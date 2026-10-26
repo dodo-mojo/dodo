@@ -1,0 +1,8 @@
+{
+  "name": "mixed_case_method_strict",
+  "spec": "RFC 9110 §9.1 (method tokens are case-sensitive)",
+  "input_hex": "47 65 74 20 2f 20 48 54 54 50 2f 31 2e 31 0d 0a 48 6f 73 74 3a 20 65 78 61 6d 70 6c 65 2e 63 6f 6d 0d 0a 0d 0a",
+  "expect": "reject",
+  "expect_reason": "'Get' is not a known canonical method token; strict mode rejects pre-dispatch",
+  "leniency": {}
+}

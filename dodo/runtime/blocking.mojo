@@ -1,0 +1,520 @@
+"""Blocking-escape hatch: ``block_in_pool``.
+
+The reactor's hot path is single-threaded per worker; any
+blocking syscall (synchronous DB query, libc ``getaddrinfo``,
+file I/O on a slow disk, CPU-heavy compute) freezes the worker
+for the duration. The fix is to offload the blocking work to
+another thread:
+
+    var rows = block_in_pool[List[Row]](
+        lambda: db.query("SELECT ..."),
+        cancel,
+    )
+
+The handler stays in straight-line code; ``cancel`` short-
+circuits if the request is cancelled mid-blocking-call.
+
+Implementation: one AsyncRT task per call.
+
+Each ``block_in_pool[T]`` call runs ``work()`` as a task on the
+AsyncRT pool (``ThreadHandle.spawn``), surfaces the result back
+through a heap-allocated task struct, and joins the task. A
+reactor worker is itself a pool task, so its join donates: while
+it waits it runs queued pool tasks, its own ``work()`` included
+if no other worker has taken it. In a forked child, which has no
+pool, the task is a fresh OS thread instead.
+
+Notes on the design:
+
+1. The pool is shared with the stdlib, so there is no dodo-side
+   pool to size or keep alive, and a task costs an enqueue rather
+   than a ``pthread_create`` (~30-50 µs on Linux x86_64).
+2. A ``work()`` that blocks holds its pool worker for as long as
+   it blocks. A reactor that donates while joining can also pick
+   up someone else's queued ``work()`` before it returns to its
+   own connections.
+3. The MAX_POOL_SIZE cap (32) is enforced process-wide via a
+   kernel-backed POSIX named semaphore shared by ``block_in_pool``
+   and ``resolve_async``: a call that would exceed the cap raises
+   "pool saturated" instead of spawning the over-limit thread, so a
+   fan-out burst cannot thread-bomb the process. The mechanism is
+   fail-closed (if the semaphore cannot be opened, e.g. under fd
+   exhaustion, the call is refused with the same error rather than
+   running uncapped) and per-process (keyed by pid, since Mojo has no
+   module-level mutable globals).
+
+What the split actually buys:
+
+- Blocking syscalls inside ``work()`` run on another pool worker
+  when one is free, so the kernel can schedule other reactor
+  workers onto the freed CPU while the syscall is waiting.
+- Multi-worker parallelism: N concurrent connections on N
+  reactor workers each calling ``block_in_pool`` get up to N
+  parallel ``work()`` executions, instead of being serialised
+  inside each reactor worker.
+
+What it does NOT buy (and why):
+
+- The submitter (handler) thread is still blocked while
+  ``work()`` runs. The synchronous public signature
+  ``def block_in_pool[T](work, cancel) raises -> T`` requires
+  this — to release the reactor's connection-loop while
+  ``work()`` is in flight we'd need either Mojo async or a
+  new "park this connection" reactor state. Both are
+  release-line follow-ups.
+
+Cancel contract (unchanged from the in-thread fallback):
+
+- **Pre-flight:** if ``cancel`` is already flipped at entry,
+  raise immediately without spawning anything.
+- **In-flight:** the user's ``work()`` is responsible for
+  polling ``cancel`` if it wants to short-circuit mid-call
+  (the work runs on another thread that can read the cancel
+  cell directly). The library cannot preempt — Mojo doesn't
+  expose preemption and thread cancellation is unsafe under
+  the borrow checker.
+- **Post-flight:** the submitter joins the task until
+  ``work()`` returns; on join it checks the cancel cell
+  one more time. If the cell flipped while ``work()`` ran,
+  raise with a "cancelled mid-flight (<reason>)" message
+  instead of returning a now-stale result.
+
+Why join rather than poll-on-done-flag:
+
+A previous iteration of this implementation polled a heap
+``done_flag`` byte with a 1 ms ``libc_usleep`` between checks
+to surface mid-flight cancel without waiting for ``work()``
+to complete. ``libc_usleep`` hits the documented 1000-1500x
+multiplier when the calling thread
+participates in multi-threaded contexts (and a ``block_in_pool``
+caller is, by construction, multi-threaded). That made the 1 ms
+poll behave like a 1 second poll and dragged the per-call
+latency from ~50 µs to ~1.1 s. Joining sidesteps the libc-time
+path entirely, so per-call latency is the spawn + work + join
+cost.
+
+The trade-off is that mid-flight cancel no longer raises
+*before* ``work()`` returns; it raises *after*. Handlers that
+care about fast-cancel during long work can poll ``cancel``
+inside ``work()``.
+"""
+
+from std.ffi import external_call
+from std.memory import Layout, Pointer, alloc, unsafe_memcpy
+from std.sys.info import CompilationTarget
+
+from ..http.cancel import Cancel, CancelReason
+from ._thread import ThreadHandle
+
+
+# Process-wide cap on concurrent pool threads. Enforced by
+# ``block_in_pool`` and ``resolve_async`` via a kernel-backed POSIX
+# named semaphore (see ``_pool_try_acquire`` / ``_pool_release``): a
+# call that would exceed the cap raises "pool saturated" instead of
+# spawning the over-limit thread, so a pathological fan-out cannot
+# thread-bomb the process. The cap is shared across both entry points
+# (they draw from the same pool).
+comptime MAX_POOL_SIZE: Int = 32
+
+
+# ── Process-wide thread-count cap (POSIX named semaphore) ────────────────────
+# Mojo has no module-level mutable globals, so the cap lives in a
+# kernel object keyed by a per-pid name. ``sem_open(O_CREAT)`` sets the
+# initial value only on first creation; later opens reuse the existing
+# object, so the count persists across calls. The mechanism is
+# fail-closed: if the semaphore cannot be opened (fd exhaustion,
+# /dev/shm full) the acquire is refused, because a fail-open acquire that
+# did not decrement would let its paired release raise the cap by one for
+# the rest of the process (RT-07).
+#
+# ponytail: kernel-name-keyed cap. Ceiling: a prior process with the
+# SAME pid that crashed while holding slots can leave the cap reduced
+# until reboot clears /dev/shm (benign -- results are never wrong, only
+# the cap tightens). Upgrade path: a C-static atomic counter in the FFI
+# lib, or Mojo module-globals once the language supports them.
+
+comptime _SEM_MODE: Int32 = 0o600
+
+
+@always_inline
+def _o_creat() -> Int32:
+    """``O_CREAT`` flag value (differs between Linux and macOS)."""
+    comptime if CompilationTarget.is_linux():
+        return Int32(0x40)
+    else:
+        return Int32(0x200)
+
+
+@always_inline
+def _pool_sem_name() -> String:
+    """Per-process semaphore name (``/dodo_pool_<pid>``)."""
+    var pid = external_call["getpid", Int32]()
+    return String("/dodo_pool_") + String(Int(pid))
+
+
+@always_inline
+def _pool_reset():
+    """Unlink the per-process pool semaphore so the next acquire recreates
+    it at ``MAX_POOL_SIZE``.
+
+    Test-only. The cap semaphore persists for the process lifetime, so a
+    prior test in the same binary that left a slot held (e.g. a
+    ``block_in_pool`` worker whose ``sem_post`` lands late on some
+    platforms) would leave the count below the max. Unlinking drops the
+    name; the next ``sem_open(O_CREAT)`` makes a fresh object at
+    ``MAX_POOL_SIZE`` (already-open handles held by a straggler thread are
+    unaffected and are reclaimed when closed). No effect on production
+    paths, which never call this.
+    """
+    var name = _pool_sem_name()
+    _ = external_call["sem_unlink", Int32](name.unsafe_ptr())
+
+
+@always_inline
+def _pool_sem_open(name: String) -> Pointer[UInt8, MutUntrackedOrigin]:
+    """Open (creating at ``MAX_POOL_SIZE`` on first use) the pool semaphore.
+
+    ``sem_open`` is variadic: ``mode`` and ``value`` are read from the
+    variadic area. On Apple arm64 that area is the stack, while
+    ``external_call`` passes every argument in registers (x2, x3), so
+    the callee read garbage and failed with ``EINVAL`` every time --
+    which, being fail-open, silently disabled the cap (RT-06). There six
+    dummy register arguments (x2..x7) push ``mode`` and ``value`` into
+    the first two 8-byte stack slots, as the callee expects; they are
+    passed as 64-bit values so each fills a whole slot (the same ABI
+    issue ``tcp/stream.mojo`` works around for ``fcntl``). Linux passes
+    variadic arguments in registers like any other, so no padding there.
+    """
+    comptime if CompilationTarget.is_macos():
+        return external_call["sem_open", Pointer[UInt8, MutUntrackedOrigin]](
+            name.unsafe_ptr(),
+            _o_creat(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Int(_SEM_MODE),
+            Int(MAX_POOL_SIZE),
+        )
+    else:
+        return external_call["sem_open", Pointer[UInt8, MutUntrackedOrigin]](
+            name.unsafe_ptr(), _o_creat(), _SEM_MODE, Int32(MAX_POOL_SIZE)
+        )
+
+
+@always_inline
+def _sem_open_failed(sem: Pointer[UInt8, MutUntrackedOrigin]) -> Bool:
+    """True when ``sem_open`` returned ``SEM_FAILED``.
+
+    ``SEM_FAILED`` is ``(sem_t *)-1`` on Darwin but ``(sem_t *)0`` on
+    glibc / musl. Testing only -1 let a failed open on Linux (for
+    example EMFILE once the fd table is full) through, and NULL then
+    reached ``sem_trywait`` / ``sem_post``: SIGSEGV (RT-08). Both values
+    are rejected; neither is ever a valid ``sem_t *``.
+    """
+    var addr = Int(sem)
+    return addr == -1 or addr == 0
+
+
+@always_inline
+def _pool_try_acquire() -> Bool:
+    """Try to claim one pool slot. Returns True on success, False when
+    the process is already at ``MAX_POOL_SIZE`` concurrent pool threads.
+
+    Fail-closed: if the semaphore cannot be opened (for example EMFILE
+    under fd exhaustion, the overload the cap exists for), no slot is
+    claimed and the result is False. A True result therefore always means
+    the semaphore was decremented, so every paired ``_pool_release``
+    returns a slot that was really taken and the count stays within
+    ``[0, MAX_POOL_SIZE]``. Returning True without decrementing (the old
+    fail-open behaviour) made the matching release raise the cap by one
+    for the rest of the process (RT-07).
+    """
+    var name = _pool_sem_name()
+    var sem = _pool_sem_open(name)
+    if _sem_open_failed(sem):
+        return False
+    var rc = external_call["sem_trywait", Int32](sem)
+    _ = external_call["sem_close", Int32](sem)
+    return rc == Int32(0)
+
+
+@always_inline
+def _pool_release():
+    """Return one pool slot claimed by ``_pool_try_acquire``.
+
+    If the semaphore cannot be opened the slot is not returned; that can
+    only tighten the cap (never raise it), see RT-07.
+    """
+    var name = _pool_sem_name()
+    var sem = _pool_sem_open(name)
+    if _sem_open_failed(sem):
+        return
+    _ = external_call["sem_post", Int32](sem)
+    _ = external_call["sem_close", Int32](sem)
+
+
+# Error message buffer size. Truncates longer Error strings.
+comptime _ERR_BUF_CAP: Int = 256
+
+
+# ── Internal task struct (heap-allocated; owned by submitter or thread) ─────
+
+
+@fieldwise_init
+struct _Task[T: Deinitable & Movable](Movable):
+    """Heap-allocated task delivered to the worker.
+
+    Address fields are stored as ``Int`` rather than typed
+    pointers because ``Pointer[T, MutUntrackedOrigin]``
+    survives the cross-function-call boundary unreliably on
+    Linux x86_64 (the same anomaly that gates the
+    ``test_pre_flipped_cancel_skips_work_*`` sub-tests in
+    ``tests/test_block_in_pool.mojo``). The
+    ``Int``-address-stash pattern is what dodo's multicore
+    ``Scheduler`` already uses for its ``stopping`` byte.
+    """
+
+    var work: def() raises thin -> Self.T
+    """User-supplied work function. Runs on the worker."""
+
+    var result_addr: Int
+    """Address of the heap slot the worker writes the success
+    result into via ``unsafe_write``."""
+
+    var err_buf_addr: Int
+    """Address of a ``UInt8`` buffer of size ``_ERR_BUF_CAP``
+    the worker writes the error message into on raise. The
+    last byte is reserved for a NUL terminator; messages
+    longer than ``_ERR_BUF_CAP - 1`` are truncated."""
+
+    var err_len_addr: Int
+    """Address of an ``Int`` slot the worker writes the actual
+    error message length into."""
+
+    var success_addr: Int
+    """Address of a ``UInt8`` flag the worker sets to 1 on
+    success and 0 on raise."""
+
+
+# ── Per-T worker thunk ──────────────────────────────────────────────────────
+
+
+def _block_thunk[
+    T: Deinitable & Movable
+](arg: Pointer[UInt8, MutUntrackedOrigin]) -> Pointer[
+    UInt8, MutUntrackedOrigin
+]:
+    """Task start routine. Per-T monomorphisation.
+
+    1. Reconstruct ``_Task[T]`` from the opaque arg pointer.
+    2. Call ``task.work()``; capture result OR error.
+    3. Write result/error/success to the heap buffers.
+    4. Set ``done_flag = 1`` (release fence implicit in the
+       1 ms libc sleep on the submitter side; on x86_64 byte
+       writes are also globally observable).
+    5. Read ``abandoned``; if 1, free buffers + task struct
+       (submitter walked away). If 0, exit without freeing
+       (submitter is going to read + free).
+    6. Always free the ``_Task`` allocation we own; the buffers
+       it points at are freed-or-not based on step 5.
+    """
+    var raw = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(arg))
+    var task_ptr = raw.unsafe_bitcast[_Task[T]]()
+    var task = task_ptr.unsafe_take_pointee()
+
+    var result_ptr = Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=task.result_addr
+    ).unsafe_bitcast[T]()
+    var err_buf = Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=task.err_buf_addr
+    )
+    var err_len_ptr = Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=task.err_len_addr
+    ).unsafe_bitcast[Int]()
+    var success_ptr = Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=task.success_addr
+    )
+
+    try:
+        var result = task.work()
+        result_ptr.unsafe_write(result^)
+        success_ptr[unsafe_offset=0] = UInt8(1)
+        err_len_ptr[unsafe_offset=0] = 0
+    except e:
+        var msg = String(e)
+        var msg_span = msg.as_bytes()
+        var n = msg.byte_length()
+        if n > _ERR_BUF_CAP - 1:
+            n = _ERR_BUF_CAP - 1
+        unsafe_memcpy(dest=err_buf, src=msg_span.unsafe_ptr(), count=n)
+        err_buf[unsafe_offset=n] = UInt8(0)  # NUL terminator
+        err_len_ptr[unsafe_offset=0] = n
+        success_ptr[unsafe_offset=0] = UInt8(0)
+
+    # The submitter owns the result / err / success buffers; it
+    # frees them after the join returns. We only own the
+    # _Task allocation itself.
+    task_ptr.unsafe_free()
+
+    # Pointer is non-nullable; build C NULL from a runtime 0.
+    var null_addr = 0
+    return Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=null_addr)
+
+
+# ── Cancel-reason error formatting ──────────────────────────────────────────
+
+
+def _raise_cancel(prefix: String, reason: Int) raises:
+    """Raise with the prefix + per-reason suffix that test_block_in_pool
+    pins in its assert_raises blocks. ``reason`` is one of the
+    ``CancelReason.*`` comptime ``Int`` constants."""
+    if reason == CancelReason.PEER_CLOSED:
+        raise Error(prefix + " (peer closed)")
+    elif reason == CancelReason.TIMEOUT:
+        raise Error(prefix + " (timeout)")
+    elif reason == CancelReason.SHUTDOWN:
+        raise Error(prefix + " (shutdown)")
+    else:
+        raise Error(prefix)
+
+
+# ── Public API ──────────────────────────────────────────────────────────────
+
+
+def block_in_pool[
+    T: Deinitable & Movable
+](work: def() raises thin -> T, cancel: Cancel) raises -> T:
+    """Run ``work()`` as an AsyncRT task; wait for its result on the
+    calling thread.
+
+    The task holds a pool worker for as long as ``work()`` blocks
+    (see ``dodo.runtime._asyncrt``). In a forked child it runs on a
+    fresh OS thread.
+
+    Pre-flight: if ``cancel`` is already flipped at entry, raise
+    without spawning anything.
+
+    On success, returns the ``T`` produced by ``work()``. If
+    ``work()`` raises, the error is propagated (truncated to
+    ``_ERR_BUF_CAP - 1`` bytes if longer).
+
+    Mid-flight: if ``cancel.cancelled()`` flips before the
+    worker thread completes, raise with a "cancelled mid-flight
+    (<reason>)" message. The worker thread runs to completion
+    in the background; the submitter does not wait for it.
+
+    Post-flight: if the cell flipped while ``work()`` ran (but
+    the submitter still saw ``done_flag`` first), raise with a
+    "cancelled mid-flight (<reason>)" message instead of
+    returning the now-stale result.
+
+    Args:
+        work: Zero-arg callable returning ``T``.
+        cancel: Per-request cancel token.
+
+    Returns:
+        The ``T`` produced by ``work()``.
+
+    Raises:
+        Error: Pre-flight cancel, mid-flight cancel, post-flight
+               cancel, or ``work()`` raised.
+    """
+    # ── Pre-flight cancel check ─────────────────────────────────────────────
+    if cancel.cancelled():
+        _raise_cancel("block_in_pool: cancelled", cancel.reason())
+
+    # ── Admission: claim a pool slot before spawning ───────────────────────
+    # Enforces the process-wide MAX_POOL_SIZE cap so a fan-out burst
+    # cannot thread-bomb the process. Acquired before any allocation so
+    # the saturation path needs no cleanup.
+    if not _pool_try_acquire():
+        raise Error(
+            "block_in_pool: pool saturated (MAX_POOL_SIZE="
+            + String(MAX_POOL_SIZE)
+            + " concurrent pool threads)"
+        )
+
+    # ── Heap-allocate task buffers ──────────────────────────────────────────
+    # The result slot is sized to T; the err buf is fixed _ERR_BUF_CAP;
+    # the four flag bytes + err_len Int slot are 1-byte / sizeof(Int)
+    # allocations. Splitting them across allocs (rather than one big
+    # block) keeps the per-T parametric step (the result slot) cleanly
+    # separate from the type-erased flag bytes.
+    var result_ptr = alloc(Layout[T](count=1)).unsafe_leak()
+    var err_buf = alloc(Layout[UInt8](count=_ERR_BUF_CAP)).unsafe_leak()
+    var err_len_ptr = alloc(Layout[Int](count=1)).unsafe_leak()
+    var success_ptr = alloc(Layout[UInt8](count=1)).unsafe_leak()
+
+    # Initialise flags to 0. (T's slot is uninitialised; the worker
+    # unsafe_write's into it on success.)
+    err_len_ptr[unsafe_offset=0] = 0
+    success_ptr[unsafe_offset=0] = UInt8(0)
+
+    var task_ptr = alloc(Layout[_Task[T]](count=1)).unsafe_leak()
+    task_ptr.unsafe_write(
+        _Task[T](
+            work=work,
+            result_addr=Int(result_ptr),
+            err_buf_addr=Int(err_buf),
+            err_len_addr=Int(err_len_ptr),
+            success_addr=Int(success_ptr),
+        )
+    )
+
+    # ── Spawn worker task + block on join ───────────────────────────────────
+    # Joining is the right primitive here: the user-visible API
+    # is synchronous, so the submitter needs to wait until the worker
+    # has finished writing the result/error buffers anyway. Polling
+    # would mean either burning CPU (busy-wait) or going through
+    # libc_usleep, which hits the documented 1000-1500x multiplier
+    # in multi-threaded contexts and inflates
+    # per-call latency from ~50 us to ~1 s.
+    var task_opaque = Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=Int(task_ptr)
+    )
+    try:
+        var handle = ThreadHandle.spawn[_block_thunk[T]](task_opaque)
+        handle.join()
+    except e:
+        _pool_release()
+        raise e^
+    _pool_release()
+
+    # ── Worker finished. Read result + free buffers. ───────────────────────
+    var success = success_ptr[unsafe_offset=0] == UInt8(1)
+    var post_cancelled = cancel.cancelled()
+    var post_reason = cancel.reason() if post_cancelled else CancelReason.NONE
+
+    if success:
+        var out = result_ptr.unsafe_take_pointee()
+        result_ptr.unsafe_free()
+        err_buf.unsafe_free()
+        err_len_ptr.unsafe_free()
+        success_ptr.unsafe_free()
+
+        # Post-flight cancel check: if the cell flipped while
+        # work() ran, raise rather than return a now-stale result.
+        if post_cancelled:
+            _raise_cancel("block_in_pool: cancelled mid-flight", post_reason)
+
+        return out^
+
+    # Failure path: copy the error message out and raise.
+    var n = err_len_ptr[unsafe_offset=0]
+    var msg_bytes = List[UInt8]()
+    msg_bytes.resize(n, UInt8(0))
+    if n > 0:
+        unsafe_memcpy(dest=msg_bytes.unsafe_ptr(), src=err_buf, count=n)
+    var msg = String(
+        unsafe_from_utf8=Span[UInt8, origin_of(msg_bytes)](msg_bytes)
+    )
+
+    result_ptr.unsafe_free()
+    err_buf.unsafe_free()
+    err_len_ptr.unsafe_free()
+    success_ptr.unsafe_free()
+
+    raise Error(msg)

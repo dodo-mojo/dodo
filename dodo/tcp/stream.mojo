@@ -1,0 +1,680 @@
+"""TCP stream: a connected, bidirectional byte stream.
+
+``TcpStream`` owns a ``RawSocket`` and exposes blocking read/write
+operations. ``TCP_NODELAY`` is set automatically on every new stream so
+callers get low-latency behaviour by default (Nagle's algorithm is
+disabled).
+
+Design rules enforced here:
+- ``write`` retries transparently on ``EINTR``.
+- ``write_all`` loops until every byte is sent.
+- ``read`` returning 0 means EOF — it is never converted to an error.
+- ``connect_timeout`` on macOS/arm64 delegates to ``dodo_connect_timeout``
+  in ``libdodo_tls.so`` to sidestep a Mojo ABI bug with variadic functions
+  (e.g. ``fcntl``) on that platform. On Linux, ``connect_timeout`` calls
+  ``fcntl`` / ``connect`` / ``poll`` / ``getsockopt`` directly via
+  ``external_call`` — ``OwnedDLHandle.get_function`` crashes on Linux when
+  calling into a freshly-loaded shared library.
+"""
+
+from std.ffi import (
+    OwnedDLHandle,
+    c_int,
+    c_uint,
+    c_size_t,
+    c_ssize_t,
+    get_errno,
+    ErrNo,
+)
+from std.memory import alloc, stack_allocation
+from std.sys.info import CompilationTarget
+
+from ..net import (
+    SocketAddr,
+    NetworkError,
+    ConnectionRefused,
+    ConnectionTimeout,
+    ConnectionReset,
+    BrokenPipe,
+    Timeout,
+    DnsError,
+)
+from ..io.buf_reader import Readable
+from ..net._write_loop import _ChunkWriter, write_all_chunks
+from ..net.socket import (
+    RawSocket,
+    AF_INET,
+    AF_INET6,
+    SOCK_STREAM,
+    _build_sockaddr_in,
+    _sockaddr_to_socket_addr,
+    _find_dodo_lib,
+)
+from ..utils.dylib import dl_sym
+from ..net._libc import (
+    _connect,
+    _recv,
+    _send,
+    _shutdown,
+    _strerror,
+    _fcntl2,
+    _poll,
+    _getsockopt,
+    MSG_NOSIGNAL,
+    SHUT_RD,
+    SHUT_WR,
+    F_GETFL,
+    F_SETFL,
+    O_NONBLOCK,
+    SOL_SOCKET,
+    SO_ERROR,
+    POLLOUT,
+    POLLFD_SIZE,
+)
+
+
+def _do_dodo_connect_timeout(
+    imm lib: OwnedDLHandle,
+    fd: c_int,
+    sa_addr: Int,
+    sa_len: c_uint,
+    timeout_ms: c_int,
+) raises -> c_int:
+    """Invoke ``dodo_connect_timeout`` with ``lib`` borrowed across both
+    the symbol lookup and the call. See the ASAP-destruction discussion in
+    ``dodo/tls/stream.mojo`` and ``dodo/http/encoding.mojo`` for why this
+    indirection is required.
+    """
+    var fn_ct = dl_sym[def(c_int, Int, c_uint, c_int) thin abi("C") -> c_int](
+        lib, "dodo_connect_timeout"
+    )
+    return fn_ct(fd, sa_addr, sa_len, timeout_ms)
+
+
+struct TcpStream(Movable, Readable, _ChunkWriter):
+    """A connected TCP socket.
+
+    Owns a ``RawSocket`` and exposes blocking read/write operations.
+    ``TCP_NODELAY`` is set automatically on every new stream so callers
+    get low-latency behaviour without any configuration.
+
+    This type is ``Movable`` but not ``Copyable`` — a TCP connection
+    cannot be duplicated without tracking both file descriptors.
+
+    The connection is closed automatically when the struct is destroyed.
+
+    Thread safety:
+        Not thread-safe . Do not share a ``TcpStream`` across
+        threads without external synchronisation.
+
+    Example:
+        ```mojo
+        from dodo.tcp import TcpStream
+        from dodo.net import SocketAddr
+
+        var stream = TcpStream.connect(SocketAddr.localhost(8080))
+        stream.write_all("hello".as_bytes())
+        var buf = List[UInt8](capacity=1024)
+        buf.resize(1024, 0)
+        var n = stream.read(buf.unsafe_ptr(), len(buf))
+        stream.close()
+        ```
+    """
+
+    var _socket: RawSocket
+    var _peer: SocketAddr
+
+    def __init__(out self, var socket: RawSocket, peer: SocketAddr):
+        """Wrap an already-connected ``RawSocket``.
+
+        Args:
+            socket: An open, connected file descriptor (ownership transferred).
+            peer: The remote address.
+
+        Safety:
+            ``socket`` must be connected before calling this constructor.
+            ``TCP_NODELAY`` should already be set by the factory functions.
+        """
+        self._socket = socket^
+        self._peer = peer
+
+    def __deinit__(deinit self):
+        self._socket.close()
+
+    # ── Factory ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def connect(addr: SocketAddr) raises -> TcpStream:
+        """Open a blocking TCP connection to ``addr``.
+
+        Sets ``TCP_NODELAY`` automatically.
+
+        Args:
+            addr: The remote socket address to connect to.
+
+        Returns:
+            A connected ``TcpStream``.
+
+        Raises:
+            ConnectionRefused: If the remote port actively refuses.
+            ConnectionTimeout: If the OS connect timeout expires.
+            ConnectionReset: If the peer sends a TCP RST during connect.
+            NetworkError: For any other OS error.
+
+        Example:
+            ```mojo
+            var stream = TcpStream.connect(SocketAddr.localhost(8080))
+            ```
+        """
+        var family = AF_INET6 if addr.ip.is_v6() else AF_INET
+        var sock = RawSocket(family, SOCK_STREAM)
+        var sa = _build_sockaddr_in(addr)
+        var rc = _connect(sock.fd, sa[0], sa[1])
+        sa[0].unsafe_free()
+        if rc < 0:
+            var e = get_errno()
+            var s = String(addr)
+            if e == ErrNo.ECONNREFUSED:
+                raise ConnectionRefused(s, Int(e.value))
+            if e == ErrNo.ETIMEDOUT:
+                raise ConnectionTimeout(s, Int(e.value))
+            if e == ErrNo.ECONNRESET:
+                raise ConnectionReset(s, Int(e.value))
+            raise NetworkError(
+                _strerror(e.value) + " (connect " + s + ")", Int(e.value)
+            )
+        sock.set_tcp_nodelay(True)
+        return TcpStream(sock^, addr)
+
+    @staticmethod
+    def connect_timeout(addr: SocketAddr, timeout_ms: Int) raises -> TcpStream:
+        """Open a TCP connection, failing if it takes longer than ``timeout_ms``.
+
+        On macOS/arm64 this delegates to ``dodo_connect_timeout`` in
+        ``libdodo_tls.so`` to avoid a Mojo ABI bug where ``external_call``
+        silently corrupts variadic-function arguments (e.g. the third argument
+        of ``fcntl``) on that platform.
+
+        On Linux, the non-blocking connect + ``poll(POLLOUT)`` +
+        ``getsockopt(SO_ERROR)`` sequence is implemented directly via
+        ``external_call``. ``OwnedDLHandle.get_function`` crashes on Linux
+        when calling into a freshly-loaded shared library, so the C helper
+        cannot be used there.
+
+        Args:
+            addr: The remote socket address.
+            timeout_ms: Maximum time to wait in milliseconds (must be > 0).
+
+        Returns:
+            A connected ``TcpStream``.
+
+        Raises:
+            ConnectionTimeout: If the deadline expires before connecting.
+            ConnectionRefused: If the port actively refuses.
+            NetworkError: For any other OS error.
+
+        Example:
+            ```mojo
+            var stream = TcpStream.connect_timeout(SocketAddr.localhost(8080), 5000)
+            ```
+        """
+        var family = AF_INET6 if addr.ip.is_v6() else AF_INET
+        var sock = RawSocket(family, SOCK_STREAM)
+        var sa = _build_sockaddr_in(addr)
+
+        comptime if CompilationTarget.is_macos():
+            # macOS/arm64: use C helper to avoid Mojo variadic fcntl ABI bug.
+            # Route through ``_do_dodo_connect_timeout`` so ``lib`` is held as
+            # a borrow across both ``get_function`` and the call (see
+            # OwnedDLHandle / ASAP-destruction discipline in
+            # dodo/tls/stream.mojo).
+            var lib = OwnedDLHandle(_find_dodo_lib())
+            var rc = _do_dodo_connect_timeout(
+                lib, sock.fd, Int(sa[0]), sa[1], c_int(timeout_ms)
+            )
+            sa[0].unsafe_free()
+
+            if rc == c_int(-2):
+                raise ConnectionTimeout(String(addr), timeout_ms)
+            if rc != c_int(0):
+                var s = String(addr)
+                var rc_int = Int(rc)
+                if rc_int == Int(ErrNo.ECONNREFUSED.value):
+                    raise ConnectionRefused(s, rc_int)
+                if rc_int == Int(ErrNo.ETIMEDOUT.value):
+                    raise ConnectionTimeout(s, rc_int)
+                if rc_int == -1:
+                    var e = get_errno()
+                    raise NetworkError(
+                        _strerror(e.value) + " (connect " + s + ")",
+                        Int(e.value),
+                    )
+                raise NetworkError(
+                    _strerror(rc) + " (connect " + s + ")", rc_int
+                )
+        else:
+            # Linux: implement directly — OwnedDLHandle.get_function crashes
+            # on Linux when calling into a freshly dlopen'd shared library.
+            var s = String(addr)
+
+            # 1. Save current socket flags and enable non-blocking mode.
+            var flags = _fcntl2(sock.fd, F_GETFL, c_int(0))
+            if flags < c_int(0):
+                sa[0].unsafe_free()
+                var e = get_errno()
+                raise NetworkError(
+                    _strerror(e.value) + " (fcntl F_GETFL)", Int(e.value)
+                )
+            _ = _fcntl2(sock.fd, F_SETFL, flags | O_NONBLOCK)
+
+            # 2. Initiate the non-blocking connect.
+            var rc = _connect(sock.fd, sa[0], sa[1])
+            var connect_errno = (
+                get_errno()
+            )  # capture before free() touches errno
+            sa[0].unsafe_free()
+
+            if rc == c_int(0):
+                # Immediate success (common on loopback).
+                _ = _fcntl2(sock.fd, F_SETFL, flags)
+            elif connect_errno != ErrNo.EINPROGRESS:
+                # Hard error before the connection even started.
+                _ = _fcntl2(sock.fd, F_SETFL, flags)
+                if connect_errno == ErrNo.ECONNREFUSED:
+                    raise ConnectionRefused(s, Int(connect_errno.value))
+                if connect_errno == ErrNo.ETIMEDOUT:
+                    raise ConnectionTimeout(s, Int(connect_errno.value))
+                raise NetworkError(
+                    _strerror(connect_errno.value) + " (connect " + s + ")",
+                    Int(connect_errno.value),
+                )
+            else:
+                # 3. EINPROGRESS: wait for the socket to become writable.
+                var pfd = stack_allocation[Int(POLLFD_SIZE), UInt8]()
+                for i in range(Int(POLLFD_SIZE)):
+                    pfd.unsafe_offset(i).unsafe_write(0)
+                pfd.unsafe_bitcast[c_int]().unsafe_write(sock.fd)
+                pfd.unsafe_offset(4).unsafe_bitcast[Int16]().unsafe_write(
+                    Int16(POLLOUT)
+                )
+
+                var nready = _poll(pfd, c_uint(1), c_int(timeout_ms))
+                if nready == c_int(0):
+                    _ = _fcntl2(sock.fd, F_SETFL, flags)
+                    raise ConnectionTimeout(s, timeout_ms)
+                if nready < c_int(0):
+                    var e = get_errno()
+                    _ = _fcntl2(sock.fd, F_SETFL, flags)
+                    raise NetworkError(
+                        _strerror(e.value) + " (poll)", Int(e.value)
+                    )
+
+                # 4. Check SO_ERROR for deferred connection errors.
+                var so_err = stack_allocation[1, c_int]()
+                so_err.unsafe_write(c_int(0))
+                var so_len = stack_allocation[1, c_uint]()
+                so_len.unsafe_write(c_uint(4))
+                _ = _getsockopt(
+                    sock.fd,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    so_err.unsafe_bitcast[UInt8](),
+                    so_len,
+                )
+                _ = _fcntl2(sock.fd, F_SETFL, flags)
+                var err_val = Int(so_err.unsafe_load())
+                if err_val != 0:
+                    if err_val == Int(ErrNo.ECONNREFUSED.value):
+                        raise ConnectionRefused(s, err_val)
+                    if err_val == Int(ErrNo.ETIMEDOUT.value):
+                        raise ConnectionTimeout(s, err_val)
+                    raise NetworkError(
+                        _strerror(c_int(err_val)) + " (connect " + s + ")",
+                        err_val,
+                    )
+
+        sock.set_tcp_nodelay(True)
+        return TcpStream(sock^, addr)
+
+    @staticmethod
+    def connect(host: String, port: UInt16) raises -> TcpStream:
+        """Resolve ``host`` via DNS and open a blocking TCP connection.
+
+        Convenience overload that performs DNS resolution then calls
+        ``TcpStream.connect(SocketAddr(...))`` automatically.
+
+        Args:
+            host: Hostname or IP address string (e.g. ``"example.com"``).
+            port: TCP port number.
+
+        Returns:
+            A connected ``TcpStream``.
+
+        Raises:
+            DnsError: If ``host`` cannot be resolved.
+            ConnectionRefused: If the remote port actively refuses.
+            ConnectionTimeout: If the OS connect timeout expires.
+            NetworkError: For any other OS error.
+
+        Example:
+            ```mojo
+            var stream = TcpStream.connect("example.com", 80)
+            ```
+        """
+        return _connect_with_fallback(host, port, 5000)
+
+    @staticmethod
+    def connect(
+        host: String, port: UInt16, timeout_ms: Int
+    ) raises -> TcpStream:
+        """Resolve ``host`` via DNS (dual-stack) and connect with a timeout.
+
+        Tries each resolved address in order (IPv4 and IPv6), falling back
+        to the next on failure.
+
+        Args:
+            host: Hostname or IP address string.
+            port: TCP port number.
+            timeout_ms: Maximum time to wait in milliseconds.
+
+        Returns:
+            A connected ``TcpStream``.
+
+        Raises:
+            DnsError: If ``host`` cannot be resolved.
+            ConnectionTimeout: If all addresses time out.
+            ConnectionRefused: If all addresses refuse.
+            NetworkError: For any other OS error.
+        """
+        return _connect_with_fallback(host, port, timeout_ms)
+
+    # ── Context manager ───────────────────────────────────────────────────────
+
+    def __enter__(var self) -> TcpStream:
+        """Transfer ownership of ``self`` into the ``with`` block.
+
+        Returns:
+            This ``TcpStream`` (moved).
+        """
+        return self^
+
+    # ── I/O ───────────────────────────────────────────────────────────────────
+
+    def read(mut self, buf: Pointer[UInt8, _], size: Int) raises -> Int:
+        """Read up to ``size`` bytes from the stream into ``buf``.
+
+        Retries transparently on ``EINTR``. Returns 0 on EOF (the peer
+        closed the connection) — this is not an error.
+
+        Args:
+            buf: Destination buffer; the caller must provide at least
+                  ``size`` bytes of valid storage.
+            size: Maximum number of bytes to read.
+
+        Returns:
+            Number of bytes placed in ``buf``. **0 means EOF.**
+
+        Raises:
+            ConnectionReset: If the peer sent a TCP RST.
+            Timeout: If a recv timeout was set and expired.
+            NetworkError: For any other OS read error.
+
+        Example:
+            ```mojo
+            var buf = List[UInt8](capacity=4096)
+            buf.resize(4096, 0)
+            var n = stream.read(buf.unsafe_ptr(), len(buf))
+            if n == 0:
+                print("connection closed")
+            ```
+        """
+        if size == 0:
+            return 0
+        while True:
+            var got = _recv(self._socket.fd, buf, c_size_t(size), c_int(0))
+            if got > 0:
+                return Int(got)
+            if got == 0:
+                return 0  # EOF — peer closed connection
+            var e = get_errno()
+            if e == ErrNo.EINTR:
+                continue  # signal interrupted — retry
+            if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                raise Timeout("recv")
+            if e == ErrNo.ECONNRESET:
+                raise ConnectionReset(String(self._peer), Int(e.value))
+            raise NetworkError(_strerror(e.value) + " (recv)", Int(e.value))
+
+    def read_exact(mut self, buf: Pointer[UInt8, _], size: Int) raises:
+        """Read exactly ``size`` bytes into ``buf``.
+
+        Loops over ``read()`` until ``size`` bytes have been received.
+
+        Args:
+            buf: Destination buffer; must have at least ``size`` bytes.
+            size: Exact number of bytes to read.
+
+        Raises:
+            NetworkError: If EOF is reached before ``size`` bytes are received,
+                or on any other I/O error.
+
+        Example:
+            ```mojo
+            var exact = List[UInt8](capacity=8)
+            exact.resize(8, 0)
+            stream.read_exact(exact.unsafe_ptr(), 8)
+            ```
+        """
+        var received = 0
+        while received < size:
+            var n = self.read(buf.unsafe_offset(received), size - received)
+            if n == 0:
+                raise NetworkError(
+                    "read_exact: EOF after "
+                    + String(received)
+                    + "/"
+                    + String(size)
+                    + " bytes"
+                )
+            received += n
+
+    def write(self, data: Span[UInt8, _]) raises -> Int:
+        """Write up to ``len(data)`` bytes to the stream.
+
+        A single call may write fewer bytes than requested (partial write).
+        Use ``write_all`` to guarantee all bytes are sent. Retries on
+        ``EINTR``.
+
+        Args:
+            data: The bytes to send.
+
+        Returns:
+            Number of bytes actually written (>= 1 if data is non-empty).
+
+        Raises:
+            BrokenPipe: If the peer has closed the read end.
+            Timeout: If a send timeout was set and expired.
+            NetworkError: For any other OS write error.
+
+        Example:
+            ```mojo
+            var n = stream.write("hello".as_bytes())
+            ```
+        """
+        var n = len(data)
+        if n == 0:
+            return 0
+        var ptr = data.unsafe_ptr()
+        while True:
+            var sent = _send(self._socket.fd, ptr, c_size_t(n), MSG_NOSIGNAL)
+            if sent > 0:
+                return Int(sent)
+            if sent == 0:
+                return 0
+            var e = get_errno()
+            if e == ErrNo.EINTR:
+                continue  # signal interrupted — retry
+            if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                raise Timeout("send")
+            if e == ErrNo.EPIPE:
+                raise BrokenPipe(String(self._peer), Int(e.value))
+            if e == ErrNo.ECONNRESET:
+                raise ConnectionReset(String(self._peer), Int(e.value))
+            raise NetworkError(_strerror(e.value) + " (send)", Int(e.value))
+
+    def write_all(self, data: Span[UInt8, _]) raises:
+        """Write all of ``data``, looping until every byte is sent.
+
+        Args:
+            data: The bytes to send completely.
+
+        Raises:
+            BrokenPipe: If the peer closes before all bytes are sent.
+            NetworkError: For any other OS write error, or if ``send(2)``
+                returns 0 for a non-empty buffer (no progress is possible).
+
+        Example:
+            ```mojo
+            stream.write_all("Hello, server!".as_bytes())
+            ```
+        """
+        write_all_chunks(self, data)
+
+    def _write_chunk(self, data: Span[UInt8, _]) raises -> Int:
+        """One ``write`` call; the ``_ChunkWriter`` hook for ``write_all``."""
+        return self.write(data)
+
+    # ── Introspection ─────────────────────────────────────────────────────────
+
+    def peer_addr(self) -> SocketAddr:
+        """Return the remote socket address.
+
+        Returns:
+            The ``SocketAddr`` this stream is connected to.
+        """
+        return self._peer
+
+    def local_addr(self) raises -> SocketAddr:
+        """Return the local socket address assigned by the OS.
+
+        Returns:
+            The local ``SocketAddr`` (IP + ephemeral port).
+
+        Raises:
+            NetworkError: If ``getsockname(2)`` fails.
+        """
+        return self._socket.local_addr()
+
+    # ── Control ───────────────────────────────────────────────────────────────
+
+    def shutdown_read(self) raises:
+        """Shut down the read half of the connection.
+
+        After this call, any subsequent ``read()`` returns 0 (EOF). The
+        peer will receive a FIN indicating no more data will be read.
+
+        Raises:
+            NetworkError: If ``shutdown(2)`` fails.
+        """
+        var rc = _shutdown(self._socket.fd, SHUT_RD)
+        if rc < 0:
+            var e = get_errno()
+            raise NetworkError(
+                _strerror(e.value) + " (shutdown_read)", Int(e.value)
+            )
+
+    def shutdown_write(self) raises:
+        """Shut down the write half of the connection.
+
+        Sends a FIN to the peer, signalling that no more data will be
+        written. The peer will see EOF on their next ``read()``.
+
+        Raises:
+            NetworkError: If ``shutdown(2)`` fails.
+        """
+        var rc = _shutdown(self._socket.fd, SHUT_WR)
+        if rc < 0:
+            var e = get_errno()
+            raise NetworkError(
+                _strerror(e.value) + " (shutdown_write)", Int(e.value)
+            )
+
+    def close(mut self):
+        """Close the connection explicitly. Idempotent."""
+        self._socket.close()
+
+    # ── Options ───────────────────────────────────────────────────────────────
+
+    def set_nodelay(self, enabled: Bool) raises:
+        """Toggle ``TCP_NODELAY`` (Nagle's algorithm).
+
+        Args:
+            enabled: ``True`` disables Nagle (low-latency); ``False`` re-enables it.
+        """
+        self._socket.set_tcp_nodelay(enabled)
+
+    def set_keepalive(self, enabled: Bool) raises:
+        """Toggle ``SO_KEEPALIVE``.
+
+        Args:
+            enabled: ``True`` to send keepalive probes on idle connections.
+        """
+        self._socket.set_keepalive(enabled)
+
+    def set_recv_timeout(self, ms: Int) raises:
+        """Set a per-read timeout.
+
+        After the timeout expires, ``read()`` raises ``Timeout``.
+
+        Args:
+            ms: Timeout in milliseconds. 0 disables the timeout.
+        """
+        self._socket.set_recv_timeout(ms)
+
+    def set_send_timeout(self, ms: Int) raises:
+        """Set a per-write timeout.
+
+        After the timeout expires, ``write()`` raises ``Timeout``.
+
+        Args:
+            ms: Timeout in milliseconds. 0 disables the timeout.
+        """
+        self._socket.set_send_timeout(ms)
+
+
+def _connect_with_fallback(
+    host: String, port: UInt16, timeout_ms: Int
+) raises -> TcpStream:
+    """Resolve ``host`` and try each resolved address until one connects.
+
+    Uses ``resolve()`` (dual-stack DNS) and iterates through results in
+    OS-preferred order, falling back to the next address if connect fails
+    or times out. This handles environments where IPv6 is advertised by
+    DNS but unreachable on the local network.
+
+    Args:
+        host: Hostname to resolve.
+        port: TCP port.
+        timeout_ms: Per-address connect timeout in milliseconds.
+
+    Returns:
+        A connected ``TcpStream``.
+
+    Raises:
+        DnsError: If ``host`` cannot be resolved.
+        NetworkError: If every resolved address fails to connect.
+    """
+    from ..dns import resolve
+
+    var addrs = resolve(host)
+    if len(addrs) == 0:
+        raise DnsError("DNS resolution returned no results for: " + host)
+    var last_err = String("")
+    for i in range(len(addrs)):
+        try:
+            return TcpStream.connect_timeout(
+                SocketAddr(addrs[i], port), timeout_ms
+            )
+        except e:
+            last_err = String(e)
+    raise NetworkError("all addresses failed for " + host + ": " + last_err)

@@ -1,0 +1,8 @@
+{
+  "name": "ows_before_colon_strict",
+  "spec": "RFC 9112 §5.1 (no whitespace before colon -- request smuggling vector)",
+  "input_hex": "47 45 54 20 2f 20 48 54 54 50 2f 31 2e 31 0d 0a 48 6f 73 74 20 3a 20 65 78 61 6d 70 6c 65 2e 63 6f 6d 0d 0a 0d 0a",
+  "expect": "reject",
+  "expect_reason": "whitespace before ':' separator is CVE-class (request smuggling)",
+  "leniency": {}
+}

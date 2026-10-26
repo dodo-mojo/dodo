@@ -1,0 +1,11 @@
+{
+  "name": "7.1.1_close_normal_closure",
+  "spec": "RFC 6455 §5.5.1 + §7.4.1 (Close frame; 1000 NORMAL)",
+  "input_hex": "88 02 03 e8",
+  "expect": "accept",
+  "expect_reason": "FIN=1 OP=CLOSE (0x8) len=2 status=1000 (NORMAL CLOSURE) -- RFC 6455 §7.4.1 reserved code",
+  "expected_opcode": 8,
+  "expected_fin": true,
+  "expected_close_code": 1000,
+  "expected_payload_hex": "03 e8"
+}

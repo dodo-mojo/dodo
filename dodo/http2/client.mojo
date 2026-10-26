@@ -1,0 +1,1377 @@
+"""HTTP/2 client byte driver (RFC 9113).
+
+Cleartext (h2c) and TLS (h2) client-side counterpart to
+:class:`dodo.http2.server.Http2Connection`.
+
+This module exposes the *low-level* HTTP/2 client byte driver
+that :class:`dodo.http.HttpClient` uses internally when it
+needs to speak HTTP/2 (either via TLS+ALPN ``h2`` for
+``https://`` URLs, or via cleartext prior knowledge when the
+caller passes ``prefer_h2c=True``). Application code should
+go through :class:`dodo.http.HttpClient`; the driver is kept
+public for callers who want to roll their own dispatch loop.
+
+- :class:`Http2ClientConfig` -- client-advertised SETTINGS
+  values (mirrors :class:`dodo.http2.server.Http2Config`).
+- :class:`Http2ClientConnection` -- the stateful,
+  *socket-agnostic* driver. The caller pumps inbound bytes
+  into ``feed`` and pulls outbound bytes from ``drain``;
+  per-stream completion is observed via
+  ``response_ready(sid)`` / ``take_response(sid)``. Same
+  shape as :class:`dodo.http2.server.Http2Connection` so the
+  two drivers can be paired entirely in-memory in tests.
+
+Wire-protocol scope:
+
+* RFC 9113 §3.5 client connection preface
+  (``"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n"``) emitted first.
+* RFC 9113 §6.5 SETTINGS exchange: client emits its initial
+  SETTINGS frame after the preface; ACKs every server SETTINGS
+  it observes; honors peer-advertised
+  ``SETTINGS_INITIAL_WINDOW_SIZE`` /
+  ``SETTINGS_MAX_FRAME_SIZE`` /
+  ``SETTINGS_HEADER_TABLE_SIZE``.
+* RFC 9113 §5.1 client stream IDs: odd integers starting at 1,
+  monotonically increasing per connection.
+* RFC 9113 §6.2 / §6.10 HEADERS + CONTINUATION send and recv
+  via :class:`dodo.http2.hpack.HpackEncoder` /
+  :class:`dodo.http2.hpack.HpackDecoder` (shared with the server).
+* RFC 9113 §6.1 DATA send and recv with per-stream + connection
+  flow-control accounting; we eagerly emit
+  ``WINDOW_UPDATE`` for received DATA so default-sized responses
+  do not stall (same shape as the server-side driver).
+* RFC 9113 §6.7 PING: we ACK every non-ACK PING the peer sends
+  and ignore the ACK side.
+* RFC 9113 §6.8 GOAWAY: we surface the received flag via
+  :attr:`Http2ClientConnection.goaway_received`; in-flight
+  streams below the announced last-stream-id continue normally;
+  callers SHOULD stop opening new streams.
+* RFC 9113 §6.4 RST_STREAM: when received, the affected stream
+  is marked closed with the peer's error code stashed for the
+  caller to read via :meth:`Http2ClientConnection.stream_error`.
+
+Out of scope (intentional, mirrors the server's scope):
+
+* Server push (``PUSH_PROMISE``) -- we never originate it and
+  treat an inbound PUSH_PROMISE from a server as a connection error
+  (GOAWAY with PROTOCOL_ERROR, RFC 9113 §8.4) since dodo clients do
+  not opt into the SETTINGS_ENABLE_PUSH affordance.
+* Stream priority (deprecated by RFC 9113 §5.3.2).
+* Trailers (HEADERS frames *after* the response DATA stream
+  closes) -- accepted at the parser level but not surfaced
+  through the high-level :class:`Http2Client` API.
+
+The wire-codec / HPACK / frame-state machinery is shared with
+the server (via :class:`dodo.http2.state.Connection`); only the
+client-specific behaviour (preface, odd stream ids, client
+stream-state transitions, the high-level request/response
+plumbing) lives here.
+"""
+
+# Long because it is one struct, ``Http2ClientConnection``, and Mojo
+# can't split a struct's methods across files.
+from std.collections import Dict, Optional
+from std.time import perf_counter_ns
+
+from .frame import (
+    Frame,
+    FrameFlags,
+    FrameType,
+    H2_DEFAULT_FRAME_SIZE,
+    H2_PREFACE,
+    encode_frame,
+    parse_frame,
+)
+from .hpack import HpackHeader
+from .state import Connection, Http2Error, Http2ErrorCode, Stream, StreamState
+
+from ._client_types import (
+    BDP_WINDOW_MAX,
+    Http2ClientConfig,
+    Http2Response,
+    _h2_response_to_http,
+    build_h2c_settings_payload,
+)
+
+
+# ── Http2ClientConnection ────────────────────────────────────────────────
+
+
+def _bdp_ping_payload() -> List[UInt8]:
+    # A PING payload is exactly 8 bytes (RFC 9113 section 6.7).
+    return List[UInt8]("dodo-bdp".as_bytes())
+
+
+struct Http2ClientConnection(Defaultable, Movable):
+    """Stateful, socket-agnostic HTTP/2 client driver.
+
+    A pure state object -- the caller owns I/O. The lifecycle is:
+
+    1. Construct via :meth:`__init__` or
+       :meth:`with_config`. The constructor pre-queues the
+       client connection preface
+       (``"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n"``) plus the
+       initial SETTINGS frame, ready to be drained.
+
+    2. Call :meth:`drain` once to pull the preface + initial
+       SETTINGS bytes; write them onto the socket.
+
+    3. For each request:
+
+       a. Allocate a stream id via :meth:`next_stream_id` (odd
+          integers starting at 1).
+       b. Call :meth:`send_request(sid, ...)` to enqueue the
+          HEADERS frame (with optional CONTINUATION) and any
+          DATA frames bounded by current flow-control windows.
+          DATA that exceeds the window is held back; the
+          driver releases more on inbound WINDOW_UPDATE.
+       c. Call :meth:`drain` to pull outbound bytes; write them.
+
+    4. On the inbound side: call :meth:`feed(bytes)` with bytes
+       read from the socket. Internally the driver:
+
+       - decodes frames via :func:`parse_frame`
+       - dispatches them through :meth:`Connection.handle_frame`
+         (with ``is_client = True`` so HEADERS / DATA receipt
+         transitions HALF_CLOSED_LOCAL streams to CLOSED instead
+         of HALF_CLOSED_REMOTE)
+       - ACKs SETTINGS / PING as appropriate
+       - emits WINDOW_UPDATE for received DATA
+       - on RST_STREAM, surfaces the error code via
+         :meth:`stream_error` and marks the stream closed
+
+       Then call :meth:`drain` again to pull any auto-emitted
+       outbound bytes (SETTINGS ACK, PING ACK, WINDOW_UPDATE).
+
+    5. Poll :meth:`response_ready(sid)`; once ``True``, call
+       :meth:`take_response(sid)` to pop the
+       ``(status, headers, body)`` tuple.
+
+    6. When done, optionally send a GOAWAY via
+       :meth:`send_goaway` and close the socket.
+
+    The driver is :class:`Movable` but not :class:`Copyable`; the
+    HPACK dynamic table inside :class:`Connection` is mutable
+    state that must not alias across two driver instances.
+    """
+
+    var conn: Connection
+    """The shared frame / HPACK / stream state machinery
+    (:class:`dodo.http2.state.Connection`).
+    ``conn.is_client`` is set to ``True`` so HEADERS / DATA
+    receipt transitions HALF_CLOSED_LOCAL streams to CLOSED."""
+
+    var inbox: List[UInt8]
+    """Inbound byte buffer. Filled by :meth:`feed`; drained
+    frame-by-frame on each :meth:`feed` call."""
+
+    var outbox: List[UInt8]
+    """Outbound byte buffer. Pre-loaded with preface + initial
+    SETTINGS at construction; appended-to by every method that
+    emits a frame. Drained by :meth:`drain`."""
+
+    var greeted: Bool
+    """``True`` once the preface + initial SETTINGS have been
+    queued in :attr:`outbox`. Mirrors
+    :attr:`Http2Connection.greeted`."""
+
+    var config: Http2ClientConfig
+    """The :class:`Http2ClientConfig` the driver was constructed
+    with. Kept on the driver so the high-level :class:`Http2Client`
+    facade can re-read individual fields per-stream (e.g. the
+    ``max_header_list_size`` cap when building outbound HEADERS)
+    without threading it through every per-frame call site."""
+
+    var _next_sid: Int
+    """The next client-initiated stream id to hand out
+    (RFC 9113 §5.1.1: odd integers, monotonically increasing).
+    Starts at 1 and increments by 2 on every
+    :meth:`next_stream_id` call."""
+    var _bdp_window: Int
+    """Current stream and connection receive window. Grown from PING
+    round-trip samples of the bytes in flight (the bandwidth-delay
+    product), as hyper does, up to :data:`BDP_WINDOW_MAX`."""
+    var _bdp_bytes: Int
+    var _bdp_sent_ns: Int
+    """When the outstanding BDP PING went out; 0 when none is."""
+    var _bdp_next_ns: Int
+    var _bdp_hdr: List[UInt8]
+    """Partial frame header :meth:`receive` is reading."""
+    var _bdp_skip: Int
+    """Payload bytes left of the frame :meth:`receive` is in."""
+
+    var _stream_errors: Dict[Int, Int]
+    """Stream-id -> peer-supplied RST_STREAM error code
+    (RFC 9113 §6.4). Populated when a stream is reset by the peer
+    so the high-level facade can surface a meaningful error to
+    the caller; queried via :meth:`stream_error`."""
+
+    var _pending_body: Dict[Int, List[UInt8]]
+    """Stream-id -> not-yet-sent body remainder when the send
+    window was exhausted mid-body (RFC 9113 §6.9). Drained by
+    :meth:`pump_pending_body` when an inbound WINDOW_UPDATE opens
+    the window."""
+
+    var _pending_body_fin: Dict[Int, Bool]
+    """Stream-id -> whether the stashed remainder's final DATA
+    frame must carry END_STREAM once fully drained."""
+
+    def __init__(out self):
+        """Default-construct with :class:`Http2ClientConfig` defaults."""
+        self.conn = Connection()
+        self.conn.is_client = True
+        self.inbox = List[UInt8]()
+        self.outbox = List[UInt8]()
+        self.greeted = False
+        self.config = Http2ClientConfig()
+        self.conn.initial_window_size = self.config.initial_window_size
+        self._next_sid = 1
+        self._bdp_window = 65535
+        self._bdp_bytes = 0
+        self._bdp_sent_ns = 0
+        self._bdp_next_ns = 0
+        self._bdp_hdr = List[UInt8]()
+        self._bdp_skip = 0
+        self._stream_errors = Dict[Int, Int]()
+        self._pending_body = Dict[Int, List[UInt8]]()
+        self._pending_body_fin = Dict[Int, Bool]()
+        try:
+            self._emit_preface_and_settings()
+        except:
+            pass
+
+    @staticmethod
+    def from_h2c_upgrade(
+        var config: Http2ClientConfig,
+    ) raises -> Http2ClientConnection:
+        """Build a client-side driver pre-seeded for an h2c upgrade.
+
+        Per RFC 7540 §3.2 ("Starting HTTP/2 for HTTP URIs"), after the
+        server accepts the upgrade with ``101 Switching Protocols``
+        the original HTTP/1.1 request implicitly becomes stream id 1
+        in HALF_CLOSED_LOCAL state from the client's perspective: the
+        request body has already been delivered on the h1 wire, so
+        the client sends no further bytes on stream 1; the server
+        will respond on stream 1 with HEADERS + DATA.
+
+        After construction the caller MUST:
+
+        1. Drain the connection preface + SETTINGS frame from
+           :attr:`outbox` and write it to the (now-h2) socket as the
+           client's connection preface (RFC 9113 §3.5);
+        2. Feed inbound bytes into :meth:`feed`, expecting the
+           server's initial SETTINGS frame followed by a HEADERS+DATA
+           response on stream 1;
+        3. Poll :meth:`response_ready(1)` and pop the response via
+           :meth:`take_response(1)`.
+
+        The next client-initiated stream id starts at 3 (RFC 9113
+        §5.1.1: odd, monotonically increasing, and stream 1 is
+        already taken).
+
+        Args:
+            config: Same client config the upgrade request advertised
+                via the ``HTTP2-Settings`` header (the SETTINGS frame
+                in the connection preface MUST agree with the values
+                the upgrade request committed to).
+
+        Returns:
+            An :class:`Http2ClientConnection` whose outbox holds the
+            client's connection preface + initial SETTINGS frame and
+            whose ``conn.streams`` already contains stream id 1 in
+            HALF_CLOSED_LOCAL state.
+        """
+        config.validate()
+        var out = Http2ClientConnection.with_config(config^)
+        var s = Stream()
+        s.id = 1
+        s.send_window = out.conn.peer_initial_window_size
+        s.recv_window = out.conn.initial_window_size
+        s.state = StreamState.HALF_CLOSED_LOCAL()
+        out.conn.streams[1] = s^
+        out.conn.note_local_stream(1)
+        out._next_sid = 3
+        return out^
+
+    @staticmethod
+    def with_config(
+        var config: Http2ClientConfig,
+    ) raises -> Http2ClientConnection:
+        """Construct a driver whose underlying SETTINGS reflect ``config``.
+
+        Validates ``config`` first (RFC 9113 / RFC 7541 bounds);
+        raises if any field is out of range. Same construction
+        shape as :meth:`Http2Connection.with_config`.
+        """
+        config.validate()
+        var out = Http2ClientConnection()
+        out.config = config^
+        out.conn.initial_window_size = out.config.initial_window_size
+        # Connection windows start at 65535 (RFC 9113 sec 6.9.2).
+        out.conn.send_window = 65535
+        out.conn.recv_window = 65535
+        # We accept up to what we advertise; what we send stays at 16384
+        # until the server's SETTINGS raise it (RFC 9113 sec 4.2).
+        out.conn.local_max_frame_size = out.config.max_frame_size
+        out.conn.max_header_list_size = out.config.max_header_list_size
+        # What we advertise is the ceiling for a peer size update
+        # (RFC 7541 sec 6.3). The decoder's *current* size stays at the
+        # 4096 default: the peer's encoder keeps that table until it has
+        # received our SETTINGS and sent a size update (sec 4.2), so
+        # shrinking now would drop entries it still indexes (HPACK-03).
+        out.conn.hpack_decoder.settings_max_size = out.config.header_table_size
+        out.conn.hpack_decoder.allow_huffman = out.config.allow_huffman_decode
+        out.conn.hpack_encoder.allow_huffman = out.config.allow_huffman_encode
+        out.conn.enable_connect_protocol = out.config.enable_connect_protocol
+        # Re-emit preface + SETTINGS into a fresh outbox now that
+        # ``config`` has been applied. The default-constructed
+        # outbox already holds the *unconfigured* defaults, but
+        # ``with_config`` runs after ``__init__`` so we need to
+        # rebuild the SETTINGS frame against the new config values.
+        out.outbox = List[UInt8]()
+        out.greeted = False
+        out._emit_preface_and_settings()
+        return out^
+
+    def _emit_preface_and_settings(mut self) raises:
+        """Pre-load :attr:`outbox` with the connection preface and the
+        client's initial SETTINGS frame.
+
+        Called once from :meth:`__init__` /
+        :meth:`with_config`. Idempotent on :attr:`greeted`.
+        """
+        if self.greeted:
+            return
+        # 24-byte client connection preface (RFC 9113 §3.5).
+        var preface = String(H2_PREFACE)
+        var pp = preface.unsafe_ptr()
+        for i in range(24):
+            self.outbox.append(pp[unsafe_offset=i])
+        # Client SETTINGS frame: emit each (id, value) pair that
+        # differs from the RFC 9113 / RFC 7541 protocol default.
+        # The high-level facade then waits for the server's
+        # SETTINGS frame + the server's ACK of ours.
+        var f = Frame()
+        f.header.type = FrameType.SETTINGS()
+        f.header.stream_id = 0
+        f.header.flags = FrameFlags(UInt8(0))
+        var p = List[UInt8]()
+        # SETTINGS_HEADER_TABLE_SIZE = 0x1
+        if self.config.header_table_size != 4096:
+            self._append_setting(p, 0x1, self.config.header_table_size)
+        # SETTINGS_ENABLE_PUSH = 0x2 -- always advertise 0 (no
+        # push). RFC 9113 §6.5.2: the protocol default is 1, so
+        # we MUST emit this pair to opt out. Setting this to 0
+        # tells the server it MUST NOT send PUSH_PROMISE; if it
+        # does, we treat that as a connection error
+        # (PROTOCOL_ERROR).
+        self._append_setting(p, 0x2, 0)
+        # SETTINGS_INITIAL_WINDOW_SIZE = 0x4
+        if self.config.initial_window_size != 65535:
+            self._append_setting(p, 0x4, self.config.initial_window_size)
+        # SETTINGS_MAX_FRAME_SIZE = 0x5
+        if self.config.max_frame_size != H2_DEFAULT_FRAME_SIZE:
+            self._append_setting(p, 0x5, self.config.max_frame_size)
+        # SETTINGS_MAX_HEADER_LIST_SIZE = 0x6 (only when set)
+        if self.config.max_header_list_size > 0:
+            self._append_setting(p, 0x6, self.config.max_header_list_size)
+        # SETTINGS_ENABLE_CONNECT_PROTOCOL = 0x8 (RFC 8441 §3).
+        # We only emit when on -- the protocol default is 0, so an
+        # absent pair is interpreted as "client does not support
+        # Extended CONNECT" (which is the safe fallback).
+        if self.config.enable_connect_protocol:
+            self._append_setting(p, 0x8, 1)
+        f.payload = p^
+        f.header.length = len(f.payload)
+        var bytes = encode_frame(f)
+        for i in range(len(bytes)):
+            self.outbox.append(bytes[i])
+        # The connection window starts at 65535 (RFC 9113 sec 6.9.2);
+        # open it to match a larger configured stream window.
+        self._bdp_window = max(65535, self.config.initial_window_size)
+        if self._bdp_window > 65535:
+            self.outbox.extend(
+                encode_frame(
+                    Connection._window_update_frame(0, self._bdp_window - 65535)
+                )
+            )
+            self.conn.recv_window = self._bdp_window
+        self.greeted = True
+
+    def _append_setting(self, mut buf: List[UInt8], id: Int, value: Int):
+        """Append one 6-byte SETTINGS pair (RFC 9113 §6.5.1):
+        big-endian 2-byte id then big-endian 4-byte value."""
+        buf.append(UInt8((id >> 8) & 0xFF))
+        buf.append(UInt8(id & 0xFF))
+        buf.append(UInt8((value >> 24) & 0xFF))
+        buf.append(UInt8((value >> 16) & 0xFF))
+        buf.append(UInt8((value >> 8) & 0xFF))
+        buf.append(UInt8(value & 0xFF))
+
+    # ── I/O surface ──────────────────────────────────────────────────────
+
+    def drain(mut self) -> List[UInt8]:
+        """Return all queued outbound bytes and clear the buffer.
+
+        Mirrors :meth:`Http2Connection.drain` for symmetry.
+        """
+        var out = self.outbox.copy()
+        self.outbox = List[UInt8]()
+        return out^
+
+    def feed(mut self, data: Span[UInt8, _]) raises:
+        """Push ``data`` (bytes from the socket) into the driver.
+
+        Decodes any complete frames in :attr:`inbox`, applies them
+        via :meth:`Connection.handle_frame`, and queues any
+        auto-generated reply frames (SETTINGS ACK, PING ACK,
+        WINDOW_UPDATE) into :attr:`outbox`. Per-stream completion
+        becomes observable via :meth:`response_ready` after this
+        call returns.
+
+        An oversized frame (RFC 9113 sec 4.2) queues
+        GOAWAY(FRAME_SIZE_ERROR) and discards the rest of the input
+        instead of raising; check :attr:`conn.goaway_sent` and flush
+        :meth:`drain` before closing.
+
+        Raises:
+            Error: On a connection-level protocol violation the frame
+                layer cannot report as a frame (malformed frame header,
+                etc.).
+        """
+        for i in range(len(data)):
+            self.inbox.append(data[i])
+        # Drain frames until we run out of complete ones.
+        var window_updated = False
+        while True:
+            if len(self.inbox) >= 9:
+                var frame_size = (
+                    (Int(self.inbox[0]) << 16)
+                    | (Int(self.inbox[1]) << 8)
+                    | Int(self.inbox[2])
+                )
+                if frame_size > self.config.max_frame_size:
+                    # sec 4.2: a frame over the size we advertised is a
+                    # connection error FRAME_SIZE_ERROR. Queue the GOAWAY
+                    # rather than raising: callers let a raise propagate
+                    # and then close without sending anything (H2-18).
+                    var gerr = self.conn._conn_error(
+                        Http2ErrorCode.FRAME_SIZE_ERROR().value
+                    )
+                    for gi in range(len(gerr)):
+                        self.outbox.extend(Span(encode_frame(gerr[gi])))
+                    self.inbox = List[UInt8]()
+                    return
+            var span = Span[UInt8, _](self.inbox)
+            var got = parse_frame(span)
+            if not got:
+                break
+            var frame = got.value().copy()
+            var consumed = 9 + frame.header.length
+            var rest = List[UInt8](capacity=len(self.inbox) - consumed)
+            for i in range(consumed, len(self.inbox)):
+                rest.append(self.inbox[i])
+            self.inbox = rest^
+            # PUSH_PROMISE from the server: we never opt in
+            # (SETTINGS_ENABLE_PUSH=0 in our preface SETTINGS), so it is a
+            # connection error of type PROTOCOL_ERROR (RFC 9113 sec 8.4).
+            # It goes to ``handle_frame`` like every other frame, which
+            # answers with GOAWAY. It must not be dropped: its header block
+            # may insert into the server's HPACK table, and skipping it
+            # would leave the decoder out of step for every later response
+            # (RFC 9113 sec 4.3, H2-17).
+            # Special-case: RST_STREAM. ``Connection.handle_frame``
+            # already marks the stream CLOSED but does not retain
+            # the peer's error code. Stash it here so the
+            # high-level facade can propagate a meaningful error.
+            if frame.header.type.value == FrameType.RST_STREAM().value:
+                if len(frame.payload) == 4 and frame.header.stream_id != 0:
+                    var code = (
+                        (Int(frame.payload[0]) << 24)
+                        | (Int(frame.payload[1]) << 16)
+                        | (Int(frame.payload[2]) << 8)
+                        | Int(frame.payload[3])
+                    )
+                    var sid = frame.header.stream_id
+                    var completed = False
+                    if sid in self.conn.streams:
+                        var s = self.conn.streams[sid].copy()
+                        completed = s.headers_complete and s.data_complete
+                    # RFC 9113 sec 8.1: NO_ERROR after a complete response
+                    # asks us to stop uploading, without discarding it.
+                    if code != 0 or not completed:
+                        self._stream_errors[sid] = code
+                    self._discard_pending_body(sid)
+            if (
+                frame.header.type.value == FrameType.GOAWAY().value
+                and len(frame.payload) >= 8
+            ):
+                var last = (
+                    (Int(frame.payload[0]) << 24)
+                    | (Int(frame.payload[1]) << 16)
+                    | (Int(frame.payload[2]) << 8)
+                    | Int(frame.payload[3])
+                ) & 0x7FFFFFFF
+                var code = (
+                    (Int(frame.payload[4]) << 24)
+                    | (Int(frame.payload[5]) << 16)
+                    | (Int(frame.payload[6]) << 8)
+                    | Int(frame.payload[7])
+                )
+                for entry in self.conn.streams.items():
+                    if entry[0] > last:
+                        # RFC 9113 sec 6.8: streams above last_stream_id
+                        # were never processed, so they are safe to retry
+                        # on a fresh connection. On a graceful GOAWAY
+                        # (code 0) recording 0 for them made
+                        # stream_error(sid) indistinguishable from the
+                        # clean RST_STREAM(NO_ERROR)-after-a-complete-
+                        # response case. REFUSED_STREAM is the code that
+                        # carries the retry-safe meaning, and retry logic
+                        # reads this.
+                        self._stream_errors[
+                            entry[0]
+                        ] = Http2ErrorCode.REFUSED_STREAM().value
+                    elif code != 0:
+                        self._stream_errors[entry[0]] = code
+            if frame.header.type.value == FrameType.WINDOW_UPDATE().value:
+                window_updated = True
+            var reply = self.conn.handle_frame(frame^)
+            for i in range(len(reply)):
+                if reply[i].header.type.value == FrameType.RST_STREAM().value:
+                    self._stream_errors[reply[i].header.stream_id] = (
+                        (Int(reply[i].payload[0]) << 24)
+                        | (Int(reply[i].payload[1]) << 16)
+                        | (Int(reply[i].payload[2]) << 8)
+                        | Int(reply[i].payload[3])
+                    )
+                var rb = encode_frame(reply[i])
+                for j in range(len(rb)):
+                    self.outbox.append(rb[j])
+        # Process responses and resets from the same read before sending
+        # more upload bytes on newly granted credit.
+        if window_updated and not self.conn.goaway_sent:
+            self._pump_all_pending()
+
+    def receive(mut self, data: Span[UInt8, _]) raises:
+        """:meth:`feed` that also grows the receive windows with the
+        measured bandwidth-delay product: drivers call this."""
+        var i = 0
+        while i < len(data):
+            if self._bdp_skip > 0:
+                var k = min(self._bdp_skip, len(data) - i)
+                i += k
+                self._bdp_skip -= k
+                continue
+            self._bdp_hdr.append(data[i])
+            i += 1
+            if len(self._bdp_hdr) < 9:
+                continue
+            ref h = self._bdp_hdr
+            var n = Int(h[0]) << 16 | Int(h[1]) << 8 | Int(h[2])
+            if h[3] == UInt8(FrameType.DATA().value):
+                self._bdp_on_data(n)
+            elif h[3] == UInt8(FrameType.PING().value) and (h[4] & 1) != 0:
+                self._bdp_on_ack()
+            self._bdp_skip = n
+            self._bdp_hdr.clear()
+        self.feed(data)
+
+    def _bdp_on_data(mut self, n: Int):
+        """Count DATA toward the outstanding sample, or start one with a
+        PING when the window can still grow."""
+        if self._bdp_sent_ns != 0:
+            self._bdp_bytes += n
+            return
+        if (
+            n == 0
+            or self._bdp_window >= BDP_WINDOW_MAX
+            or self.conn.goaway_sent
+        ):
+            return
+        var now = perf_counter_ns()
+        if now < self._bdp_next_ns:
+            return
+        var ping = Frame()
+        ping.header.type = FrameType.PING()
+        ping.payload = _bdp_ping_payload()
+        ping.header.length = 8
+        self.outbox.extend(encode_frame(ping))
+        self._bdp_sent_ns = now
+        self._bdp_bytes = n
+
+    def _bdp_on_ack(mut self) raises:
+        """The PING came back (the client sends no other PING): when the
+        round trip's DATA filled two thirds of the window, grow both
+        windows to twice it."""
+        if self._bdp_sent_ns == 0:
+            return
+        self._bdp_sent_ns = 0
+        if self._bdp_bytes * 3 < self._bdp_window * 2:
+            self._bdp_next_ns = perf_counter_ns() + 1_000_000_000
+            return
+        var w = min(self._bdp_bytes * 2, BDP_WINDOW_MAX)
+        if w <= self._bdp_window:
+            return
+        var delta = w - self._bdp_window
+        var p = List[UInt8]()
+        self._append_setting(p, 0x4, w)
+        var f = Frame()
+        f.header.type = FrameType.SETTINGS()
+        f.header.length = len(p)
+        f.payload = p^
+        self.outbox.extend(encode_frame(f))
+        self.conn.initial_window_size = w
+        var sids = List[Int]()
+        for entry in self.conn.streams.items():
+            sids.append(entry[0])
+        for sid in sids:
+            var st = self.conn.streams.pop(sid)
+            st.recv_window += delta
+            self.conn.streams[sid] = st^
+        self.outbox.extend(
+            encode_frame(Connection._window_update_frame(0, delta))
+        )
+        self.conn.recv_window += delta
+        self._bdp_window = w
+
+    # ── Stream id allocation ─────────────────────────────────────────────
+
+    def next_stream_id(mut self) -> Int:
+        """Allocate the next client-initiated stream id.
+
+        RFC 9113 §5.1.1: client-initiated stream identifiers must
+        be odd, MUST be monotonically increasing, and MUST NOT
+        exceed ``2^31 - 1``. Once we'd wrap, the connection MUST
+        be closed gracefully via GOAWAY.
+        """
+        var sid = self._next_sid
+        self._next_sid += 2
+        return sid
+
+    # ── Body emission + pending-body queue (RFC 9113 §6.9) ───────────────
+
+    def _emit_body_span(
+        mut self,
+        sid: Int,
+        body: Span[UInt8, _],
+        start: Int,
+        end_stream: Bool,
+    ) raises -> Int:
+        """Emit DATA frames for ``body[start:]`` bounded by the
+        connection + stream send windows and ``max_frame_size``.
+
+        Returns the absolute position reached: ``len(body)`` when the
+        whole body was sent, or the offset where the send window ran
+        out (the caller stashes the remainder for
+        :meth:`pump_pending_body`). Never raises on window exhaustion.
+        """
+        var n_body = len(body)
+        var max_frame = self.conn.max_frame_size
+        var pos = start
+        while pos < n_body:
+            var chunk = max_frame
+            if pos + chunk > n_body:
+                chunk = n_body - pos
+            var win = self.conn.send_window
+            if sid in self.conn.streams:
+                var sl = self.conn.streams[sid].copy()
+                if sl.send_window < win:
+                    win = sl.send_window
+            if chunk > win:
+                chunk = win
+            if chunk <= 0:
+                return pos  # window exhausted; caller stashes remainder
+            var df = Frame()
+            df.header.type = FrameType.DATA()
+            df.header.stream_id = sid
+            var is_last = pos + chunk == n_body
+            if is_last and end_stream:
+                df.header.flags = FrameFlags(FrameFlags.END_STREAM())
+            else:
+                df.header.flags = FrameFlags(UInt8(0))
+            var dp = List[UInt8](capacity=chunk)
+            for i in range(chunk):
+                dp.append(body[pos + i])
+            df.payload = dp^
+            df.header.length = len(df.payload)
+            var db = encode_frame(df)
+            for i in range(len(db)):
+                self.outbox.append(db[i])
+            self.conn.send_window -= chunk
+            if sid in self.conn.streams:
+                var sl2 = self.conn.streams[sid].copy()
+                sl2.send_window -= chunk
+                if is_last and end_stream:
+                    # sec 5.1: our END_STREAM closes a stream the peer has
+                    # already ended; otherwise it half-closes our side.
+                    sl2.state = (
+                        StreamState.CLOSED() if sl2.state.value
+                        == StreamState.HALF_CLOSED_REMOTE().value else StreamState.HALF_CLOSED_LOCAL()
+                    )
+                self.conn.streams[sid] = sl2^
+            pos += chunk
+        return pos
+
+    def _stash_pending(
+        mut self, sid: Int, body: Span[UInt8, _], start: Int, fin: Bool
+    ):
+        """Stash ``body[start:]`` as this stream's pending body."""
+        var rem = List[UInt8](capacity=len(body) - start)
+        for i in range(start, len(body)):
+            rem.append(body[i])
+        self._pending_body[sid] = rem^
+        self._pending_body_fin[sid] = fin
+
+    def pump_pending_body(mut self, sid: Int) raises:
+        """Re-attempt draining a stream's stashed body after a
+        WINDOW_UPDATE opened the send window. No-op when the stream
+        has no pending body."""
+        if sid not in self._pending_body:
+            return
+        if self.response_ready(sid) or sid in self._stream_errors:
+            # Dropping the stashed body is right, but the stream has to
+            # be closed out as well. Discarding alone left our half open
+            # with no END_STREAM and no RST_STREAM on the wire: the peer
+            # kept counting it against SETTINGS_MAX_CONCURRENT_STREAMS
+            # and the request was truncated at whatever frame boundary
+            # we reached, with nothing recorded anywhere. finish_upload
+            # already handles the CLOSED / HALF_CLOSED_LOCAL case that
+            # `sid in self._stream_errors` implies, so it is a no-op when
+            # the stream really is finished.
+            self._discard_pending_body(sid)
+            self.finish_upload(sid)
+            return
+        var rem = self._pending_body[sid].copy()
+        var fin = self._pending_body_fin[sid]
+        var sent = self._emit_body_span(sid, Span(rem), 0, fin)
+        if sent >= len(rem):
+            _ = self._pending_body.pop(sid)
+            _ = self._pending_body_fin.pop(sid)
+        else:
+            var still = List[UInt8](capacity=len(rem) - sent)
+            for i in range(sent, len(rem)):
+                still.append(rem[i])
+            self._pending_body[sid] = still^
+
+    def _pump_all_pending(mut self) raises:
+        """Drain every stream with a pending body (called after an
+        inbound WINDOW_UPDATE)."""
+        var sids = List[Int]()
+        for entry in self._pending_body.items():
+            sids.append(entry.key)
+        for i in range(len(sids)):
+            self.pump_pending_body(sids[i])
+
+    def has_pending_body(self, sid: Int) -> Bool:
+        """True if stream ``sid`` has a body remainder still awaiting a
+        WINDOW_UPDATE (RFC 9113 §6.9)."""
+        return sid in self._pending_body
+
+    def _discard_pending_body(mut self, sid: Int) raises:
+        if sid in self._pending_body:
+            _ = self._pending_body.pop(sid)
+        if sid in self._pending_body_fin:
+            _ = self._pending_body_fin.pop(sid)
+
+    def finish_upload(mut self, sid: Int) raises:
+        """Drop unsent request bytes and finish our half after an early reply.
+
+        Preserve the received response. A peer reset may already have closed
+        the stream, in which case no further DATA is permitted.
+        """
+        self._discard_pending_body(sid)
+        if sid not in self.conn.streams:
+            return
+        var s = self.conn.streams[sid].copy()
+        if s.state.value == StreamState.CLOSED().value or (
+            s.state.value == StreamState.HALF_CLOSED_LOCAL().value
+        ):
+            return
+        var empty = List[UInt8]()
+        self.send_data(sid, Span(empty), True)
+
+    # ── Sending requests ─────────────────────────────────────────────────
+
+    def send_request(
+        mut self,
+        sid: Int,
+        method: String,
+        scheme: String,
+        authority: String,
+        path: String,
+        extra_headers: List[HpackHeader],
+        body: Span[UInt8, _],
+    ) raises -> None:
+        """Encode + queue a request on stream ``sid``.
+
+        Builds the pseudo-header block per RFC 9113 §8.1.2.3 in the
+        required order (``:method``, ``:scheme``, ``:authority``,
+        ``:path``) followed by the caller-supplied
+        ``extra_headers`` (already lower-cased; RFC 9113 §8.1.2),
+        HPACK-encodes the lot via the shared :class:`HpackEncoder`,
+        and emits a HEADERS frame.
+
+        If ``body`` is empty, the HEADERS frame carries
+        ``END_STREAM`` and the stream transitions to
+        HALF_CLOSED_LOCAL. Otherwise the body is split into one
+        or more DATA frames bounded by the negotiated
+        ``max_frame_size`` and the connection-level + per-stream
+        send windows; the *last* DATA frame carries
+        ``END_STREAM``. If the windows can't fit the entire body
+        right now, we emit as much as fits and stash the
+        remainder for the caller to flush via
+        :meth:`pump_pending_body` after WINDOW_UPDATE has
+        loosened the windows.
+
+        Args:
+            sid: Stream id allocated via :meth:`next_stream_id`.
+            method: HTTP method (e.g. ``"GET"``, ``"POST"``).
+            scheme: ``"http"`` or ``"https"``.
+            authority: ``Host``-equivalent (RFC 9113 §8.1.2.3.1).
+            path: Request target (RFC 9113 §8.1.2.3.4).
+            extra_headers: Caller-supplied request headers
+                (lowercased name -> value). MUST NOT contain any
+                of the connection-level headers forbidden by RFC
+                9113 §8.2.2 (``connection``, ``transfer-encoding``,
+                ``keep-alive``, ``proxy-connection``, ``upgrade``);
+                the high-level facade strips them before calling.
+            body: Request body bytes; may be empty.
+        """
+        var hh = List[HpackHeader]()
+        hh.append(HpackHeader(":method", method))
+        hh.append(HpackHeader(":scheme", scheme))
+        hh.append(HpackHeader(":authority", authority))
+        hh.append(HpackHeader(":path", path))
+        for i in range(len(extra_headers)):
+            hh.append(extra_headers[i].copy())
+        var enc = self.conn.hpack_encoder.encode(Span[HpackHeader, _](hh))
+        # HEADERS frame with END_HEADERS always set (the
+        # encoder produces a single contiguous block; we don't
+        # split into CONTINUATION yet -- that's a follow-up for
+        # >max_frame_size header blocks). If the encoded block
+        # exceeds ``max_frame_size`` we fall back to a HEADERS +
+        # CONTINUATION sequence below.
+        var max_frame = self.conn.max_frame_size
+        var n_enc = len(enc)
+        if n_enc <= max_frame:
+            var hf = Frame()
+            hf.header.type = FrameType.HEADERS()
+            hf.header.stream_id = sid
+            var flags = FrameFlags.END_HEADERS()
+            if len(body) == 0:
+                flags |= FrameFlags.END_STREAM()
+            hf.header.flags = FrameFlags(flags)
+            hf.payload = enc^
+            hf.header.length = len(hf.payload)
+            var hb = encode_frame(hf)
+            for i in range(len(hb)):
+                self.outbox.append(hb[i])
+        else:
+            # First frame: HEADERS with END_HEADERS = 0; payload
+            # is the first ``max_frame`` bytes of the encoded
+            # block. END_STREAM rides on the HEADERS frame even
+            # when the block continues across CONTINUATION
+            # frames (RFC 9113 §6.10).
+            var hf = Frame()
+            hf.header.type = FrameType.HEADERS()
+            hf.header.stream_id = sid
+            var hflags = UInt8(0)
+            if len(body) == 0:
+                hflags |= FrameFlags.END_STREAM()
+            hf.header.flags = FrameFlags(hflags)
+            var first_payload = List[UInt8](capacity=max_frame)
+            for i in range(max_frame):
+                first_payload.append(enc[i])
+            hf.payload = first_payload^
+            hf.header.length = len(hf.payload)
+            var hb = encode_frame(hf)
+            for i in range(len(hb)):
+                self.outbox.append(hb[i])
+            # CONTINUATION frames for the rest. Each carries
+            # END_HEADERS=0 except the last.
+            var pos = max_frame
+            while pos < n_enc:
+                var chunk = max_frame
+                if pos + chunk > n_enc:
+                    chunk = n_enc - pos
+                var cf = Frame()
+                cf.header.type = FrameType.CONTINUATION()
+                cf.header.stream_id = sid
+                if pos + chunk == n_enc:
+                    cf.header.flags = FrameFlags(FrameFlags.END_HEADERS())
+                else:
+                    cf.header.flags = FrameFlags(UInt8(0))
+                var cp = List[UInt8](capacity=chunk)
+                for i in range(chunk):
+                    cp.append(enc[pos + i])
+                cf.payload = cp^
+                cf.header.length = len(cf.payload)
+                var cb = encode_frame(cf)
+                for i in range(len(cb)):
+                    self.outbox.append(cb[i])
+                pos += chunk
+        # Locally track the new stream so flow-control accounting
+        # works for subsequent inbound frames.
+        var s = Stream()
+        s.id = sid
+        s.send_window = self.conn.peer_initial_window_size
+        s.recv_window = self.conn.initial_window_size
+        if len(body) == 0:
+            s.state = StreamState.HALF_CLOSED_LOCAL()
+        else:
+            s.state = StreamState.OPEN()
+        s.response_body_allowed = method.upper() != "HEAD"
+        self.conn.streams[sid] = s^
+        self.conn.note_local_stream(sid)
+        # Body: emit DATA frames bounded by the current send windows
+        # + max_frame_size. If the window is exhausted mid-body the
+        # remainder is stashed and drained by ``pump_pending_body``
+        # when an inbound WINDOW_UPDATE opens the window (RFC 9113
+        # §6.9), instead of raising.
+        var n_body = len(body)
+        if n_body > 0:
+            var sent = self._emit_body_span(sid, body, 0, True)
+            if sent < n_body:
+                self._stash_pending(sid, body, sent, True)
+
+    def send_extended_connect(
+        mut self,
+        sid: Int,
+        scheme: String,
+        authority: String,
+        path: String,
+        protocol: String,
+        extra_headers: List[HpackHeader],
+    ) raises -> None:
+        """Open an RFC 8441 Extended CONNECT stream.
+
+        Emits a HEADERS frame with the Extended-CONNECT pseudo-header
+        set (``:method = CONNECT, :scheme, :authority, :path,
+        :protocol``) **without** ``END_STREAM``. The stream stays in
+        OPEN state so the caller can pump bidirectional DATA frames
+        (e.g. WebSocket frames over h2 -- ``protocol="websocket"``).
+
+        The peer MUST have advertised
+        ``SETTINGS_ENABLE_CONNECT_PROTOCOL=1`` (RFC 8441 §3) before
+        the caller invokes this; gate the call on
+        :meth:`peer_supports_extended_connect`. The driver does NOT
+        block here -- callers may pre-stage the frame and the peer
+        may have already ACKed our SETTINGS by the time the bytes
+        are flushed.
+
+        Args:
+            sid: Stream id allocated via :meth:`next_stream_id`.
+            scheme: ``"http"`` or ``"https"`` per RFC 8441 §4.
+            authority: ``Host``-equivalent.
+            path: Request target.
+            protocol: Tunnelled protocol token, e.g. ``"websocket"``.
+            extra_headers: Caller-supplied headers (lowercased).
+        """
+        var hh = List[HpackHeader]()
+        hh.append(HpackHeader(":method", "CONNECT"))
+        hh.append(HpackHeader(":scheme", scheme))
+        hh.append(HpackHeader(":authority", authority))
+        hh.append(HpackHeader(":path", path))
+        hh.append(HpackHeader(":protocol", protocol))
+        for i in range(len(extra_headers)):
+            hh.append(extra_headers[i].copy())
+        var enc = self.conn.hpack_encoder.encode(Span[HpackHeader, _](hh))
+        var hf = Frame()
+        hf.header.type = FrameType.HEADERS()
+        hf.header.stream_id = sid
+        # Extended CONNECT: NO END_STREAM (the stream stays open).
+        hf.header.flags = FrameFlags(FrameFlags.END_HEADERS())
+        hf.payload = enc^
+        hf.header.length = len(hf.payload)
+        var hb = encode_frame(hf)
+        for i in range(len(hb)):
+            self.outbox.append(hb[i])
+        var s = Stream()
+        s.id = sid
+        s.send_window = self.conn.peer_initial_window_size
+        s.recv_window = self.conn.initial_window_size
+        s.state = StreamState.OPEN()
+        self.conn.streams[sid] = s^
+        self.conn.note_local_stream(sid)
+
+    def send_data(
+        mut self,
+        sid: Int,
+        body: Span[UInt8, _],
+        end_stream: Bool,
+    ) raises -> None:
+        """Queue ``body`` as one or more DATA frames on stream ``sid``.
+
+        Used by tunnelling clients (Extended CONNECT bodies, or
+        chunked POSTs that need to be fed incrementally) where the
+        caller wants explicit control over ``END_STREAM`` placement.
+        Same flow-control accounting as the body-emission path of
+        :meth:`send_request`. Honours the negotiated send windows;
+        raises if the body wouldn't fit.
+        """
+        # sec 5.1, closed: "An endpoint MUST NOT send frames other than
+        # PRIORITY on a closed stream." A reset or finished stream stays
+        # closed; sending here would queue a DATA frame the peer answers
+        # with STREAM_CLOSED and would reopen the stream locally.
+        if sid in self.conn.streams and (
+            self.conn.streams[sid].state.value == StreamState.CLOSED().value
+        ):
+            self._discard_pending_body(sid)
+            return
+        var n_body = len(body)
+        if n_body == 0 and end_stream:
+            # Empty DATA with END_STREAM is the half-close marker.
+            var df = Frame()
+            df.header.type = FrameType.DATA()
+            df.header.stream_id = sid
+            df.header.flags = FrameFlags(FrameFlags.END_STREAM())
+            df.payload = List[UInt8]()
+            df.header.length = 0
+            var db = encode_frame(df)
+            for i in range(len(db)):
+                self.outbox.append(db[i])
+            if sid in self.conn.streams:
+                var s_local = self.conn.streams[sid].copy()
+                s_local.state = (
+                    StreamState.CLOSED() if s_local.state.value
+                    == StreamState.HALF_CLOSED_REMOTE().value else StreamState.HALF_CLOSED_LOCAL()
+                )
+                self.conn.streams[sid] = s_local^
+            return
+        # Emit as far as the window allows; stash any remainder for
+        # pump_pending_body on the next WINDOW_UPDATE (RFC 9113 §6.9).
+        var sent = self._emit_body_span(sid, body, 0, end_stream)
+        if sent < n_body:
+            self._stash_pending(sid, body, sent, end_stream)
+
+    def peer_supports_extended_connect(imm self) -> Bool:
+        """Return ``True`` once the peer has advertised
+        ``SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`` (RFC 8441 §3).
+
+        Latches on the first server-side SETTINGS that includes the
+        bit and never flips back -- RFC 9113 §6.5 forbids tearing
+        down an already-advertised SETTINGS value once peers have
+        acted on it. Callers should gate any
+        :meth:`send_extended_connect` call on this returning ``True``.
+        """
+        return self.conn.peer_enable_connect_protocol
+
+    def send_goaway(mut self, last_stream_id: Int, error_code: Int = 0) -> None:
+        """Queue a GOAWAY frame (RFC 9113 §6.8).
+
+        The peer should treat any stream id > ``last_stream_id``
+        as not-processed; in-flight streams below that id MAY
+        complete. ``error_code`` defaults to 0 (NO_ERROR) for a
+        clean shutdown; pass an :class:`Http2ErrorCode` value for
+        an abnormal close.
+        """
+        var f = Frame()
+        f.header.type = FrameType.GOAWAY()
+        f.header.stream_id = 0
+        f.header.flags = FrameFlags(UInt8(0))
+        var p = List[UInt8]()
+        var lsi = last_stream_id & 0x7FFFFFFF
+        p.append(UInt8((lsi >> 24) & 0xFF))
+        p.append(UInt8((lsi >> 16) & 0xFF))
+        p.append(UInt8((lsi >> 8) & 0xFF))
+        p.append(UInt8(lsi & 0xFF))
+        p.append(UInt8((error_code >> 24) & 0xFF))
+        p.append(UInt8((error_code >> 16) & 0xFF))
+        p.append(UInt8((error_code >> 8) & 0xFF))
+        p.append(UInt8(error_code & 0xFF))
+        f.payload = p^
+        f.header.length = len(f.payload)
+        var bytes = encode_frame(f)
+        for i in range(len(bytes)):
+            self.outbox.append(bytes[i])
+
+    def _send_rst_stream(mut self, sid: Int, error_code: Int) -> None:
+        """Queue a RST_STREAM frame (RFC 9113 §6.4)."""
+        var f = Frame()
+        f.header.type = FrameType.RST_STREAM()
+        f.header.stream_id = sid
+        f.header.flags = FrameFlags(UInt8(0))
+        var p = List[UInt8]()
+        p.append(UInt8((error_code >> 24) & 0xFF))
+        p.append(UInt8((error_code >> 16) & 0xFF))
+        p.append(UInt8((error_code >> 8) & 0xFF))
+        p.append(UInt8(error_code & 0xFF))
+        f.payload = p^
+        f.header.length = len(f.payload)
+        var bytes = encode_frame(f)
+        for i in range(len(bytes)):
+            self.outbox.append(bytes[i])
+
+    # ── Inbound completion polling ───────────────────────────────────────
+
+    def response_ready(mut self, sid: Int) raises -> Bool:
+        """Return ``True`` when the response on stream ``sid`` is fully
+        buffered and ready to be popped via :meth:`take_response`.
+
+        A response is "ready" iff its HEADERS block has been
+        completely received (END_HEADERS observed on either
+        HEADERS or trailing CONTINUATION) **and** either:
+
+        - the stream has been ENDed by the peer (END_STREAM seen
+          on HEADERS or DATA), or
+        - the stream has been RESET by the peer.
+        """
+        if sid in self._stream_errors:
+            return True
+        if sid not in self.conn.streams:
+            return False
+        # Moved out and back: a copy duplicated the whole buffered body
+        # on every poll, quadratic in the response size.
+        var s = self.conn.streams.pop(sid)
+        var ready = s.headers_complete and (
+            s.data_complete or s.state.value == StreamState.CLOSED().value
+        )
+        self.conn.streams[sid] = s^
+        return ready
+
+    def stream_error(self, sid: Int) raises -> Optional[Int]:
+        """Return the peer-supplied RST_STREAM error code for ``sid``,
+        if any. ``None`` means the stream completed cleanly (or has
+        not been reset)."""
+        if sid in self._stream_errors:
+            return Optional[Int](self._stream_errors[sid])
+        return Optional[Int]()
+
+    def take_response(mut self, sid: Int) raises -> Http2Response:
+        """Pop and return the :class:`Http2Response` for stream ``sid``.
+
+        Raises:
+            Error: When ``sid`` is unknown, the stream is not yet
+                ready (use :meth:`response_ready` to gate), or
+                the response lacks the required ``:status``
+                pseudo-header.
+
+        The returned :class:`Http2Response` owns the header list
+        and body bytes; the entry is removed from
+        :attr:`conn.streams` so the per-connection memory is
+        reclaimed across many sequential requests on one driver.
+        """
+        if not self.response_ready(sid):
+            raise Error("h2 client: take_response on stream not yet ready")
+        if sid not in self.conn.streams:
+            raise Error("h2 client: take_response on unknown stream")
+        # Pop the stream out of the per-conn dict so we own its
+        # storage outright (no aliasing into the live dict). This
+        # also bounds per-conn memory across many sequential
+        # requests on one driver.
+        var s = self.conn.streams.pop(sid)
+        # Locate :status; everything else is a regular header.
+        var status_str = String("")
+        var hdrs_out = List[HpackHeader]()
+        for i in range(len(s.headers)):
+            var h = s.headers[i].copy()
+            if h.name == ":status":
+                status_str = h.value
+            else:
+                hdrs_out.append(h^)
+        if status_str.byte_length() == 0:
+            raise Error(
+                "h2 client: response missing :status pseudo-header (RFC"
+                " 9113 §8.1.2.4)"
+            )
+        var status = Int(status_str)
+        # ``s.data.copy()`` keeps ``s`` whole so its destructor
+        # runs cleanly when the function returns; the body is
+        # one allocation per response so the extra copy is in
+        # the noise. The body memory peak stays the same: the
+        # source ``s.data`` is freed when ``s`` is destroyed at
+        # function exit, and the destination owned by the
+        # returned :class:`Http2Response` is the only live copy
+        # the caller holds.
+        var body_copy = s.data.copy()
+        return Http2Response(status, hdrs_out^, body_copy^)
+
+    def goaway_received(self) -> Bool:
+        """``True`` once the peer has sent a GOAWAY frame (RFC 9113
+        §6.8). The high-level facade SHOULD stop opening new
+        streams; in-flight streams MAY complete."""
+        return self.conn.goaway_received
+
+    # ── Incremental streaming surface ─────────────────────────────────────
+    #
+    # The unary path above buffers the whole response and pops it via
+    # take_response(). A streaming client instead opens a stream,
+    # pumps DATA frames as they arrive, and surfaces each message
+    # incrementally -- so a long server-streaming response stays
+    # bounded-memory rather than materializing every frame. These
+    # methods give the caller the live stream state without consuming it.
+
+    def send_request_open(
+        mut self,
+        sid: Int,
+        method: String,
+        scheme: String,
+        authority: String,
+        path: String,
+        extra_headers: List[HpackHeader],
+    ) raises -> None:
+        """Open a request stream that stays OPEN for incremental body
+        writes (client-streaming / bidi).
+
+        Like :meth:`send_request` but emits HEADERS *without*
+        ``END_STREAM`` and never any body, leaving the stream in OPEN
+        state so the caller pumps request DATA frames via
+        :meth:`send_data` and half-closes with an empty
+        ``end_stream=True`` DATA frame when the request body is done.
+        """
+        var hh = List[HpackHeader]()
+        hh.append(HpackHeader(":method", method))
+        hh.append(HpackHeader(":scheme", scheme))
+        hh.append(HpackHeader(":authority", authority))
+        hh.append(HpackHeader(":path", path))
+        for i in range(len(extra_headers)):
+            hh.append(extra_headers[i].copy())
+        var enc = self.conn.hpack_encoder.encode(Span[HpackHeader, _](hh))
+        var max_frame = self.conn.max_frame_size
+        var n_enc = len(enc)
+        if n_enc <= max_frame:
+            var hf = Frame()
+            hf.header.type = FrameType.HEADERS()
+            hf.header.stream_id = sid
+            hf.header.flags = FrameFlags(FrameFlags.END_HEADERS())
+            hf.payload = enc^
+            hf.header.length = len(hf.payload)
+            var hb = encode_frame(hf)
+            for i in range(len(hb)):
+                self.outbox.append(hb[i])
+        else:
+            var hf = Frame()
+            hf.header.type = FrameType.HEADERS()
+            hf.header.stream_id = sid
+            hf.header.flags = FrameFlags(UInt8(0))
+            var first_payload = List[UInt8](capacity=max_frame)
+            for i in range(max_frame):
+                first_payload.append(enc[i])
+            hf.payload = first_payload^
+            hf.header.length = len(hf.payload)
+            var hb = encode_frame(hf)
+            for i in range(len(hb)):
+                self.outbox.append(hb[i])
+            var pos = max_frame
+            while pos < n_enc:
+                var chunk = max_frame
+                if pos + chunk > n_enc:
+                    chunk = n_enc - pos
+                var cf = Frame()
+                cf.header.type = FrameType.CONTINUATION()
+                cf.header.stream_id = sid
+                if pos + chunk == n_enc:
+                    cf.header.flags = FrameFlags(FrameFlags.END_HEADERS())
+                else:
+                    cf.header.flags = FrameFlags(UInt8(0))
+                var cp = List[UInt8](capacity=chunk)
+                for i in range(chunk):
+                    cp.append(enc[pos + i])
+                cf.payload = cp^
+                cf.header.length = len(cf.payload)
+                var cb = encode_frame(cf)
+                for i in range(len(cb)):
+                    self.outbox.append(cb[i])
+                pos += chunk
+        var s = Stream()
+        s.id = sid
+        s.send_window = self.conn.peer_initial_window_size
+        s.recv_window = self.conn.initial_window_size
+        s.state = StreamState.OPEN()
+        s.response_body_allowed = method.upper() != "HEAD"
+        self.conn.streams[sid] = s^
+        self.conn.note_local_stream(sid)
+
+    def headers_received(self, sid: Int) raises -> Bool:
+        """``True`` once the response HEADERS block on ``sid`` is fully
+        received (END_HEADERS observed). Body / trailers may still be
+        arriving."""
+        if sid not in self.conn.streams:
+            return False
+        return self.conn.streams[sid].copy().headers_complete
+
+    def stream_ended(self, sid: Int) raises -> Bool:
+        """``True`` once the peer has ENDed (END_STREAM) or RESET the
+        stream, i.e. no more response DATA will arrive."""
+        if sid in self._stream_errors:
+            return True
+        if sid not in self.conn.streams:
+            # An already-popped / never-opened stream counts as ended.
+            return True
+        var s = self.conn.streams[sid].copy()
+        return s.data_complete or s.state.value == StreamState.CLOSED().value
+
+    def drain_body(mut self, sid: Int) raises -> List[UInt8]:
+        """Move out and return the response DATA accumulated on ``sid``
+        so far, clearing the stream's buffer.
+
+        Returns an empty list when no new DATA has arrived. Keeps the
+        stream entry alive (unlike :meth:`take_response`) so subsequent
+        DATA frames keep accumulating; this is what bounds memory on a
+        long streaming response."""
+        if sid not in self.conn.streams:
+            return List[UInt8]()
+        var s = self.conn.streams.pop(sid)
+        var out = s.data^
+        s.data = List[UInt8]()
+        var credit = s.pending_body_credit
+        s.pending_body_credit = 0
+        s.recv_window += credit
+        if (
+            credit > 0
+            and not s.data_complete
+            and (s.state.value != StreamState.CLOSED().value)
+        ):
+            self.outbox.extend(
+                encode_frame(Connection._window_update_frame(sid, credit))
+            )
+        self.conn.streams[sid] = s^
+        return out^
+
+    def enable_response_streaming(mut self, sid: Int) raises:
+        """Return this stream's DATA credit only when drain_body consumes it.
+
+        Call before feeding the response. Drain outbound WINDOW_UPDATEs
+        before waiting for more inbound data.
+        """
+        var s = self.conn.streams[sid].copy()
+        s.defer_body_credit = True
+        self.conn.streams[sid] = s^
+
+    def response_headers(self, sid: Int) raises -> List[HpackHeader]:
+        """Return a copy of the current header list for ``sid`` (initial
+        HEADERS plus any trailing HEADERS the driver has merged in).
+        Read after :meth:`stream_ended` to pick up gRPC trailers
+        (``grpc-status`` / ``grpc-message``)."""
+        if sid not in self.conn.streams:
+            return List[HpackHeader]()
+        return self.conn.streams[sid].copy().headers.copy()
+
+    def discard_stream(mut self, sid: Int) -> None:
+        """Drop the stream entry for ``sid`` (after the caller has read
+        the trailers), reclaiming its per-connection memory."""
+        try:
+            if sid in self.conn.streams:
+                _ = self.conn.streams.pop(sid)
+            self._discard_pending_body(sid)
+        except:
+            pass
+
+    def initial_response_headers(self, sid: Int) raises -> List[HpackHeader]:
+        var out = List[HpackHeader]()
+        var s = self.conn.streams[sid].copy()
+        for i in range(s.initial_header_count):
+            out.append(s.headers[i].copy())
+        return out^
+
+    def response_trailers(self, sid: Int) raises -> List[HpackHeader]:
+        var out = List[HpackHeader]()
+        var s = self.conn.streams[sid].copy()
+        for i in range(s.initial_header_count, len(s.headers)):
+            out.append(s.headers[i].copy())
+        return out^
+
+    def cancel_stream(mut self, sid: Int):
+        self._send_rst_stream(sid, Http2ErrorCode.CANCEL().value)
+        self.discard_stream(sid)

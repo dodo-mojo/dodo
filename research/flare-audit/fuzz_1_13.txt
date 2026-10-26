@@ -1,0 +1,3 @@
+2500 inputs in 147s; server alive=True
+outcomes: {"BrokenPipeError(32, 'Broken pipe')": 375, 'EOF': 2052, "OSError(107, 'Transport endpoint is not ": 59, 'TIMEOUT': 14, b'---': 637, b'100': 1, b'101': 5, b'200': 266, b'400': 1544, b'500': 9, b'501': 38}
+malformed responses: 0

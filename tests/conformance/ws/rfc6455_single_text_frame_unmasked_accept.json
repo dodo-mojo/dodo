@@ -1,0 +1,10 @@
+{
+  "name": "1.1.1_single_text_frame_unmasked",
+  "spec": "RFC 6455 §5.6 (Text frames; server-to-client; unmasked)",
+  "input_hex": "81 05 48 65 6c 6c 6f",
+  "expect": "accept",
+  "expect_reason": "FIN=1 OP=TEXT len=5 payload='Hello'; server-side unmasked frame",
+  "expected_opcode": 1,
+  "expected_fin": true,
+  "expected_payload_hex": "48 65 6c 6c 6f"
+}

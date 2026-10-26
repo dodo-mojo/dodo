@@ -1,0 +1,233 @@
+"""Tests for ``dodo.runtime.handoff``.
+
+Covers:
+
+- :class:`HandoffQueue` push / pop / drain semantics on the
+  single-threaded path.
+- The queue refuses (returns False) when full instead of blocking.
+- ``size`` reflects pending entries through push / pop / drain.
+- Wrap-around: push capacity items, pop half, push half more, then
+  drain — order is FIFO across the wrap.
+- Refused-push counter is bumped on each rejection.
+- :class:`HandoffPolicy` defaults to disabled.
+- ``HandoffPolicy.from_env`` flips when ``DODO_SOAK_WORKERS=on``.
+"""
+
+from std.testing import assert_equal, assert_false, assert_true
+from std.os import setenv
+
+from dodo.runtime import HandoffPolicy, HandoffQueue, WorkerHandoffPool
+
+
+def test_push_pop_basic() raises:
+    var q = HandoffQueue(8)
+    assert_equal(q.size(), 0)
+    assert_true(q.push(101))
+    assert_true(q.push(202))
+    assert_equal(q.size(), 2)
+    var a = q.pop()
+    assert_true(Bool(a))
+    assert_equal(a.value(), 101)
+    var b = q.pop()
+    assert_true(Bool(b))
+    assert_equal(b.value(), 202)
+    var c = q.pop()
+    assert_false(Bool(c))
+
+
+def test_push_full_refuses() raises:
+    var q = HandoffQueue(2)
+    assert_true(q.push(1))
+    assert_true(q.push(2))
+    assert_false(q.push(3))
+    assert_equal(q.refused, 1)
+
+
+def test_drain_empties() raises:
+    var q = HandoffQueue(4)
+    _ = q.push(10)
+    _ = q.push(20)
+    _ = q.push(30)
+    var all = q.drain()
+    assert_equal(len(all), 3)
+    assert_equal(all[0], 10)
+    assert_equal(all[1], 20)
+    assert_equal(all[2], 30)
+    assert_equal(q.size(), 0)
+
+
+def test_wraparound_preserves_fifo() raises:
+    var q = HandoffQueue(4)
+    _ = q.push(1)
+    _ = q.push(2)
+    _ = q.push(3)
+    _ = q.push(4)
+    _ = q.pop()
+    _ = q.pop()
+    _ = q.push(5)
+    _ = q.push(6)
+    var all = q.drain()
+    assert_equal(len(all), 4)
+    assert_equal(all[0], 3)
+    assert_equal(all[1], 4)
+    assert_equal(all[2], 5)
+    assert_equal(all[3], 6)
+
+
+def test_handoff_policy_default_disabled() raises:
+    var p = HandoffPolicy()
+    assert_false(p.enabled)
+    assert_equal(p.capacity, 64)
+    assert_equal(p.steal_threshold, 4)
+
+
+def test_handoff_policy_from_env_on() raises:
+    """``DODO_SOAK_WORKERS=on`` flips the policy enabled."""
+    _ = setenv("DODO_SOAK_WORKERS", "on", True)
+    var p = HandoffPolicy.from_env(HandoffPolicy())
+    assert_true(p.enabled)
+    assert_equal(p.steal_threshold, 1)
+    _ = setenv("DODO_SOAK_WORKERS", "", True)
+
+
+def test_handoff_policy_from_env_off() raises:
+    """Anything other than ``on/1/true`` keeps the default."""
+    _ = setenv("DODO_SOAK_WORKERS", "no", True)
+    var p = HandoffPolicy.from_env(HandoffPolicy())
+    assert_false(p.enabled)
+
+
+def test_metrics_counters() raises:
+    var q = HandoffQueue(2)
+    _ = q.push(1)
+    _ = q.push(2)
+    _ = q.push(3)  # refused
+    _ = q.pop()
+    assert_equal(q.pushes, 2)
+    assert_equal(q.pops, 1)
+    assert_equal(q.refused, 1)
+
+
+def test_pool_disabled_short_circuits() raises:
+    """When the policy is disabled, ``try_handoff`` rejects without push."""
+    var pool = WorkerHandoffPool(HandoffPolicy(False, 8, 4), 4)
+    assert_equal(pool.size(), 4)
+    assert_false(pool.try_handoff(1, 42))
+    var d = pool.drain_local(1)
+    assert_equal(len(d), 0)
+
+
+def test_pool_enabled_routes_fd() raises:
+    """Enabled policy + try_handoff push goes to the right queue."""
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 8, 4), 4)
+    assert_true(pool.try_handoff(2, 99))
+    var d0 = pool.drain_local(0)
+    var d2 = pool.drain_local(2)
+    assert_equal(len(d0), 0)
+    assert_equal(len(d2), 1)
+    assert_equal(d2[0], 99)
+
+
+def test_pool_peek_idle_excludes_self() raises:
+    """``peek_idle_worker`` returns the peer with the shortest queue."""
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 8, 4), 3)
+    _ = pool.try_handoff(0, 1)
+    _ = pool.try_handoff(0, 2)
+    _ = pool.try_handoff(1, 3)
+    var idle = pool.peek_idle_worker(2)
+    assert_equal(idle, 1)
+
+
+def test_pool_disabled_peek_returns_minus_one() raises:
+    var pool = WorkerHandoffPool(HandoffPolicy(False, 8, 4), 4)
+    assert_equal(pool.peek_idle_worker(0), -1)
+
+
+# ── Load-aware target selection (D1) ────────────────────────────────────────
+
+
+def test_choose_target_hands_off_under_skew() raises:
+    """A heavily-loaded local worker hands a new conn to an idle peer
+    once its load exceeds the peer's queue depth by ``steal_threshold``.
+    """
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 64, 4), 4)
+    # Peers all idle (queue depth 0); local load 10 >> threshold 4.
+    var target = pool.choose_handoff_target(local_worker=0, local_load=10)
+    assert_true(target >= 0)
+    assert_true(target != 0)
+
+
+def test_choose_target_keeps_uniform_local() raises:
+    """A uniform (unskewed) workload stays local -- no cross-thread
+    chatter when local load is within ``steal_threshold`` of the peers.
+    """
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 64, 4), 4)
+    assert_equal(pool.choose_handoff_target(local_worker=0, local_load=2), -1)
+
+
+def test_choose_target_disabled_keeps_local() raises:
+    """Disabled policy always keeps the connection local."""
+    var pool = WorkerHandoffPool(HandoffPolicy(False, 64, 4), 4)
+    assert_equal(pool.choose_handoff_target(local_worker=0, local_load=100), -1)
+
+
+def test_choose_target_single_worker_keeps_local() raises:
+    """With one worker there is no peer to hand off to."""
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 64, 4), 1)
+    assert_equal(pool.choose_handoff_target(local_worker=0, local_load=100), -1)
+
+
+def test_peek_idle_skips_peer_whose_queue_is_full() raises:
+    """RT-04: ``peek_idle_worker`` returns -1 when no peer queue is below
+    capacity. The scan used to start at ``capacity + 1`` and so returned a
+    peer holding exactly ``capacity`` tokens, whose ``try_handoff`` fails."""
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 1, 1), 2)
+    assert_true(pool.try_handoff(1, 42))  # worker 1's queue (capacity 1) full
+    assert_equal(pool.peek_idle_worker(0), -1)
+    assert_false(pool.try_handoff(1, 43))
+
+
+def test_peek_idle_prefers_non_full_peer_over_full_one() raises:
+    """RT-04: with one full peer and one below capacity the result is the
+    non-full peer, whichever order they are in."""
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 2, 1), 3)
+    _ = pool.try_handoff(1, 1)
+    _ = pool.try_handoff(1, 2)  # worker 1 full (2 of 2)
+    _ = pool.try_handoff(2, 3)  # worker 2 has room (1 of 2)
+    assert_equal(pool.peek_idle_worker(0), 2)
+    var pool2 = WorkerHandoffPool(HandoffPolicy(True, 2, 1), 3)
+    _ = pool2.try_handoff(2, 1)
+    _ = pool2.try_handoff(2, 2)  # worker 2 full
+    _ = pool2.try_handoff(1, 3)  # worker 1 has room
+    assert_equal(pool2.peek_idle_worker(0), 1)
+
+
+def test_choose_target_never_picks_full_peer() raises:
+    """RT-04: ``choose_handoff_target`` must not name a peer whose queue is
+    full, so the following ``try_handoff`` is not a wasted attempt."""
+    var pool = WorkerHandoffPool(HandoffPolicy(True, 1, 1), 2)
+    _ = pool.try_handoff(1, 42)
+    assert_equal(pool.choose_handoff_target(local_worker=0, local_load=100), -1)
+
+
+def main() raises:
+    test_push_pop_basic()
+    test_push_full_refuses()
+    test_drain_empties()
+    test_wraparound_preserves_fifo()
+    test_handoff_policy_default_disabled()
+    test_handoff_policy_from_env_on()
+    test_handoff_policy_from_env_off()
+    test_metrics_counters()
+    test_pool_disabled_short_circuits()
+    test_pool_enabled_routes_fd()
+    test_pool_peek_idle_excludes_self()
+    test_pool_disabled_peek_returns_minus_one()
+    test_choose_target_hands_off_under_skew()
+    test_choose_target_keeps_uniform_local()
+    test_choose_target_disabled_keeps_local()
+    test_choose_target_single_worker_keeps_local()
+    test_peek_idle_skips_peer_whose_queue_is_full()
+    test_peek_idle_prefers_non_full_peer_over_full_one()
+    test_choose_target_never_picks_full_peer()
+    print("test_handoff: 19 passed")

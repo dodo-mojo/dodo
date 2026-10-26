@@ -1,0 +1,275 @@
+"""Deadline watchdog: a background thread that flips Cancel cells on expiry.
+
+Mojo cannot preempt synchronous code -- a handler that never yields
+runs to completion on its worker no matter what. The reactor can only
+observe a deadline at the points it owns (request-read edges, streaming
+writable edges). To give a *time-based* deadline any teeth against a
+handler that at least cooperatively polls its ``Cancel`` token, a
+separate OS thread must watch the clock and flip the cell; the worker
+thread is busy inside the handler and cannot watch its own deadline.
+
+That is exactly what :struct:`DeadlineWatchdog` does (the K2 mechanism
+the assessment names): one background thread polls a fixed table of
+``(deadline_ms, cancel_cell_addr)`` slots and, when a slot's deadline
+passes, writes ``CancelReason.TIMEOUT`` into that cell with a release
+store -- the same cell + ordering :struct:`dodo.http.cancel.CancelCell`
+uses, so a ``CancelHandler`` polling ``cancel.cancelled()`` observes it.
+
+This is cooperative, not true preemption: a handler that never checks
+its cancel token is still not interruptible (a Mojo language limit, not
+a design choice) -- for those, ``PostHocDeadline`` still refuses the
+too-late response. What the watchdog adds is real mid-flight
+cancellation for handlers that *do* cooperate, which the on-worker
+reactor cannot deliver by itself.
+"""
+
+from std.atomic import Atomic, Ordering
+from std.ffi import c_int, external_call
+from std.memory import Layout, Pointer, alloc
+
+from ._libc_time import libc_nanosleep_ms, monotonic_now_ms
+from ._thread import ThreadHandle, _OpaquePtr
+
+
+comptime WATCHDOG_MAX_SLOTS: Int = 256
+"""Deadline slots (one per worker; matches the scheduler worker cap)."""
+
+# Control-block layout (a flat Int64 array):
+#   [0]           running flag (1 = run, 0 = stop)
+#   [1]           poll interval (ms)
+#   [2 + 2*i]     slot i deadline (monotonic ms; 0 = disarmed)
+#   [3 + 2*i]     slot i cancel-cell address (0 = none)
+comptime _IDX_RUNNING: Int = 0
+comptime _IDX_POLL_MS: Int = 1
+comptime _BLOCK_LEN: Int = 2 + 2 * WATCHDOG_MAX_SLOTS
+comptime _TIMEOUT_REASON: Int64 = 2  # CancelReason.TIMEOUT
+comptime _FIRING: Int64 = -1
+"""Deadline-slot value while the poller is writing the cancel cell.
+``arm`` and ``disarm`` wait it out, so a fire that has begun always
+lands on the request it was meant for."""
+
+
+comptime _I64_MAX: Int64 = 9223372036854775807
+
+
+def _deadline_after(now_ms: Int, budget_ms: Int) -> Int64:
+    """The slot deadline ``budget_ms`` after ``now_ms``, in ``1..Int64.MAX``.
+
+    A deadline must be positive: ``0`` reads as disarmed, a negative value is
+    never fired by the poller, and ``-1`` is the ``_FIRING`` sentinel that
+    wedges the slot (``arm`` and ``disarm`` would wait on it forever). So a
+    budget that is already spent fires at the next poll (deadline ``1``),
+    and a budget that would overflow ``now + budget`` saturates instead of
+    wrapping into the past.
+    """
+    var now = Int64(now_ms)
+    var budget = Int64(budget_ms)
+    var deadline: Int64
+    if budget > 0 and now > _I64_MAX - budget:
+        deadline = _I64_MAX
+    else:
+        deadline = now + budget
+    if deadline < 1:
+        deadline = 1
+    return deadline
+
+
+@always_inline
+def _slot_deadline_idx(slot: Int) -> Int:
+    return 2 + 2 * slot
+
+
+@always_inline
+def _slot_addr_idx(slot: Int) -> Int:
+    return 3 + 2 * slot
+
+
+@always_inline
+def _atomic_load(block: Int, idx: Int) -> Int64:
+    var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=block)
+    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](
+        (p.unsafe_offset(idx)).unsafe_bitcast[Scalar[DType.int64]]()
+    )
+
+
+@always_inline
+def _atomic_cas(block: Int, idx: Int, expected: Int64, desired: Int64) -> Bool:
+    var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=block)
+    var e = expected
+    return Atomic[Int64].compare_exchange(
+        (p.unsafe_offset(idx)).unsafe_bitcast[Scalar[DType.int64]](),
+        e,
+        desired,
+    )
+
+
+def _settle(block: Int, slot: Int) -> Int64:
+    """Wait out a fire in progress on ``slot`` and return its value."""
+    while True:
+        var v = _atomic_load(block, _slot_deadline_idx(slot))
+        if v != _FIRING:
+            return v
+        _ = external_call["sched_yield", c_int]()
+
+
+@always_inline
+def _atomic_store(block: Int, idx: Int, v: Int64):
+    var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=block)
+    Atomic[Int64].store[ordering=Ordering.RELEASE](
+        (p.unsafe_offset(idx)).unsafe_bitcast[Scalar[DType.int64]](), v
+    )
+
+
+def watchdog_arm(block: Int, slot: Int, budget_ms: Int, cancel_addr: Int):
+    """Arm ``slot`` on the watchdog control block at ``block`` to flip
+    the cell at ``cancel_addr`` after ``budget_ms``. A slot that is still
+    armed is disarmed first (as :func:`watchdog_disarm` does, without
+    reporting a fire), so a previous request's deadline can never fire into
+    this request's cell; calling ``watchdog_disarm`` before re-arming remains
+    the way to learn whether the previous request was cancelled. The
+    address is stored before the deadline so the poller never sees a
+    deadline without its target."""
+    if block == 0 or slot < 0 or slot >= WATCHDOG_MAX_SLOTS:
+        return
+    # Release whatever the slot still holds *before* the address changes:
+    # CAS the current deadline to 0, waiting out a fire in progress. Without
+    # this the poller could claim the previous, expired deadline after the
+    # address store below and write TIMEOUT into the new request's cell.
+    while True:
+        var held = _settle(block, slot)
+        if held == 0 or _atomic_cas(
+            block, _slot_deadline_idx(slot), held, Int64(0)
+        ):
+            break
+    _atomic_store(block, _slot_addr_idx(slot), Int64(cancel_addr))
+    var deadline = _deadline_after(monotonic_now_ms(), budget_ms)
+    while True:
+        var v = _settle(block, slot)
+        if _atomic_cas(block, _slot_deadline_idx(slot), v, deadline):
+            return
+
+
+def watchdog_disarm(block: Int, slot: Int) -> Bool:
+    """Disarm ``slot`` and return whether the watchdog fired on it.
+
+    When this returns, the poller is done with the slot: either it was
+    disarmed first and will not fire, or it has already written the
+    cancel cell. A late fire can no longer land after a re-arm. The
+    old disarm was a plain store: a poll past its deadline check still
+    wrote TIMEOUT into the cell afterwards, cancelling the next request
+    that reused it, and its own "fire once" store then wiped that
+    request's deadline.
+    """
+    if block == 0 or slot < 0 or slot >= WATCHDOG_MAX_SLOTS:
+        return False
+    while True:
+        var v = _settle(block, slot)
+        if v == 0:
+            return True  # fired (or was never armed)
+        if _atomic_cas(block, _slot_deadline_idx(slot), v, 0):
+            return False
+
+
+def spawn_leaked_watchdog(poll_ms: Int = 1) raises -> Int:
+    """Spawn a process-lifetime watchdog thread and return its control-
+    block address. The thread + block are intentionally leaked (never
+    stopped/freed) -- one background thread for the process life. Use
+    the returned address with ``watchdog_arm`` / ``watchdog_disarm``."""
+    var wd = DeadlineWatchdog(poll_ms)
+    var block = wd._block
+    # Drop ``wd`` without ``stop()``: no __deinit__ joins/frees, so the
+    # thread keeps running and the block stays live for the process.
+    return block
+
+
+def _watchdog_main(arg: _OpaquePtr) -> _OpaquePtr:
+    """Background-thread entry: poll the deadline table until stopped.
+
+    Must not raise (pthread has no exception channel); every call
+    inside is non-raising.
+    """
+    var block = Int(arg)
+    while _atomic_load(block, _IDX_RUNNING) != 0:
+        var now = Int64(monotonic_now_ms())
+        for slot in range(WATCHDOG_MAX_SLOTS):
+            var d = _atomic_load(block, _slot_deadline_idx(slot))
+            # Claim the slot before touching the cell. If a disarm or a
+            # re-arm got there first the CAS fails and nothing is
+            # written.
+            if (
+                d > 0
+                and now >= d
+                and _atomic_cas(block, _slot_deadline_idx(slot), d, _FIRING)
+            ):
+                var addr = _atomic_load(block, _slot_addr_idx(slot))
+                if addr != 0:
+                    # Flip the Cancel cell (release store of TIMEOUT).
+                    var cp = Pointer[Int64, MutUntrackedOrigin](
+                        unsafe_from_address=Int(addr)
+                    )
+                    Atomic[Int64].store[ordering=Ordering.RELEASE](
+                        cp.unsafe_bitcast[Scalar[DType.int64]](),
+                        _TIMEOUT_REASON,
+                    )
+                # Fire once: release the claim.
+                _atomic_store(block, _slot_deadline_idx(slot), 0)
+        var poll = Int(_atomic_load(block, _IDX_POLL_MS))
+        if poll < 1:
+            poll = 1
+        _ = libc_nanosleep_ms(poll)
+    return arg
+
+
+struct DeadlineWatchdog(Movable):
+    """One background thread enforcing per-slot deadlines.
+
+    Arm a slot with ``arm(slot, budget_ms, cancel_addr)`` before running
+    a cooperative handler and ``disarm(slot)`` after it returns; the
+    watchdog flips the cell if the budget elapses first. ``stop()``
+    halts and joins the thread. For a process-lifetime server watchdog,
+    construct once and leak it (never ``stop``) -- one background thread
+    for the process is negligible.
+    """
+
+    var _block: Int
+    var _thread: ThreadHandle
+
+    def __init__(out self, poll_ms: Int = 1) raises:
+        """Allocate the control block and spawn the watchdog thread."""
+        var raw = alloc(Layout[Int64](count=_BLOCK_LEN)).unsafe_leak()
+        for i in range(_BLOCK_LEN):
+            (raw.unsafe_offset(i)).unsafe_write(Int64(0))
+        self._block = Int(raw)
+        _atomic_store(
+            self._block, _IDX_POLL_MS, Int64(poll_ms if poll_ms > 0 else 1)
+        )
+        _atomic_store(self._block, _IDX_RUNNING, Int64(1))
+        var arg = _OpaquePtr(unsafe_from_address=self._block)
+        # A dedicated OS thread, not a pool task: callers leak the
+        # watchdog for the process lifetime, and a task that never
+        # returns would hang the AsyncRT pool shutdown at exit.
+        self._thread = ThreadHandle.spawn_os[_watchdog_main](arg)
+
+    def arm(self, slot: Int, budget_ms: Int, cancel_addr: Int):
+        """Arm ``slot`` to flip the cell at ``cancel_addr`` in
+        ``budget_ms`` from now. A budget that is already spent
+        (``<= 0`` or in the past) fires at the next poll; one that would
+        overflow never fires."""
+        watchdog_arm(self._block, slot, budget_ms, cancel_addr)
+
+    def disarm(self, slot: Int) -> Bool:
+        """Disarm ``slot``; ``True`` if the watchdog had already fired
+        it. See :func:`watchdog_disarm`."""
+        return watchdog_disarm(self._block, slot)
+
+    def stop(mut self) raises:
+        """Stop the watchdog thread, join it, and free the block."""
+        if self._block == 0:
+            return
+        _atomic_store(self._block, _IDX_RUNNING, 0)
+        self._thread.join()
+        var p = Pointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=self._block
+        )
+        p.unsafe_free()
+        self._block = 0

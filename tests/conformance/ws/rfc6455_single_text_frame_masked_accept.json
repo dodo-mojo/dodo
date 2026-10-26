@@ -1,0 +1,11 @@
+{
+  "name": "1.1.2_single_text_frame_masked",
+  "spec": "RFC 6455 §5.3 + §5.6 (Text frames; client-to-server; masked)",
+  "input_hex": "81 85 37 fa 21 3d 7f 9f 4d 51 58",
+  "expect": "accept",
+  "expect_reason": "FIN=1 OP=TEXT mask-bit=1 len=5 mask-key=37fa213d payload after unmask = 'Hello'",
+  "expected_opcode": 1,
+  "expected_fin": true,
+  "expected_masked": true,
+  "expected_payload_hex": "48 65 6c 6c 6f"
+}

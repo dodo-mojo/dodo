@@ -1,0 +1,960 @@
+"""Multicore scheduler: 1 shared listener, N reactors, N workers.
+
+Runs N single-threaded reactor loops in parallel, one per worker thread,
+all sharing a *single* listener fd. Each worker registers the
+listener fd in its own reactor with ``EPOLLEXCLUSIVE`` (on Linux
+>= 4.5) so the kernel wakes exactly one worker per accept event.
+On macOS / kqueue the flag is unavailable and registration falls
+back to plain ``register`` — the practical behaviour is similar
+because non-blocking ``accept`` returns ``EAGAIN`` on the losers.
+
+This is the redesign of the multicore path. the prior implementation
+used N independent listeners bound with ``SO_REUSEPORT``; the
+kernel then distributed accepted connections across workers by
+hashing each connection's 4-tuple to one of the N listeners. That
+scheme has a known fairness gap under bursty arrival: a
+256-connection storm from a wrk2-style load generator can land
+80+ conns on one worker and 30 on another, producing
+hundreds-of-millisecond head-of-line tail latency on the
+overloaded worker(s). ``benchmark/configs/throughput_mc``
+shows the failure mode at p99 ≈ 1.7 s; the
+``EPOLLEXCLUSIVE``-based shared-listener design collapses the
+same workload's p99 to the millisecond range.
+
+Shutdown path: ``shutdown()`` flips a heap-allocated ``Bool`` that
+every worker polls on each reactor iteration. A stable heap address
+is used (instead of a field on the ``Scheduler`` struct) so the flag
+survives the NRVO-or-not move from ``Scheduler.start`` back to the
+caller. The main thread joins all workers, and only then closes the
+shared listener fd (once), before ``shutdown()`` returns.
+
+The listener is never closed to wake the workers. On Linux an fd that
+is also registered in a worker's ``epoll`` instance is kept alive by
+the kernel, so ``close()`` from another thread triggers no ``EPOLLHUP``
+and the workers stay blocked in ``epoll_wait`` until the 100 ms poll
+timeout fires; and closing it early let a worker that polled a batch
+before it saw the flag ``accept`` on a reused number (CONC-05). The
+heap flag is what breaks the loop.
+
+This module is :trait:`Frontend`-generic: every worker calls
+:meth:`Frontend.run_worker` once with its assigned listener fd
+and the shared stopping flag. The frontend value is moved
+(per-worker copies are made via ``F.copy()``; if that's expensive
+users should wrap their handler's expensive state behind an
+``Pointer`` or a similar shared-reference holder).
+
+The scheduler used to import directly from
+:mod:`dodo.http._server_reactor_impl`,
+:mod:`dodo.http._unified_reactor_impl`,
+:mod:`dodo.http.handler`, :mod:`dodo.http.server`,
+:mod:`dodo.http.static_response`, and :mod:`dodo.http2.server`.
+That layering violation (runtime depending on protocol modules)
+is gone now; the scheduler depends only on the
+:trait:`dodo.runtime.Frontend` trait and concrete impls live
+where their protocol does
+(:class:`dodo.http.HttpFrontend` /
+:class:`dodo.http.StaticHttpFrontend`).
+
+Known limitations:
+
+- The stopping flag is a heap-allocated byte written from the main
+  thread and read from each worker through ``Atomic[UInt8]``
+  release-store / acquire-load (``store_stop_flag`` /
+  ``load_stop_flag``). This gives the workers a proper happens-before
+  edge on shutdown and lowers to a plain ``mov`` on x86-64 (TSO) and
+  to ``stlr`` / ``ldar`` on ARM64. The per-iteration re-materialisation
+  of the pointer inside the frontend's serving loop still defeats the
+  optimiser's LICM so every iteration re-reads the flag.
+- Worker panics that escape :meth:`Frontend.run_worker` are caught and
+  discarded in ``_worker_entry`` because pthread has no exception
+  channel. ``is_running()`` still reports ``True`` until the
+  ``ThreadHandle`` is joined, which is a mildly wrong signal for a
+  worker that crashed rather than shut down cleanly. Plumbing a
+  per-worker error cell back to the Scheduler is also scheduled for a future release.
+  .
+"""
+
+from std.atomic import Atomic, Ordering
+from std.ffi import c_int, external_call
+from std.memory import Layout, Pointer, alloc
+
+from std.os import getenv
+from std.sys.info import CompilationTarget
+from ..net import SocketAddr
+from ..tcp import TcpListener
+
+from ._thread import ThreadHandle, num_cpus, _OpaquePtr
+from .frontend import Frontend
+from ._balance import balance_group_alloc, balance_group_free
+from .reuseport import bind_reuseport, bind_shared
+
+# Re-exported so the reactor loops' existing
+# ``from dodo.runtime.scheduler import load_stop_flag`` imports keep
+# resolving after the split.
+from .scheduler_stats import (
+    load_stop_flag,
+    store_stop_flag,
+    store_worker_stat,
+    load_worker_stat,
+    WORKER_STAT_INFLIGHT,
+    WORKER_STAT_STATUS,
+    WORKER_STAT_DONE,
+    WORKER_STAT_SLOTS,
+    WORKER_STAT_GROUP,
+    WORKER_STAT_INDEX,
+    WORKER_STATUS_RUNNING,
+    WORKER_STATUS_CLEAN,
+    WORKER_STATUS_CRASHED,
+)
+from ._worker import _WorkerCtx, _worker_entry
+from ._libc_time import monotonic_now_ms
+
+
+# ── ShutdownReport (per-worker drain accounting) ─────────────────────────────
+
+
+@fieldwise_init
+struct ShutdownReport(Copyable, ImplicitlyCopyable):
+    """Per-worker drain summary returned by :meth:`Scheduler.drain`.
+
+    Originally defined under ``dodo.http.server`` and imported back
+    by the scheduler; promoted into :mod:`dodo.runtime` to break
+    the runtime → http import cycle. ``dodo.http.server`` re-exports
+    this type so the public ``dodo.http.ShutdownReport`` surface is
+    unchanged.
+
+    The per-worker registry that would let us count individual
+    in-flight connections lives on each worker's stack today;
+    until that registry is published back through a shared
+    atomic, ``in_flight_at_deadline`` is the coarse 0/1 signal
+    driven by whether the worker's join completed inside the
+    budget.
+
+    Fields:
+        drained: Connections that completed their in-flight work
+            inside the drain timeout. Best-effort.
+        timed_out: Connections that were force-closed because the
+            drain timeout elapsed before they finished. Best-effort.
+        in_flight_at_deadline: Connections still alive at the
+            instant the timeout fired (== ``timed_out`` after the
+            force-close completes).
+        crashed: 1 if this worker's last run exited crashed (poll
+            failure) rather than cleanly, else 0. Mirrors the
+            per-worker slot behind ``crashed_worker_count()`` so a
+            caller can attribute a crash to a specific worker.
+    """
+
+    var drained: Int
+    var timed_out: Int
+    var in_flight_at_deadline: Int
+    var crashed: Int
+
+
+# ── Context cleanup helpers ──────────────────────────────────────────────────
+
+
+@always_inline
+def _scheduler_free_raw(raw: _OpaquePtr):
+    """Release a heap cell allocated via ``Pointer[...].alloc``.
+
+    Uses Mojo's native allocator pair (``.alloc`` / ``.free``) rather than
+    libc ``malloc``/``free`` via FFI: ``external_call["free", ...]``
+    conflicts with the stdlib's own ``free`` declaration at MLIR
+    legalization time when this module is pulled into a fuzz-environment
+    compile (mozz harness), which previously blocked the
+    ``fuzz-scheduler-shutdown`` harness from importing
+    ``dodo.runtime.scheduler`` at all.
+    """
+    raw.unsafe_free()
+
+
+def _scheduler_free_ctxs[F: Frontend](addrs: List[Int]):
+    """Destroy each ``_WorkerCtx[F]`` at the given address then free it."""
+    for i in range(len(addrs)):
+        var raw = _OpaquePtr(unsafe_from_address=addrs[i])
+        var typed = raw.unsafe_bitcast[_WorkerCtx[F]]()
+        typed.unsafe_deinit_pointee()
+        _scheduler_free_raw(raw)
+
+
+# ── Scheduler ────────────────────────────────────────────────────────────────
+
+
+struct Scheduler[F: Frontend](Movable):
+    """Owns ``num_workers`` workers, each running a frontend's
+    serving loop sharing a single listener fd (or its own
+    SO_REUSEPORT listener when the strategy demands).
+
+    Usage:
+        ```mojo
+        from dodo.http import HttpFrontend
+        var frontend = HttpFrontend(handler^, config^)
+        var s = Scheduler[HttpFrontend[MyHandler]].start(
+            addr, frontend^, num_workers=4
+        )
+        # ... server running ...
+        s.shutdown()
+        ```
+
+    Notes:
+        - The scheduler stores the workers' ``ThreadHandle`` values and
+          a heap-allocated stopping flag. ``shutdown()`` writes through
+          that heap address and joins all workers.
+        - The stopping flag lives on the heap (not on this struct) so
+          its address survives the move from ``Scheduler.start`` back
+          to the caller; every worker captures that address once at
+          spawn time.
+        - **Listener strategy.** Default: each worker pre-binds
+          its own ``SO_REUSEPORT`` listener (the kernel hashes
+          new 4-tuples to one of N pre-bound listeners; matches
+          actix_web's listener strategy and gives the highest
+          steady-state throughput on dev-box workloads). Opt out
+          by exporting ``DODO_REUSEPORT_WORKERS=0`` before
+          ``start`` to switch to a single shared listener bound
+          via ``bind_shared`` and registered with
+          ``Reactor.register_exclusive`` (``EPOLLEXCLUSIVE`` on
+          Linux >= 4.5) — the kernel wakes one worker per
+          accept event, idle workers absorb spikes, p99.99 σ
+          is uniformly tighter under sustained load for 7-22 %
+          less req/s depending on path (see
+          ``docs/benchmark.md``). Frontends that *require*
+          per-worker listeners (the io_uring buffer-ring
+          frontend) override this via
+          :meth:`Frontend.requires_per_worker_listener`.
+        - The frontend value is cloned into each worker via
+          ``F.copy()``.
+    """
+
+    # Workers are stored in a heap-allocated block of exactly
+    # ``num_workers`` slots rather than a ``List[ThreadHandle]``.
+    # ``List[T]`` requires ``T: Copyable``, but ``ThreadHandle`` is
+    # *intentionally* move-only: ``pthread_t`` is
+    # a unique OS resource and copying the handle would let the same
+    # thread be ``pthread_join``'d twice, which is UB per POSIX. So
+    # we own the memory directly here instead.
+    #
+    # ``_workers_ptr`` is NULL when no workers have been allocated
+    # (freshly constructed or post-shutdown); ``_workers_len`` tracks
+    # how many slots hold a live ``ThreadHandle`` that still needs
+    # joining + destroying.
+    var _workers_ptr: Pointer[ThreadHandle, MutUntrackedOrigin]
+    var _workers_len: Int
+    # Heap-allocated ``TcpListener`` shared by all workers. Address is
+    # stable across struct moves so worker ctxs can carry the fd as a
+    # plain ``Int`` — workers never close it (that's ``shutdown()``'s
+    # job after every worker has joined). A 0 value means "no shared
+    # listener yet" (freshly constructed) or "already destroyed"
+    # (post-shutdown).
+    var _shared_listener_addr: Int
+    # Cached fd for the shared listener, for the workers' bare-number
+    # handles. It is closed once, by the listener's destructor in
+    # ``_free_resources``, after every worker has joined; never earlier,
+    # since a worker may still ``accept`` on it.
+    var _shared_listener_fd: Int
+    var _per_worker_listener_addrs: List[Int]
+    """When the io_uring buffer-ring path is active, the
+    Scheduler pre-binds one SO_REUSEPORT listener per worker on
+    its own thread (serialised binds avoid any concurrent-bind
+    race). Each entry is the heap address of an owned
+    ``TcpListener``; freed in ``shutdown()`` after all workers
+    join. Empty on the epoll path."""
+    var _ctx_addrs: List[Int]
+    # Heap-allocated Bool, owned by this Scheduler. Address is stable
+    # across struct moves; every worker's ``_WorkerCtx.stopping_addr``
+    # points at the same heap cell. A 0 value here means "not yet
+    # allocated" (freshly constructed) or "already freed" (post-shutdown).
+    var _stopping_addr: Int
+    # One heap-allocated two-slot ``Int64`` stats cell per worker
+    # (in-flight snapshot + exit status). Read by ``drain`` after the
+    # workers join; freed on teardown. Empty until ``start``.
+    var _stats_addrs: List[Int]
+    # Accept-balancing group block shared by every worker
+    # (``dodo.runtime._balance``); 0 when balancing is off or there is a
+    # single worker. Freed with the stats cells.
+    var _balance_addr: Int
+    # Number of workers whose last run exited with WORKER_STATUS_CRASHED,
+    # captured from the stats cells during ``shutdown`` / ``drain`` before
+    # they are freed. Lets callers tell a crash from a clean shutdown
+    # after the workers have joined (``is_running`` cannot).
+    var _last_crash_count: Int
+
+    def __init__(out self):
+        """Build an empty scheduler; use ``Scheduler.start`` instead."""
+        # Pointer is non-nullable; build C NULL from a runtime 0.
+        var null_addr = 0
+        self._workers_ptr = Pointer[ThreadHandle, MutUntrackedOrigin](
+            unsafe_from_address=null_addr
+        )
+        self._workers_len = 0
+        self._shared_listener_addr = 0
+        self._shared_listener_fd = -1
+        self._per_worker_listener_addrs = List[Int]()
+        self._ctx_addrs = List[Int]()
+        self._stopping_addr = 0
+        self._stats_addrs = List[Int]()
+        self._balance_addr = 0
+        self._last_crash_count = 0
+
+    @staticmethod
+    def start(
+        addr: SocketAddr,
+        var frontend: Self.F,
+        num_workers: Int,
+        pin_cores: Bool = True,
+        extra_addrs: List[SocketAddr] = List[SocketAddr](),
+    ) raises -> Scheduler[Self.F]:
+        """Spawn ``num_workers`` threads sharing one listener.
+
+        The scheduler binds its listener(s) according to
+        :meth:`Frontend.requires_per_worker_listener` plus the
+        ``DODO_REUSEPORT_WORKERS`` env knob, then hands one fd
+        per worker into :meth:`Frontend.run_worker`. The frontend
+        encapsulates everything protocol-specific (handler,
+        request config, HTTP/2 settings, auto-protocol toggle,
+        backend selection); the runtime layer no longer knows
+        any of those flags exist.
+
+        Args:
+            addr: Address the listener(s) bind.
+            frontend: Per-worker run target. Cloned per worker
+                via :meth:`Frontend.copy`.
+            num_workers: Number of worker threads. Must be in
+                ``1..=256``; values outside that range raise.
+                The upper bound is a defensive guard against
+                runaway ``pthread_create`` + heap allocation.
+            pin_cores: If ``True`` (default), pin worker N to core
+                ``N % num_cpus``. No-op on macOS.
+            extra_addrs: Additional addresses to serve. Each worker
+                gets its own ``SO_REUSEPORT`` listener on every one,
+                so N addresses x M workers binds N*M listeners, all
+                serially on this thread. Empty (default) preserves
+                the single-address behaviour exactly. Every extra
+                address must be bindable with ``SO_REUSEPORT``, so
+                any earlier listener on it must already be closed.
+
+        Returns:
+            A running ``Scheduler`` whose workers will continue to
+            serve until ``shutdown()`` is called.
+
+        Raises:
+            Error: If ``num_workers`` is outside ``1..=256``, if the
+                listener fails to bind, or if spawning a worker fails;
+                partially-started workers are best-effort joined before
+                re-raising.
+        """
+        if num_workers < 1 or num_workers > 256:
+            raise Error(
+                "Scheduler.start: num_workers must be in 1..=256 (got "
+                + String(num_workers)
+                + ")"
+            )
+        var s = Scheduler[Self.F]()
+
+        # Heap-allocate the stopping flag. Using a struct field would
+        # be unsafe: ``return s^`` moves the Scheduler to the caller
+        # and NRVO is not guaranteed, so any ``&s._stopping`` address
+        # captured here could be dangling by the time ``shutdown()``
+        # writes through it. The heap cell is allocated here and
+        # freed in ``shutdown()`` after every worker joins. Uses the
+        # native Mojo allocator (see ``_scheduler_free_raw``).
+        var stop_ptr = alloc(Layout[Bool](count=1)).unsafe_leak()
+        stop_ptr.unsafe_write(False)
+        var stop_raw = stop_ptr.unsafe_bitcast[UInt8]()
+        var stopping_addr = Int(stop_ptr)
+        s._stopping_addr = stopping_addr
+
+        # Listener binding strategy. Defaults to per-worker
+        # SO_REUSEPORT (matches actix_web; highest steady-state
+        # throughput on dev-box workloads). Override paths:
+        #
+        # * **Frontend forces per-worker** (e.g. io_uring buffer-
+        #   ring): :meth:`Frontend.requires_per_worker_listener`
+        #   returns True. The scheduler binds N SO_REUSEPORT
+        #   listeners on its own thread (serialised binds avoid
+        #   any concurrent-bind race) and hands one to each
+        #   worker.
+        # * **DODO_REUSEPORT_WORKERS=0**: opt back into a single
+        #   ``bind_shared`` listener with ``EPOLLEXCLUSIVE`` (7-22 %
+        #   less req/s for a uniformly tighter p99.99 σ; see
+        #   ``docs/benchmark.md``). Workers register the shared
+        #   fd with ``Reactor.register_exclusive`` so the kernel
+        #   wakes one worker per accept event.
+        #
+        # Decision is made on the Scheduler thread (not in the
+        # workers) so an ``AddressInUse`` from a faulty
+        # configuration raises on the caller's thread, not inside
+        # an opaque pthread.
+        var frontend_demands_per_worker = (
+            frontend.requires_per_worker_listener()
+        )
+
+        # Per-worker ``SO_REUSEPORT`` listeners (each worker
+        # accept(2)s on its own fd; kernel hashes new 4-tuples to
+        # one of N listeners) are the **default** for
+        # ``num_workers >= 2``. This matches actix_web's listener
+        # strategy and gives strictly higher steady-state
+        # throughput on dev-box workloads (the headline numbers
+        # in ``docs/benchmark.md`` come from this mode).
+        #
+        # Opt out via ``DODO_REUSEPORT_WORKERS=0`` to switch back
+        # to the single-listener ``EPOLLEXCLUSIVE`` shape, which
+        # trades ~10 % req/s for an even tighter p99.99 (the
+        # kernel offers each accept event to whichever worker is
+        # currently waiting in ``epoll_wait``, so idle workers
+        # absorb spikes). See ``docs/benchmark.md`` for the
+        # head-to-head numbers in both modes.
+        var use_reuseport_workers = True
+        if getenv("DODO_REUSEPORT_WORKERS") == "0":
+            use_reuseport_workers = False
+
+        var listener_fd: Int = -1
+        # Pointer is non-nullable; build C NULL from a runtime 0.
+        var null_addr = 0
+        var listener_ptr = Pointer[TcpListener, MutUntrackedOrigin](
+            unsafe_from_address=null_addr
+        )
+        # Both the io_uring buffer-ring path and the opt-in epoll
+        # reuseport mode pre-bind per-worker SO_REUSEPORT listeners
+        # on this thread (serialised binds avoid concurrent-bind
+        # races) and skip the shared listener.
+        # Several addresses means per-worker SO_REUSEPORT listeners on
+        # every one of them: there is no shared-listener shape for
+        # N addresses x M workers, and mixing a shared primary with
+        # per-worker extras would give the two halves different accept
+        # semantics on the same server.
+        var prebind_per_worker = (
+            frontend_demands_per_worker
+            or use_reuseport_workers
+            or len(extra_addrs) > 0
+        )
+
+        # Probe-bind each extra address on this thread so an unusable
+        # one raises here rather than inside an opaque pthread, and
+        # before any listener has been heap-stored.
+        for j in range(len(extra_addrs)):
+            try:
+                var xprobe = bind_reuseport(extra_addrs[j])
+                _ = xprobe^
+            except e:
+                _scheduler_free_raw(stop_raw)
+                s._stopping_addr = 0
+                raise e^
+        if prebind_per_worker:
+            # Probe-bind to validate the addr (raises on the
+            # caller's thread if AddressInUse / etc.); the probe
+            # listener is dropped immediately and each worker binds
+            # its own SO_REUSEPORT listener inside _worker_entry.
+            try:
+                var probe = bind_reuseport(addr)
+                _ = probe^
+            except e:
+                _scheduler_free_raw(stop_raw)
+                s._stopping_addr = 0
+                raise e^
+            s._shared_listener_addr = 0
+            s._shared_listener_fd = -1
+        else:
+            var bound = bind_shared(addr)
+            try:
+                bound._socket.set_nonblocking(True)
+            except e:
+                _scheduler_free_raw(stop_raw)
+                s._stopping_addr = 0
+                raise e^
+            listener_fd = Int(bound.as_raw_fd())
+            # Heap-store the listener so its destructor doesn't fire
+            # when the local ``bound`` goes out of scope at the end
+            # of this function. ``shutdown()`` destroys+frees this
+            # allocation *after* joining every worker.
+            var lp = alloc(Layout[TcpListener](count=1)).unsafe_leak()
+            lp.unsafe_write(bound^)
+            listener_ptr = lp
+            s._shared_listener_addr = Int(lp)
+            s._shared_listener_fd = listener_fd
+
+        # Preallocate the worker slot array once; grow is not needed
+        # because ``num_workers`` is bounded above (<= 256) and fixed.
+        s._workers_ptr = alloc(
+            Layout[ThreadHandle](count=num_workers)
+        ).unsafe_leak()
+        s._workers_len = 0
+
+        # Per-worker stats cells (in-flight snapshot + exit status).
+        # Allocated on this thread before any pthread spawns; the worker
+        # writes them, ``drain`` reads them after join, teardown frees
+        # them. Native Mojo allocator (see _scheduler_free_raw).
+        # Several workers share one block that balances accepted
+        # connections between them; ``DODO_BALANCE_ACCEPT=0`` opts out.
+        if num_workers >= 2 and getenv("DODO_BALANCE_ACCEPT") != "0":
+            s._balance_addr = balance_group_alloc(num_workers)
+        for w in range(num_workers):
+            var sp = alloc(Layout[Int64](count=WORKER_STAT_SLOTS)).unsafe_leak()
+            sp[unsafe_offset=WORKER_STAT_INFLIGHT] = Int64(0)
+            sp[unsafe_offset=WORKER_STAT_STATUS] = Int64(WORKER_STATUS_RUNNING)
+            sp[unsafe_offset=WORKER_STAT_DONE] = Int64(0)
+            sp[unsafe_offset=WORKER_STAT_GROUP] = Int64(s._balance_addr)
+            sp[unsafe_offset=WORKER_STAT_INDEX] = Int64(w)
+            s._stats_addrs.append(Int(sp))
+
+        # If we need per-worker listeners (io_uring buffer-ring
+        # path OR the opt-in epoll reuseport mode): pre-bind one
+        # SO_REUSEPORT listener PER WORKER on the Scheduler thread
+        # before spawning any pthreads. Doing the binds serially
+        # on a single thread eliminates any concurrent-bind races
+        # that could surface from N pthreads each calling
+        # bind_reuseport simultaneously, which empirically caused
+        # the multi-worker bufring crash on commit 88ea2f7.
+        # Per-worker listeners are heap-stored in a parallel array
+        # so their destructors don't fire here; the same shutdown
+        # path that frees s._shared_listener_addr will iterate +
+        # free them.
+        # A failed bind raises. It used to be skipped: the listener list
+        # came up short, a worker past its end ran on fd -1, and with
+        # extra addresses a worker was handed another address's
+        # listener as its primary, since the extras sit right after the
+        # primaries in the same list.
+        if prebind_per_worker:
+            for _ in range(num_workers):
+                try:
+                    var pwl = bind_reuseport(addr)
+                    pwl._socket.set_nonblocking(True)
+                    var ptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
+                    ptr.unsafe_write(pwl^)
+                    s._per_worker_listener_addrs.append(Int(ptr))
+                except e:
+                    s._abandon_start()
+                    raise e^
+
+        # Extra addresses, same serial-bind discipline. Appended to
+        # _per_worker_listener_addrs AFTER the primaries so indices
+        # 0..num_workers-1 keep pointing at each worker's primary
+        # listener (the pick below indexes by worker number), while
+        # shutdown still frees every listener from the one list.
+        var extra_worker_fds = List[List[Int]]()
+        for _ in range(num_workers):
+            var per_worker = List[Int]()
+            for j in range(len(extra_addrs)):
+                try:
+                    var xl = bind_reuseport(extra_addrs[j])
+                    xl._socket.set_nonblocking(True)
+                    var xfd = Int(xl.as_raw_fd())
+                    var xptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
+                    xptr.unsafe_write(xl^)
+                    s._per_worker_listener_addrs.append(Int(xptr))
+                    per_worker.append(xfd)
+                except e:
+                    s._abandon_start()
+                    raise e^
+            extra_worker_fds.append(per_worker^)
+
+        for i in range(num_workers):
+            var frontend_copy = frontend.copy()
+            # Pick this worker's listener fd: either the shared
+            # epoll listener, or its own per-worker SO_REUSEPORT
+            # listener (pre-bound on this thread above).
+            var worker_listener_fd: Int = listener_fd
+            if prebind_per_worker and i < len(s._per_worker_listener_addrs):
+                var pwl_ptr = Pointer[TcpListener, MutUntrackedOrigin](
+                    unsafe_from_address=s._per_worker_listener_addrs[i]
+                )
+                worker_listener_fd = Int(pwl_ptr[].as_raw_fd())
+            var worker_stats_addr = (
+                s._stats_addrs[i] if i < len(s._stats_addrs) else 0
+            )
+            var worker_extra_fds = List[Int]()
+            if i < len(extra_worker_fds):
+                worker_extra_fds = extra_worker_fds[i].copy()
+            var ctx = _WorkerCtx[Self.F](
+                worker_listener_fd,
+                addr,
+                frontend_copy^,
+                stopping_addr,
+                i,
+                pin_cores,
+                worker_stats_addr,
+                worker_extra_fds^,
+            )
+            # Native Mojo allocator (see _scheduler_free_raw for why).
+            var ctx_ptr = alloc(
+                Layout[_WorkerCtx[Self.F]](count=1)
+            ).unsafe_leak()
+            ctx_ptr.unsafe_write(ctx^)
+            var arg = ctx_ptr.unsafe_bitcast[UInt8]()
+            var ctx_addr = Int(ctx_ptr)
+
+            var spawned = False
+            try:
+                var th = ThreadHandle.spawn_serving[_worker_entry[Self.F]](arg)
+                # Move the (non-Copyable) handle into the next slot
+                # of the worker array; bump the live-slot counter.
+                s._workers_ptr.unsafe_offset(s._workers_len).unsafe_write(th^)
+                s._workers_len += 1
+                s._ctx_addrs.append(ctx_addr)
+                spawned = True
+            except:
+                pass
+            if not spawned:
+                # Roll back any workers we already started so the caller
+                # gets a fully-stopped scheduler instead of half-live state.
+                store_stop_flag(stopping_addr, True)
+                for j in range(s._workers_len):
+                    try:
+                        s._workers_ptr.unsafe_offset(j)[].join()
+                    except:
+                        pass
+                    s._workers_ptr.unsafe_offset(j).unsafe_deinit_pointee()
+                _scheduler_free_raw(s._workers_ptr.unsafe_bitcast[UInt8]())
+                # Pointer is non-nullable; C NULL from a runtime 0.
+                var null_addr = 0
+                s._workers_ptr = Pointer[ThreadHandle, MutUntrackedOrigin](
+                    unsafe_from_address=null_addr
+                )
+                s._workers_len = 0
+                # Destroy + free EVERY ctx (the ones that workers claimed
+                # + this one that never got claimed).
+                _scheduler_free_ctxs[Self.F](s._ctx_addrs)
+                s._ctx_addrs.clear()
+                ctx_ptr.unsafe_deinit_pointee()
+                _scheduler_free_raw(ctx_ptr.unsafe_bitcast[UInt8]())
+                # Free the pre-allocated per-worker stats cells.
+                for k in range(len(s._stats_addrs)):
+                    _scheduler_free_raw(
+                        _OpaquePtr(unsafe_from_address=s._stats_addrs[k])
+                    )
+                s._stats_addrs.clear()
+                balance_group_free(s._balance_addr)
+                s._balance_addr = 0
+                # The pre-bound per-worker listeners (default mode) were
+                # never freed here, so a failed start left every one of
+                # them open and bound (CONC-06). All workers joined.
+                s._free_per_worker_listeners()
+                # All workers joined, so no one is reading the
+                # shared listener anymore -- destroy + free it
+                # if we owned one (paths that prebind per-worker
+                # listeners leave listener_ptr null).
+                if Int(listener_ptr) != 0:
+                    listener_ptr.unsafe_deinit_pointee()
+                    _scheduler_free_raw(listener_ptr.unsafe_bitcast[UInt8]())
+                s._shared_listener_addr = 0
+                s._shared_listener_fd = -1
+                # All workers joined, so no one is reading the
+                # stopping flag anymore — safe to free.
+                _scheduler_free_raw(stop_raw)
+                s._stopping_addr = 0
+                raise Error("pthread_create failed in Scheduler.start")
+
+        # Workers holding a lease are pool tasks. Don't hand back the
+        # scheduler while one is still queued: a donating join elsewhere
+        # could run it inline and never return. No-op for OS threads.
+        for i in range(s._workers_len):
+            s._workers_ptr.unsafe_offset(i)[].wait_started()
+        return s^
+
+    def _abandon_start(mut self):
+        """Undo a ``start`` that failed before any worker was spawned:
+        free the listeners, stats cells, stop flag and worker array."""
+        self._free_resources()
+        if Int(self._workers_ptr) != 0:
+            _scheduler_free_raw(self._workers_ptr.unsafe_bitcast[UInt8]())
+            var null_addr = 0
+            self._workers_ptr = Pointer[ThreadHandle, MutUntrackedOrigin](
+                unsafe_from_address=null_addr
+            )
+        self._workers_len = 0
+
+    def _signal_stop(mut self):
+        """Flip the stop flag.
+
+        Idempotent. ``_stopping_addr == 0`` (never started / already
+        torn down) makes it a no-op.
+
+        The shared listener is deliberately *not* closed here. Every
+        worker holds its bare fd number, and one that polled a batch
+        before it saw the flag still accepts on it, so closing it now
+        would let that ``accept`` land on whatever the number names next
+        (or let a worker still starting up register a reused number).
+        ``_free_resources`` closes it once, after every worker joined;
+        the stop flag, polled at least every 100 ms, is what ends the
+        loops (CONC-05).
+        """
+        if self._stopping_addr != 0:
+            store_stop_flag(self._stopping_addr, True)
+
+    def _join_workers(mut self):
+        """Join every worker thread and release the handle array.
+
+        Must run before reading the per-worker stats cells (the
+        acquire-load pairs with each worker's release-stores, which
+        are guaranteed visible once the worker's pthread has joined).
+        """
+        for i in range(self._workers_len):
+            try:
+                self._workers_ptr.unsafe_offset(i)[].join()
+            except:
+                pass
+            self._workers_ptr.unsafe_offset(i).unsafe_deinit_pointee()
+        if self._workers_len > 0:
+            _scheduler_free_raw(self._workers_ptr.unsafe_bitcast[UInt8]())
+            var null_addr = 0
+            self._workers_ptr = Pointer[ThreadHandle, MutUntrackedOrigin](
+                unsafe_from_address=null_addr
+            )
+            self._workers_len = 0
+
+    def _record_crash_count(mut self):
+        """Snapshot how many workers exited crashed (call after join,
+        before freeing the stats cells)."""
+        var crashed = 0
+        for i in range(len(self._stats_addrs)):
+            if (
+                load_worker_stat(self._stats_addrs[i], WORKER_STAT_STATUS)
+                == WORKER_STATUS_CRASHED
+            ):
+                crashed += 1
+        self._last_crash_count = crashed
+
+    def _free_per_worker_listeners(mut self):
+        """Close and free every pre-bound per-worker listener (primaries
+        and extras). Only call once no worker can still use them."""
+        for i in range(len(self._per_worker_listener_addrs)):
+            var pwl_raw = _OpaquePtr(
+                unsafe_from_address=self._per_worker_listener_addrs[i]
+            )
+            var pwl_typed = pwl_raw.unsafe_bitcast[TcpListener]()
+            pwl_typed.unsafe_deinit_pointee()
+            _scheduler_free_raw(pwl_raw)
+        self._per_worker_listener_addrs.clear()
+
+    def _free_resources(mut self):
+        """Free ctxs, listeners, stats cells, and the stop flag.
+
+        Runs after ``_join_workers`` (no worker still references any of
+        these) and after ``_record_crash_count`` (the stats cells are
+        read before they are freed). Idempotent.
+        """
+        _scheduler_free_ctxs[Self.F](self._ctx_addrs)
+        self._ctx_addrs.clear()
+
+        if self._shared_listener_addr != 0:
+            var raw = _OpaquePtr(unsafe_from_address=self._shared_listener_addr)
+            var typed = raw.unsafe_bitcast[TcpListener]()
+            typed.unsafe_deinit_pointee()
+            _scheduler_free_raw(raw)
+            self._shared_listener_addr = 0
+            self._shared_listener_fd = -1
+
+        self._free_per_worker_listeners()
+
+        for i in range(len(self._stats_addrs)):
+            _scheduler_free_raw(
+                _OpaquePtr(unsafe_from_address=self._stats_addrs[i])
+            )
+        self._stats_addrs.clear()
+        balance_group_free(self._balance_addr)
+        self._balance_addr = 0
+
+        if self._stopping_addr != 0:
+            var stop_raw = _OpaquePtr(unsafe_from_address=self._stopping_addr)
+            _scheduler_free_raw(stop_raw)
+            self._stopping_addr = 0
+
+    def shutdown(mut self) raises:
+        """Signal every worker to stop and wait for them to join.
+
+        Flips the heap-allocated stopping flag (what breaks the
+        workers' loops), joins all worker threads, records the crash
+        count, and frees every worker context, listener (the shared
+        one is closed here, after the join), stats cell, and the
+        stopping-flag heap cell. Idempotent — a second call finds the state empty
+        and is a no-op.
+        """
+        self._signal_stop()
+        self._join_workers()
+        self._record_crash_count()
+        self._free_resources()
+
+    def is_running(self) -> Bool:
+        """Return True if any worker has not yet joined.
+
+        Note: this only tracks join state. To tell a crash from a
+        clean shutdown after the workers have joined, read
+        ``crashed_worker_count()`` (populated by ``shutdown`` /
+        ``drain`` from the per-worker exit-status cells).
+        """
+        return self._workers_len > 0
+
+    def crashed_worker_count(self) -> Int:
+        """Number of workers whose last run exited crashed (poll
+        failure), captured during the most recent ``shutdown`` /
+        ``drain``. 0 after a clean shutdown."""
+        return self._last_crash_count
+
+    def drain(mut self, timeout_ms: Int) raises -> List[ShutdownReport]:
+        """Graceful multi-worker shutdown.
+
+        Broadcasts the stopping flag to every worker, closes every
+        worker's listener socket, waits up to ``timeout_ms`` for
+        workers to drain in-flight work, then joins. Returns one
+        ``ShutdownReport`` per worker — best-effort counts based on
+        whether the worker joined inside the timeout.
+
+        Each worker publishes its live-connection count to a shared
+        per-worker stats cell on every reactor iteration (release
+        store), so once the worker joins the Scheduler reads a real
+        ``in_flight_at_deadline`` (acquire load) instead of the old
+        fabricated 0 / 1. Those remaining connections are force-closed
+        during the worker's graceful-shutdown pass, so ``timed_out``
+        mirrors that count. ``drained`` stays a coarse budget signal
+        (1 when a positive drain budget was given, 0 on a hard cut):
+        the reactor does not count naturally-completed connections, so
+        an exact "finished vs cut" split is not available in this
+        force-close model.
+
+        ``timeout_ms`` bounds the wait. A worker whose thread has not
+        returned by then (a handler that will not finish) is detached
+        and reported with ``drained == 0``; its context, stats cell and
+        listeners (its own, not the joined workers'), the shared listener
+        (opt-out shape), and the shared stop flag, are left allocated, since the
+        thread may still be using them. ``timeout_ms <= 0`` is a hard stop: no drain window,
+        and every worker is joined, as ``shutdown()`` does.
+
+        Args:
+            timeout_ms: Max ms to wait for the workers to drain.
+
+        Returns:
+            ``List[ShutdownReport]`` of length ``num_workers`` (the
+            count at start time). ``in_flight_at_deadline`` /
+            ``timed_out`` are the real per-worker live-connection
+            counts; ``drained`` is the budget signal.
+        """
+        var deadline_ms = timeout_ms if timeout_ms > 0 else 0
+        var n_workers = len(self._stats_addrs)
+
+        # Step 1: signal stop. The shared listener stays open until
+        # every worker has joined (see _signal_stop).
+        self._signal_stop()
+
+        # Step 2: wait, up to the deadline, for each worker's thread to
+        # return (WORKER_STAT_DONE), then join the ones that did and
+        # detach the rest. This used to go straight to pthread_join, so
+        # a worker stuck in a handler held drain(timeout_ms) for as long
+        # as the handler took, forever included. A yield loop, not a
+        # sleep: libc_nanosleep_ms after pthread_create trips the
+        # usleep-multiplier anomaly noted in shutdown().
+        var n = self._workers_len
+        var done = List[Bool](length=n, fill=True)
+        if deadline_ms > 0:
+            var until = monotonic_now_ms() + deadline_ms
+            while True:
+                var all_done = True
+                for i in range(n):
+                    done[i] = (
+                        load_worker_stat(self._stats_addrs[i], WORKER_STAT_DONE)
+                        != 0
+                    )
+                    if not done[i]:
+                        all_done = False
+                if all_done or monotonic_now_ms() >= until:
+                    break
+                _ = external_call["sched_yield", c_int]()
+        var stuck = List[Int]()
+        for i in range(n):
+            try:
+                if done[i]:
+                    self._workers_ptr.unsafe_offset(i)[].join()
+                else:
+                    self._workers_ptr.unsafe_offset(i)[].detach()
+                    stuck.append(i)
+            except:
+                pass
+            self._workers_ptr.unsafe_offset(i).unsafe_deinit_pointee()
+        if n > 0:
+            _scheduler_free_raw(self._workers_ptr.unsafe_bitcast[UInt8]())
+            var null_addr = 0
+            self._workers_ptr = Pointer[ThreadHandle, MutUntrackedOrigin](
+                unsafe_from_address=null_addr
+            )
+            self._workers_len = 0
+
+        # Step 3: read the per-worker in-flight snapshots + exit status.
+        # For a joined worker the join is the happens-before edge; for a
+        # detached one it is the acquire load, and the count is as of
+        # the deadline.
+        var reports = List[ShutdownReport]()
+        for i in range(n_workers):
+            var inflight = load_worker_stat(
+                self._stats_addrs[i], WORKER_STAT_INFLIGHT
+            )
+            var status = load_worker_stat(
+                self._stats_addrs[i], WORKER_STAT_STATUS
+            )
+            var on_time = i >= n or done[i]
+            reports.append(
+                ShutdownReport(
+                    drained=1 if deadline_ms > 0 and on_time else 0,
+                    timed_out=inflight if on_time else max(inflight, 1),
+                    in_flight_at_deadline=inflight,
+                    crashed=1 if status == WORKER_STATUS_CRASHED else 0,
+                )
+            )
+        self._record_crash_count()
+
+        # A detached worker may still be running, reading its context,
+        # stats cell and listeners. Those stay allocated for the life of
+        # the process rather than be freed under a live thread.
+        if len(stuck) > 0:
+            for k in range(len(stuck) - 1, -1, -1):
+                var idx = stuck[k]
+                if idx < len(self._ctx_addrs):
+                    _ = self._ctx_addrs.pop(idx)
+                if idx < len(self._stats_addrs):
+                    _ = self._stats_addrs.pop(idx)
+            # Drop only the stuck workers' listeners from the list that
+            # gets freed. Primary i is entry i; worker i's extras follow
+            # all the primaries, at n + i * n_extra + j. Clearing the
+            # whole list leaked every joined worker's SO_REUSEPORT
+            # listener (CONC-04).
+            var n_lis = len(self._per_worker_listener_addrs)
+            var n_extra = 0
+            if n > 0 and n_lis > n:
+                n_extra = (n_lis - n) // n
+            var is_stuck = List[Bool](length=n, fill=False)
+            for k in range(len(stuck)):
+                is_stuck[stuck[k]] = True
+            var kept = List[Int]()
+            for p in range(n_lis):
+                var owner = p if p < n else (p - n) // n_extra
+                if not (owner < n and is_stuck[owner]):
+                    kept.append(self._per_worker_listener_addrs[p])
+            self._per_worker_listener_addrs = kept^
+            # The shared listener (opt-out shape) is held by every worker
+            # by its bare fd number, so it is leaked with the detached
+            # worker too rather than closed under it (CONC-05).
+            self._shared_listener_addr = 0
+            self._shared_listener_fd = -1
+            # The detached worker re-reads the shared stop flag on every
+            # serve-loop iteration, so the flag stays allocated too: it
+            # is leaked like the stuck worker's context and stats cell.
+            # Freeing it handed the cell to the next allocation, which
+            # could store False and keep the worker serving forever.
+            self._stopping_addr = 0
+            # The accept-balancing group too: the worker publishes into it
+            # every iteration and locks it on the way out.
+            self._balance_addr = 0
+
+        # Step 4: free everything (stats cells are read above first).
+        self._free_resources()
+        return reports^
+
+
+# ── Convenience ─────────────────────────────────────────────────────────────
+
+
+def default_worker_count() -> Int:
+    """Sensible default worker count: ``num_cpus()``.
+
+    For IO-bound HTTP plaintext the best throughput is usually
+    num_cpus workers; CPU-heavy handlers may prefer num_cpus // 2 to
+    leave headroom for the kernel network stack.
+    """
+    return num_cpus()

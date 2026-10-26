@@ -1,0 +1,651 @@
+/**
+ * dodo TLS - minimal OpenSSL wrapper for Mojo FFI.
+ *
+ * Exposes a C API over the OpenSSL SSL_CTX / SSL lifecycle so Mojo
+ * can call it without knowing about C++ name mangling or OpenSSL
+ * object internals.
+ *
+ * Requires OpenSSL 3.x — compile-time enforced.
+ */
+
+#pragma once
+
+#include <stdint.h>
+#include <sys/types.h>  /* ssize_t, size_t */
+
+#if defined(OPENSSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER < 0x30000000L
+#error "dodo requires OpenSSL 3.x or later"
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Opaque handles */
+typedef void* dodo_ssl_ctx_t;
+typedef void* dodo_ssl_t;
+typedef void* dodo_ssl_session_t;
+
+/* ── Client context lifecycle ──────────────────────────────────────────────── */
+
+dodo_ssl_ctx_t dodo_ssl_ctx_new(void);
+void            dodo_ssl_ctx_free(dodo_ssl_ctx_t ctx);
+
+/* Enforce TLS 1.2+, forward-secret AEAD ciphers (must call after ctx_new) */
+int  dodo_ssl_ctx_set_security_policy(dodo_ssl_ctx_t ctx);
+
+int  dodo_ssl_ctx_set_verify_peer(dodo_ssl_ctx_t ctx, int enabled);
+int  dodo_ssl_ctx_load_ca_bundle(dodo_ssl_ctx_t ctx, const char* path);
+int  dodo_ssl_ctx_load_cert_key(dodo_ssl_ctx_t ctx,
+                                  const char* cert_path,
+                                  const char* key_path);
+
+/* ── Session lifecycle ─────────────────────────────────────────────────────── */
+
+dodo_ssl_t dodo_ssl_new(dodo_ssl_ctx_t ctx, int fd);
+void        dodo_ssl_free(dodo_ssl_t ssl);
+
+int dodo_ssl_connect(dodo_ssl_t ssl, const char* server_name);
+int dodo_ssl_shutdown(dodo_ssl_t ssl);
+
+/**
+ * ``dodo_ssl_connect`` with the failure classified rather than
+ * flattened to -1. Returns 0 on a completed handshake, or a
+ * ``DODO_SSL_IO_*`` sentinel (see below): WANT_READ / WANT_WRITE when
+ * the handshake needs more I/O -- which on a *blocking* fd means the
+ * socket's ``SO_RCVTIMEO`` / ``SO_SNDTIMEO`` expired -- or FATAL, with
+ * the reason in ``dodo_ssl_last_error()``.
+ *
+ * ``dodo_ssl_connect`` cannot report the timeout: an expiry leaves the
+ * OpenSSL error queue empty, so it is indistinguishable there from a
+ * protocol failure that also left nothing behind.
+ */
+int dodo_ssl_connect_ex(dodo_ssl_t ssl, const char* server_name);
+
+/* ── I/O ───────────────────────────────────────────────────────────────────── */
+
+int dodo_ssl_read(dodo_ssl_t ssl, uint8_t* buf, int len);
+int dodo_ssl_write(dodo_ssl_t ssl, const uint8_t* buf, int len);
+
+/* ── Non-blocking I/O (reactor state machine) ──────────────────────────────── */
+
+/* Sentinel return codes for the ``_ex`` I/O helpers. Positive values
+ * are byte counts; these negatives disambiguate the non-fatal
+ * "call again after the matching readiness edge" cases (mapped from
+ * ``SSL_get_error``) from a clean TLS shutdown and a fatal error, so
+ * a non-blocking reactor never has to guess at ``errno``. */
+#define DODO_SSL_IO_WANT_READ  (-1)
+#define DODO_SSL_IO_WANT_WRITE (-2)
+#define DODO_SSL_IO_CLOSED     (-3)  /* peer close_notify (clean EOF) */
+#define DODO_SSL_IO_FATAL      (-4)
+#define DODO_SSL_IO_EOF_UNCLEAN (-5)  /* EOF with no close_notify (blocking read) */
+
+/**
+ * Non-blocking ``SSL_read``. Returns the number of plaintext bytes
+ * read (>0), or one of the ``DODO_SSL_IO_*`` sentinels: WANT_READ /
+ * WANT_WRITE (re-arm the matching interest and call again), CLOSED
+ * (the peer sent close_notify -- clean end of stream), or FATAL.
+ *
+ * A TLS record can require a write during a read (mid-stream
+ * renegotiation / key update), hence WANT_WRITE is possible here.
+ */
+int dodo_ssl_read_ex(dodo_ssl_t ssl, uint8_t* buf, int len);
+
+/**
+ * Non-blocking ``SSL_write``. Returns the number of plaintext bytes
+ * consumed (>0), or a ``DODO_SSL_IO_*`` sentinel. WANT_READ is
+ * possible here for the symmetric reason (a write can need to read a
+ * handshake record first).
+ */
+int dodo_ssl_write_ex(dodo_ssl_t ssl, const uint8_t* buf, int len);
+
+/**
+ * ``SSL_read`` for a *blocking* fd, with the retryable case split out.
+ * Returns bytes read (>0), 0 at end of stream, WANT_READ / WANT_WRITE
+ * when the socket's own ``SO_RCVTIMEO`` / ``SO_SNDTIMEO`` expired
+ * mid-record, or FATAL.
+ *
+ * ``dodo_ssl_read`` cannot report the timeout -- it arrives as
+ * ``SSL_ERROR_WANT_READ`` on an empty error queue, so the caller gets
+ * an error with no reason attached. ``dodo_ssl_read_ex`` reports it,
+ * but treats a peer that vanished without ``close_notify`` as FATAL
+ * (OpenSSL 3.x raises ``SSL_ERROR_SSL`` / "unexpected eof while
+ * reading" there), which for a blocking reader draining a body to EOF
+ * is a regression. This keeps ``dodo_ssl_read``'s end-of-stream
+ * contract and adds only the timeout split.
+ */
+int dodo_ssl_read_blocking(dodo_ssl_t ssl, uint8_t* buf, int len);
+
+/* ── Introspection ─────────────────────────────────────────────────────────── */
+
+const char* dodo_ssl_get_version(dodo_ssl_t ssl);
+const char* dodo_ssl_get_cipher(dodo_ssl_t ssl);
+int         dodo_ssl_get_peer_cert_subject(dodo_ssl_t ssl, char* buf, int buf_size);
+
+/* ── Session resumption (TLS tickets, RFC 5077 + RFC 8446 §4.6.1) ───────── */
+
+/**
+ * Enable client-side session caching on a client ``SSL_CTX``.
+ *
+ * Sets ``SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL`` plus a
+ * ``new_session_cb`` that stashes the most recent ``SSL_SESSION``
+ * into per-ctx ex_data. The application retrieves it via
+ * ``dodo_ssl_ctx_take_session`` after a post-handshake read
+ * round-trip (TLS 1.3 NewSessionTicket arrives interleaved with
+ * application data).
+ *
+ * Idempotent — safe to call more than once on the same ctx.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int dodo_ssl_ctx_enable_client_session_cache(dodo_ssl_ctx_t ctx);
+
+/**
+ * Take the most recently captured session from this client ctx,
+ * transferring ownership to the caller. Returns NULL if no session
+ * has been captured yet (or if the caller already took it). The
+ * caller must pair every non-NULL return with a
+ * ``dodo_ssl_session_free`` once done with it.
+ */
+dodo_ssl_session_t dodo_ssl_ctx_take_session(dodo_ssl_ctx_t ctx);
+
+/** Free a session handle returned by ``dodo_ssl_ctx_take_session``. */
+void dodo_ssl_session_free(dodo_ssl_session_t sess);
+
+/**
+ * Apply a saved session to a fresh ``SSL`` before
+ * ``dodo_ssl_connect``. The ``SSL`` keeps its own reference; the
+ * caller still owns ``sess`` and must free it (after every
+ * planned reuse).
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int dodo_ssl_set_session(dodo_ssl_t ssl, dodo_ssl_session_t sess);
+
+/**
+ * Returns 1 if the most recent handshake on ``ssl`` resumed a
+ * prior session (full handshake skipped), 0 otherwise.
+ */
+int dodo_ssl_session_reused(dodo_ssl_t ssl);
+
+/**
+ * Server-side: enable session ticket emission (RFC 5077 / RFC
+ * 8446 §4.6.1) with the given lifetime in seconds. Sets a fixed
+ * session-id-context (required by OpenSSL whenever tickets are
+ * on) and clears ``SSL_OP_NO_TICKET`` if it was set.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int dodo_ssl_ctx_enable_session_tickets(dodo_ssl_ctx_t ctx, int lifetime_s);
+
+/**
+ * Server-side: turn resumption off. Sets ``SSL_OP_NO_TICKET``, sends zero
+ * TLS 1.3 NewSessionTicket messages (``SSL_CTX_set_num_tickets(ctx, 0)``) and
+ * disables the server session cache (``SSL_SESS_CACHE_OFF``), so no session
+ * is issued and none can be resumed.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int dodo_ssl_ctx_disable_session_tickets(dodo_ssl_ctx_t ctx);
+
+/* Raise the minimum protocol version: TLS1_2_VERSION (0x0303) or
+ * TLS1_3_VERSION (0x0304). Anything else fails; returns 0 on success. */
+int dodo_ssl_ctx_set_min_proto(dodo_ssl_ctx_t ctx, int version);
+
+/* ── Error ─────────────────────────────────────────────────────────────────── */
+
+const char* dodo_ssl_last_error(void);
+
+/* ── Server-side context lifecycle ─────────────────────────────────────── */
+
+/**
+ * Create a server-side ``SSL_CTX`` configured with TLS 1.2+,
+ * forward-secret AEAD ciphers, and the supplied certificate
+ * chain + private key. Combines ``SSL_CTX_new(TLS_server_method())``
+ * + min-proto-version + cipher list + ``load_cert_key`` + optional
+ * client-cert verification.
+ *
+ * @param cert_path  PEM full chain (leaf first, then intermediates).
+ * @param key_path   PEM private key matching ``cert_path``.
+ * @return Opaque ctx handle; NULL on failure (use
+ *         ``dodo_ssl_last_error()`` for the message).
+ */
+dodo_ssl_ctx_t dodo_ssl_ctx_new_server(
+    const char* cert_path, const char* key_path
+);
+
+/**
+ * Reload cert + key on an existing server ``SSL_CTX``. In-flight
+ * sessions that already loaded an ``SSL`` from the old ctx see
+ * the previous cert (OpenSSL holds the cert on the SSL via
+ * ``SSL_use_certificate``); new handshakes pick up the reloaded
+ * cert. Used for cert rotation without restart.
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int dodo_ssl_ctx_reload(
+    dodo_ssl_ctx_t ctx, const char* cert_path, const char* key_path
+);
+
+/* Serve cert_path / key_path to clients whose SNI is ``host`` ("" for the
+ * default, "*.example.com" for one-label wildcards), replacing any entry
+ * for it. Safe while other threads handshake on ctx; a bad pair changes
+ * nothing. 0 on success, -1 on failure. */
+int dodo_ssl_ctx_set_cert(
+    dodo_ssl_ctx_t ctx, const char* host, const char* cert_path,
+    const char* key_path
+);
+
+/* 1 when the context's certificate and private key match, else 0. */
+int dodo_ssl_ctx_check_private_key(dodo_ssl_ctx_t ctx);
+
+/**
+ * Set ALPN protocols for server-side selection.
+ *
+ * ``protos`` is the wire-format ALPN list:
+ * ``len_byte || protocol_bytes || len_byte || protocol_bytes || ...``.
+ * For example, advertising ``["h2", "http/1.1"]`` produces:
+ * ``\x02h2\x08http/1.1``.
+ *
+ * The selection callback picks the first server-listed protocol
+ * matching the client's advertised list (server preference wins
+ * on ties — RFC 7301 §3.2 SHOULD recommendation).
+ *
+ * @return 0 on success, -1 on failure.
+ */
+int dodo_ssl_ctx_set_alpn_server(
+    dodo_ssl_ctx_t ctx, const uint8_t* protos, int protos_len
+);
+
+/* Client-side ALPN: tell OpenSSL which protocols to advertise on
+ * the ClientHello. Wire-format: ``len_byte || proto ||
+ * len_byte || proto || ...`` (same as the server-side blob).
+ *
+ * Returns 0 on success, -1 on failure (set_error() set).
+ * OpenSSL's SSL_CTX_set_alpn_protos uses 0/1 return values
+ * inverted from typical OpenSSL idioms; this wrapper normalises
+ * to the rest of the file's "0 ok, -1 err" convention. */
+int dodo_ssl_ctx_set_alpn_protos(
+    dodo_ssl_ctx_t ctx, const uint8_t* protos, int protos_len
+);
+
+/**
+ * Enable mTLS client-cert verification.
+ *
+ * Sets ``SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`` and
+ * loads ``ca_path`` as the trust anchor for client certs.
+ *
+ * @return 0 on success, -1 on failure (cert load failure, etc.).
+ */
+int dodo_ssl_ctx_set_verify_client_cert(
+    dodo_ssl_ctx_t ctx, const char* ca_path
+);
+
+/* ── Server-side session lifecycle ──────────────────────────────────────── */
+
+/**
+ * Create an ``SSL`` for an accepted server-side connection.
+ *
+ * Wraps ``SSL_new`` + ``SSL_set_fd`` + ``SSL_set_accept_state``.
+ * The caller drives the handshake via ``dodo_ssl_do_handshake``
+ * on each readable / writable edge.
+ *
+ * @return Opaque handle; NULL on failure.
+ */
+dodo_ssl_t dodo_ssl_new_accept(dodo_ssl_ctx_t ctx, int fd);
+
+/**
+ * Drive ``SSL_accept`` (server side) or ``SSL_connect`` (client
+ * side, equivalent to ``dodo_ssl_connect``) one step.
+ *
+ * Reactor-friendly return values:
+ *
+ *   0  — handshake complete (``SSL_is_init_finished`` is true).
+ *   1  — WANT_READ: caller waits for the socket to be readable
+ *        and calls ``dodo_ssl_do_handshake`` again.
+ *   2  — WANT_WRITE: caller waits for the socket to be writable
+ *        and calls ``dodo_ssl_do_handshake`` again.
+ *  -1  — fatal error (use ``dodo_ssl_last_error`` for the
+ *        message; close the connection).
+ */
+int dodo_ssl_do_handshake(dodo_ssl_t ssl);
+
+/* ── Server-side introspection ─────────────────────────────────────────── */
+
+/**
+ * Copy the negotiated ALPN protocol into ``buf``.
+ *
+ * @return Number of bytes written (excluding NUL), or 0 if no
+ *         ALPN protocol was negotiated, or -1 if ``buf`` was too
+ *         small.
+ */
+int dodo_ssl_get_alpn_selected(dodo_ssl_t ssl, char* buf, int buf_size);
+
+/**
+ * Copy the SNI hostname the client sent in the Client Hello into
+ * ``buf``.
+ *
+ * @return Number of bytes written (excluding NUL), or 0 if the
+ *         client sent no SNI, or -1 if ``buf`` was too small.
+ */
+int dodo_ssl_get_sni_host(dodo_ssl_t ssl, char* buf, int buf_size);
+
+/* ── Test server (loopback echo server — for use in test code only) ────────── */
+
+/**
+ * Opaque handle for a test TLS echo server.
+ * Created by dodo_test_server_new, freed by dodo_test_server_free.
+ */
+typedef void* dodo_test_server_t;
+
+/**
+ * Create and bind a loopback TLS echo server.
+ *
+ * Binds to 127.0.0.1:<port> (use 0 for ephemeral port assignment).
+ * Calls listen(2) with backlog 16. Does NOT accept yet.
+ *
+ * @param cert_path  PEM server certificate path.
+ * @param key_path   PEM server private key path.
+ * @param ca_path    PEM CA bundle for client cert verification,
+ *                   or NULL to skip client cert verification.
+ * @param port       TCP port to bind (0 = OS assigns ephemeral port).
+ * @return           Opaque server handle, or NULL on failure.
+ */
+dodo_test_server_t dodo_test_server_new(
+    const char* cert_path,
+    const char* key_path,
+    const char* ca_path,
+    int         port
+);
+
+/** Free a test server and close its listening socket. */
+void dodo_test_server_free(dodo_test_server_t srv);
+
+/* ── Socket utilities (work around Mojo external_call variadic ABI bug) ──── */
+
+/**
+ * Set or clear the O_NONBLOCK flag on a socket via fcntl(F_SETFL).
+ *
+ * Mojo's external_call cannot reliably pass the third argument to variadic
+ * C functions (like fcntl) on macOS/arm64.  This non-variadic wrapper is
+ * properly compiled by the C++ compiler and avoids the bug.
+ *
+ * @param fd     File descriptor of the socket.
+ * @param enable 1 to enable non-blocking mode, 0 to disable.
+ * @return 0 on success, -1 on failure (errno is set).
+ */
+int dodo_set_nonblocking(int fd, int enable);
+
+/**
+ * Thin wrapper around read(2). Works on any fd (socket, pipe, eventfd).
+ *
+ * The Mojo stdlib declares ``external_call["read", ...]`` with its own
+ * signature for ``FileDescriptor``; routing through this wrapper lets
+ * dodo's reactor use a distinct symbol name.
+ *
+ * @param fd    File descriptor to read from.
+ * @param buf   Destination buffer.
+ * @param count Maximum bytes to read.
+ * @return Number of bytes read on success (0 on EOF), -1 on error
+ *         (errno set; EAGAIN/EWOULDBLOCK for nonblocking fds).
+ */
+ssize_t dodo_read(int fd, void* buf, size_t count);
+
+/**
+ * Thin wrapper around write(2). Works on any fd (socket, pipe, eventfd).
+ *
+ * See ``dodo_read`` for why the wrapper exists.
+ *
+ * @param fd    File descriptor to write to.
+ * @param buf   Source buffer.
+ * @param count Number of bytes to write.
+ * @return Number of bytes written on success, -1 on error (errno set).
+ */
+ssize_t dodo_write(int fd, const void* buf, size_t count);
+
+/**
+ * Non-blocking connect + poll — the core of connect_timeout().
+ *
+ * 1. Sets fd to non-blocking mode.
+ * 2. Calls connect(fd, addr, addrlen).
+ * 3. If EINPROGRESS: waits up to timeout_ms with poll(POLLOUT).
+ * 4. On timeout: returns -2 (caller should raise ConnectionTimeout).
+ * 5. On success: restores blocking mode, returns 0.
+ * 6. On failure: returns errno (positive int).
+ *
+ * @param fd         Socket fd (must already be created).
+ * @param addr       Pointer to sockaddr (cast to void* for C compatibility).
+ * @param addrlen    Size of the sockaddr struct.
+ * @param timeout_ms Maximum wait in milliseconds.
+ * @return 0 on success, -2 on timeout, positive errno on error.
+ */
+int dodo_connect_timeout(int fd, const void* addr, unsigned addrlen,
+                          int timeout_ms);
+
+/** Return the actual bound port (useful when port=0 was passed to _new). */
+int dodo_test_server_port(dodo_test_server_t srv);
+
+/**
+ * Accept one connection, echo all received bytes back, then close.
+ *
+ * This function blocks until a client connects, performs the TLS handshake,
+ * reads data (until EOF or 64 KB), writes the same data back, and closes.
+ * Intended to be called in a forked child process.
+ *
+ * @return 0 on success, -1 on error.
+ */
+int dodo_test_server_echo_once(dodo_test_server_t srv);
+
+/**
+ * Accept ``n`` sequential connections, echo each one, then return.
+ * Same per-connection semantics as ``dodo_test_server_echo_once``;
+ * differs only in that the same ``SSL_CTX`` is reused across all
+ * accepts so cached session tickets / IDs survive between
+ * connections (the resumption tests rely on this).
+ *
+ * @return 0 on success, -1 on error.
+ */
+int dodo_test_server_echo_n(dodo_test_server_t srv, int n);
+
+/* ── HMAC-SHA256 (signed cookies / sessions) ─────────────────────────────── */
+
+/**
+ * Compute HMAC-SHA256(key, msg) and write the 32-byte tag into out.
+ *
+ * @param key      Secret key bytes (any length; HMAC handles >block_size).
+ * @param key_len  Length of key in bytes.
+ * @param msg      Message bytes.
+ * @param msg_len  Length of message in bytes.
+ * @param out_32   Caller-allocated 32-byte buffer for the digest.
+ * @return 0 on success, -1 on failure.
+ */
+int dodo_hmac_sha256(const uint8_t* key, size_t key_len,
+                      const uint8_t* msg, size_t msg_len,
+                      uint8_t* out_32);
+
+/**
+ * Verify HMAC-SHA256(key, msg) == mac_32 in constant time.
+ *
+ * Uses ``CRYPTO_memcmp`` so the comparison time does not leak which byte
+ * differs.
+ *
+ * @param key      Secret key bytes.
+ * @param key_len  Length of key in bytes.
+ * @param msg      Message bytes.
+ * @param msg_len  Length of message in bytes.
+ * @param mac_32   Caller-supplied 32-byte tag to compare against.
+ * @return 1 if MACs match, 0 if they differ, -1 on FFI failure.
+ */
+int dodo_hmac_sha256_verify(const uint8_t* key, size_t key_len,
+                              const uint8_t* msg, size_t msg_len,
+                              const uint8_t* mac_32);
+
+/* ── QUIC AEAD (RFC 9001 §5.3) ──────────────────────────────────────────── */
+
+/*
+ * QUIC packet AEAD seal / open against OpenSSL EVP_CIPHER_CTX with
+ * deterministic IV-XOR per RFC 9001 §5.3:
+ *
+ *   nonce = iv XOR (zero-padded packet number, big-endian, 12 bytes)
+ *
+ * The caller passes the 12-byte ``iv`` derived from the QUIC key
+ * schedule (``hkdf_expand_label(secret, "quic iv", "", 12)``) and
+ * the packet number as a ``uint64_t``; the FFI builds the nonce
+ * locally so callers cannot accidentally double-XOR. The packet
+ * number is BE-encoded into the low 8 bytes of the nonce buffer
+ * (the upper 4 bytes stay as the iv prefix) before the XOR.
+ *
+ * Cipher selection (``cipher_id`` parameter):
+ *
+ *   1  AES-128-GCM     (16-byte key, 16-byte tag) -- RFC 9001 §5.1
+ *   2  AES-256-GCM     (32-byte key, 16-byte tag)
+ *   3  ChaCha20-Poly1305 (32-byte key, 16-byte tag)
+ *
+ * The tag is appended to the ciphertext: ``ct || tag``. The caller
+ * supplies ``out`` with capacity ``plaintext_len + tag_len``;
+ * ``written`` receives the actual byte count.
+ *
+ * Returns 0 on success, -1 on cipher misconfiguration (wrong key
+ * length, NULL pointers, bad cipher_id), -2 on AEAD tag failure
+ * (decrypt only -- the ciphertext was modified / forged or the
+ * packet number / aad does not match the sealer's).
+ */
+
+/* Cipher IDs -- stable across versions; the Mojo side maps these to
+ * ``QuicAead`` enum values. */
+#define DODO_QUIC_AEAD_AES_128_GCM      1
+#define DODO_QUIC_AEAD_AES_256_GCM      2
+#define DODO_QUIC_AEAD_CHACHA20_POLY1305 3
+
+/* All RFC 9001 AEADs use a 16-byte authentication tag (RFC 9001 §5.3
+ * second paragraph: "The output tag length is 16 octets, the default
+ * for these AEAD algorithms"). */
+#define DODO_QUIC_AEAD_TAG_LEN 16
+
+/* QUIC AEAD nonce is 12 bytes for all three ciphers (RFC 9001 §5.3,
+ * referring to RFC 5116 §3.1 default and ChaCha20-Poly1305 spec).
+ * The FFI builds the nonce internally from ``iv`` + ``pn``. */
+#define DODO_QUIC_AEAD_NONCE_LEN 12
+
+/*
+ * Seal a QUIC packet payload.
+ *
+ * @param cipher_id    One of ``DODO_QUIC_AEAD_*`` constants.
+ * @param key          AEAD key (length per ``cipher_id``).
+ * @param key_len      Length of ``key``; must match the cipher.
+ * @param iv           12-byte AEAD IV from the key schedule.
+ * @param pn           Packet number to be XOR'd into the nonce
+ *                     (BE-encoded into the low 8 bytes).
+ * @param aad          Associated data (the QUIC packet header,
+ *                     including the header-protection-recovered
+ *                     first byte and packet number).
+ * @param aad_len      Length of ``aad``.
+ * @param plaintext    Plaintext bytes to encrypt.
+ * @param plaintext_len Length of ``plaintext``.
+ * @param out          Caller-allocated buffer; capacity must be
+ *                     >= ``plaintext_len + DODO_QUIC_AEAD_TAG_LEN``.
+ * @param out_cap      Capacity of ``out``.
+ * @param written      Receives the number of bytes written into ``out``
+ *                     on success (== plaintext_len + tag_len).
+ * @return 0 on success, -1 on misconfiguration.
+ */
+int dodo_quic_aead_seal(int cipher_id,
+                          const uint8_t* key, size_t key_len,
+                          const uint8_t* iv,
+                          uint64_t pn,
+                          const uint8_t* aad, size_t aad_len,
+                          const uint8_t* plaintext, size_t plaintext_len,
+                          uint8_t* out, size_t out_cap,
+                          size_t* written);
+
+/*
+ * Open a QUIC packet ciphertext + tag.
+ *
+ * The ciphertext buffer ``ct`` must hold ``ct || tag`` (the layout
+ * ``dodo_quic_aead_seal`` produces). On success the recovered
+ * plaintext is written to ``out`` and ``written`` receives the
+ * plaintext length (== ``ct_len - DODO_QUIC_AEAD_TAG_LEN``).
+ *
+ * @return 0 on success; -1 on misconfiguration; -2 on AEAD tag
+ *         failure (RFC 9001 §5.3 invalid packet -- caller drops).
+ */
+int dodo_quic_aead_open(int cipher_id,
+                          const uint8_t* key, size_t key_len,
+                          const uint8_t* iv,
+                          uint64_t pn,
+                          const uint8_t* aad, size_t aad_len,
+                          const uint8_t* ct, size_t ct_len,
+                          uint8_t* out, size_t out_cap,
+                          size_t* written);
+
+/* ── QUIC header protection mask (RFC 9001 §5.4) ───────────────────────── */
+
+/*
+ * QUIC header protection takes a 16-byte sample from the
+ * ciphertext (starting at packet-number-offset + 4 -- see RFC 9001
+ * §5.4.2 for exact byte placement) and derives a 5-byte mask that
+ * XORs into the protected header bits:
+ *
+ *   byte[0] low 4 bits (long header) or low 5 bits (short header)
+ *   byte[pn_offset .. pn_offset + pn_length] (1-4 bytes)
+ *
+ * Mask construction per cipher (RFC 9001 §5.4.3 / §5.4.4):
+ *
+ *   AES-128-ECB sample -> first 5 bytes of AES-ECB(hp_key, sample)
+ *   AES-256-ECB sample -> first 5 bytes of AES-ECB(hp_key, sample)
+ *   ChaCha20 sample    -> ChaCha20(hp_key, counter=u32le(sample[0..4]),
+ *                                  nonce=sample[4..16]) over 5 zero bytes
+ *
+ * Cipher IDs reuse the AEAD constants for AES (a 16-byte sample
+ * for AES-128, 32-byte key for AES-256); ChaCha20 has its own.
+ */
+
+/* Header-protection cipher IDs.  Distinct from AEAD IDs because the
+ * mask path is different (single-block ECB for AES, raw ChaCha20
+ * stream for ChaCha20-Poly1305 AEAD). */
+#define DODO_QUIC_HP_AES_128 1
+#define DODO_QUIC_HP_AES_256 2
+#define DODO_QUIC_HP_CHACHA20 3
+
+/* Sample length is 16 bytes for all three ciphers (RFC 9001 §5.4.2). */
+#define DODO_QUIC_HP_SAMPLE_LEN 16
+
+/* Mask length is 5 bytes -- 1 for the header byte, up to 4 for the
+ * packet number (RFC 9001 §5.4.1). */
+#define DODO_QUIC_HP_MASK_LEN 5
+
+/*
+ * Derive the 5-byte header-protection mask from a 16-byte sample.
+ *
+ * @param cipher_id  One of DODO_QUIC_HP_* constants.
+ * @param hp_key     Header-protection key (16 bytes for AES-128,
+ *                   32 bytes for AES-256, 32 bytes for ChaCha20).
+ * @param hp_key_len Length of hp_key; must match cipher_id.
+ * @param sample     16-byte sample from the ciphertext.
+ * @param out_5      Caller-allocated 5-byte buffer for the mask.
+ * @return 0 on success, -1 on misconfiguration.
+ */
+int dodo_quic_hp_mask(int cipher_id,
+                        const uint8_t* hp_key, size_t hp_key_len,
+                        const uint8_t* sample,
+                        uint8_t* out_5);
+
+/*
+ * Test-only: build the deterministic AEAD nonce from ``iv`` + ``pn``.
+ *
+ * Mirrors the internal nonce-construction step the seal / open
+ * functions run before calling OpenSSL, so test code can pin the
+ * exact bytes the AEAD sees against the RFC 9001 Appendix A vectors
+ * without instrumenting the cpp.
+ *
+ * @param iv      12-byte AEAD IV.
+ * @param pn      Packet number.
+ * @param out_12  Caller-allocated 12-byte buffer for the nonce.
+ * @return 0 on success, -1 on NULL pointer.
+ */
+int dodo_quic_aead_build_nonce(const uint8_t* iv, uint64_t pn,
+                                 uint8_t* out_12);
+
+#ifdef __cplusplus
+}
+#endif

@@ -1,0 +1,7 @@
+{
+  "name": "3.1.1_rsv1_without_negotiated_extension",
+  "spec": "RFC 6455 §5.2 (RSV1-3 MUST be 0 unless an extension negotiates them)",
+  "input_hex": "c1 05 48 65 6c 6c 6f",
+  "expect": "reject",
+  "expect_reason": "RSV1 bit set without permessage-deflate negotiation -- receiver MUST fail the connection"
+}

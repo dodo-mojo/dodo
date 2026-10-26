@@ -1,0 +1,584 @@
+"""Tests for ``dodo.runtime.Reactor``.
+
+Both the Linux epoll backend and the macOS kqueue backend are exercised via
+the same uniform API; the struct itself uses ``comptime if
+CompilationTarget.is_linux()`` internally so callers never see the platform
+split.
+
+Tests rely only on loopback socketpairs (built from a TcpListener +
+TcpStream pair) and do not require any external network access.
+"""
+
+from std.testing import (
+    assert_equal,
+    assert_not_equal,
+    assert_true,
+    assert_false,
+    assert_raises,
+    TestSuite,
+)
+from std.ffi import c_int, c_size_t
+from std.sys.info import CompilationTarget
+
+from dodo.net import SocketAddr
+from dodo.net._libc_event import EPOLLEXCLUSIVE, EPOLLIN, EPOLLRDHUP
+from dodo.tcp import TcpStream, TcpListener
+from dodo.runtime import (
+    Reactor,
+    Event,
+    INTEREST_READ,
+    INTEREST_WRITE,
+    EVENT_READABLE,
+    EVENT_WRITABLE,
+    EVENT_HUP,
+    WAKEUP_TOKEN,
+)
+
+
+# ── Basic lifecycle ───────────────────────────────────────────────────────────
+
+
+def test_create_and_destroy() raises:
+    """A freshly-created reactor has zero user registrations."""
+    var r = Reactor()
+    assert_equal(r.registered_count(), 0)
+
+
+def test_many_create_destroy_no_leak() raises:
+    """Creating and destroying many reactors in sequence doesn't leak fds.
+
+    Not a perfect leak test — relies on the process not hitting EMFILE.
+    Run 100 iterations; any leak of 2-3 fds per reactor would trip this on
+    most dev machines by ~300 iterations, so 100 gives ~3x safety margin.
+    """
+    for _ in range(100):
+        var r = Reactor()
+        _ = r.registered_count()
+
+
+# ── register / modify / unregister ────────────────────────────────────────────
+
+
+def test_register_then_is_registered() raises:
+    """After register(), is_registered() returns True."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    r.register(listener._socket.fd, UInt64(1), INTEREST_READ)
+    assert_true(r.is_registered(listener._socket.fd))
+    assert_equal(r.registered_count(), 1)
+    r.unregister(listener._socket.fd)
+    assert_false(r.is_registered(listener._socket.fd))
+    listener.close()
+
+
+def test_register_rejects_wakeup_token() raises:
+    """Using WAKEUP_TOKEN as a user token is rejected."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    with assert_raises():
+        r.register(listener._socket.fd, WAKEUP_TOKEN, INTEREST_READ)
+    listener.close()
+
+
+def test_register_rejects_empty_interest() raises:
+    """Interest must include at least READ or WRITE."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    with assert_raises():
+        r.register(listener._socket.fd, UInt64(1), 0)
+    listener.close()
+
+
+def test_register_same_fd_twice_raises() raises:
+    """Registering an fd that is already registered raises."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    r.register(listener._socket.fd, UInt64(1), INTEREST_READ)
+    with assert_raises():
+        r.register(listener._socket.fd, UInt64(2), INTEREST_READ)
+    listener.close()
+
+
+def test_unregister_unknown_fd_raises() raises:
+    """Unregister() on a never-registered fd raises."""
+    var r = Reactor()
+    with assert_raises():
+        r.unregister(c_int(999))
+
+
+def test_unregister_after_close_succeeds() raises:
+    """Unregister() must tolerate an fd the owner already closed.
+
+    Ownership hand-off (e.g. a WebSocket upgrade passing the socket to a
+    connection object that closes it) can close the fd before the
+    reactor unregisters it. The kernel auto-removes a closed fd from the
+    epoll set, so ``EPOLL_CTL_DEL`` then fails with EBADF; kqueue's
+    ``EV_DELETE`` returns ENOENT. Both mean "no longer watched", so
+    neither is fatal and the bookkeeping entry must still be dropped.
+    """
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var fd = listener._socket.fd
+    r.register(fd, UInt64(1), INTEREST_READ)
+    listener.close()
+    r.unregister(fd)
+    assert_false(r.is_registered(fd))
+    assert_equal(r.registered_count(), 0)
+
+
+def test_unregister_after_close_frees_fd_for_reuse() raises:
+    """A stale entry left by a failed DEL would poison the recycled fd.
+
+    The kernel hands out the lowest free descriptor, so the next socket
+    very often reuses the number just closed. If ``unregister`` bailed
+    out before ``_registered.pop(fd)``, ``register`` would reject that
+    recycled fd as already-registered and the new connection would be
+    dropped.
+    """
+    var r = Reactor()
+    var first = TcpListener.bind(SocketAddr.localhost(0))
+    var fd = first._socket.fd
+    r.register(fd, UInt64(1), INTEREST_READ)
+    first.close()
+    r.unregister(fd)
+
+    var second = TcpListener.bind(SocketAddr.localhost(0))
+    r.register(second._socket.fd, UInt64(2), INTEREST_READ)
+    assert_true(r.is_registered(second._socket.fd))
+    r.unregister(second._socket.fd)
+    second.close()
+
+
+def test_modify_unknown_fd_raises() raises:
+    """Modify() on a never-registered fd raises."""
+    var r = Reactor()
+    with assert_raises():
+        r.modify(c_int(999), INTEREST_READ)
+
+
+def test_modify_from_read_to_write() raises:
+    """Modify() changes the interest without changing the token."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    r.register(listener._socket.fd, UInt64(42), INTEREST_READ)
+    r.modify(listener._socket.fd, INTEREST_WRITE)
+    # Token preserved; fd still registered.
+    assert_true(r.is_registered(listener._socket.fd))
+    listener.close()
+
+
+# ── poll timing ───────────────────────────────────────────────────────────────
+
+
+def test_poll_timeout_zero_returns_empty() raises:
+    """Polling an idle reactor with timeout 0 returns no events immediately."""
+    var r = Reactor()
+    var events = List[Event]()
+    var n = r.poll(0, events)
+    assert_equal(n, 0)
+    assert_equal(len(events), 0)
+
+
+def test_poll_timeout_short_returns_empty() raises:
+    """A short bounded timeout on an idle reactor also returns no events."""
+    var r = Reactor()
+    var events = List[Event]()
+    var n = r.poll(10, events)
+    assert_equal(n, 0)
+
+
+# ── Readability detection ─────────────────────────────────────────────────────
+
+
+def test_poll_detects_readable_on_writable_peer() raises:
+    """A connected peer writing bytes triggers EVENT_READABLE."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    listener.close()
+
+    var token = UInt64(0x1234567890ABCDEF)
+    r.register(server._socket.fd, token, INTEREST_READ)
+    # Client writes -> server becomes readable
+    var msg = List[UInt8]()
+    msg.append(UInt8(ord("X")))
+    _ = client.write(Span[UInt8](msg))
+
+    var events = List[Event]()
+    var n = r.poll(1000, events)
+    var found = False
+    for i in range(n):
+        var ev = events[i]
+        if ev.token == token and ev.is_readable():
+            found = True
+    assert_true(found, "expected a readable event for token")
+
+    r.unregister(server._socket.fd)
+    client.close()
+    server.close()
+
+
+def test_poll_detects_writable() raises:
+    """A fresh connected socket is typically immediately writable."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    listener.close()
+
+    var token = UInt64(7)
+    r.register(client._socket.fd, token, INTEREST_WRITE)
+    var events = List[Event]()
+    var n = r.poll(1000, events)
+    var found = False
+    for i in range(n):
+        var ev = events[i]
+        if ev.token == token and ev.is_writable():
+            found = True
+    assert_true(found, "expected a writable event on fresh connected socket")
+
+    r.unregister(client._socket.fd)
+    client.close()
+    server.close()
+
+
+def test_poll_detects_hup_on_peer_close() raises:
+    """When the peer closes, the reactor reports HUP (possibly with READABLE).
+    """
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    listener.close()
+
+    var token = UInt64(77)
+    r.register(server._socket.fd, token, INTEREST_READ)
+    # Client closes -> server fd gets HUP
+    client.close()
+
+    var events = List[Event]()
+    var n = r.poll(1000, events)
+    var saw_hup_or_read = False
+    for i in range(n):
+        var ev = events[i]
+        if ev.token == token and (ev.is_hup() or ev.is_readable()):
+            saw_hup_or_read = True
+    assert_true(
+        saw_hup_or_read,
+        "expected HUP or READABLE after peer close",
+    )
+
+    r.unregister(server._socket.fd)
+    server.close()
+
+
+# ── Multi-fd handling ─────────────────────────────────────────────────────────
+
+
+def test_poll_multiple_fds() raises:
+    """Multiple registered fds can all fire in a single poll."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+
+    # 3 pairs is enough to prove the loop without fighting Mojo's Movable-not-
+    # Copyable List limitation.
+    var c1 = TcpStream.connect(SocketAddr.localhost(port))
+    var s1 = listener.accept()
+    r.register(s1._socket.fd, UInt64(1001), INTEREST_READ)
+    var c2 = TcpStream.connect(SocketAddr.localhost(port))
+    var s2 = listener.accept()
+    r.register(s2._socket.fd, UInt64(1002), INTEREST_READ)
+    var c3 = TcpStream.connect(SocketAddr.localhost(port))
+    var s3 = listener.accept()
+    r.register(s3._socket.fd, UInt64(1003), INTEREST_READ)
+    listener.close()
+
+    # Each client writes a byte. Use ``write_all`` so we don't silently
+    # accept a short write that would make the later poll flaky.
+    var m1 = List[UInt8]()
+    m1.append(UInt8(ord("A")))
+    c1.write_all(Span[UInt8](m1))
+    var m2 = List[UInt8]()
+    m2.append(UInt8(ord("B")))
+    c2.write_all(Span[UInt8](m2))
+    var m3 = List[UInt8]()
+    m3.append(UInt8(ord("C")))
+    c3.write_all(Span[UInt8](m3))
+
+    # Poll may return a subset of ready fds per call on some kernels.
+    # Accumulate across up to 40 short polls (up to 4 seconds total) and
+    # drain each fd once we see it so we exercise the level-triggered
+    # path rather than relying on repeated delivery. In practice on
+    # loopback all three arrive within the first 1-2 polls.
+    var drain_buf = List[UInt8]()
+    drain_buf.resize(1, UInt8(0))
+    var events = List[Event]()
+    var seen = List[Bool]()
+    seen.resize(3, False)
+    var total_seen = 0
+    var attempts = 0
+    while total_seen < 3 and attempts < 40:
+        events.clear()
+        _ = r.poll(100, events, max_events=16)
+        for j in range(len(events)):
+            var tok = events[j].token
+            if tok == UInt64(1001) and not seen[0]:
+                seen[0] = True
+                total_seen += 1
+                _ = s1.read(drain_buf.unsafe_ptr(), 1)
+            elif tok == UInt64(1002) and not seen[1]:
+                seen[1] = True
+                total_seen += 1
+                _ = s2.read(drain_buf.unsafe_ptr(), 1)
+            elif tok == UInt64(1003) and not seen[2]:
+                seen[2] = True
+                total_seen += 1
+                _ = s3.read(drain_buf.unsafe_ptr(), 1)
+        attempts += 1
+    assert_true(
+        total_seen == 3,
+        "expected all 3 tokens across <=40 polls; got " + String(total_seen),
+    )
+
+    r.unregister(s1._socket.fd)
+    r.unregister(s2._socket.fd)
+    r.unregister(s3._socket.fd)
+    c1.close()
+    c2.close()
+    c3.close()
+    s1.close()
+    s2.close()
+    s3.close()
+
+
+# ── Wakeup ────────────────────────────────────────────────────────────────────
+
+
+def test_wakeup_breaks_blocking_poll() raises:
+    """``wakeup()`` before poll() causes poll to return a wakeup event.
+
+    Since we're single-threaded, we invoke wakeup() first and then poll()
+    with timeout=0 — the event is already queued so poll returns it
+    immediately.
+    """
+    var r = Reactor()
+    r.wakeup()
+    var events = List[Event]()
+    var n = r.poll(100, events)
+    assert_true(n >= 1, "expected at least 1 event after wakeup")
+    var saw_wakeup = False
+    for i in range(n):
+        if events[i].is_wakeup():
+            saw_wakeup = True
+    assert_true(saw_wakeup, "expected a wakeup event flagged is_wakeup=True")
+
+
+def test_wakeup_does_not_appear_without_call() raises:
+    """Without wakeup(), poll(0) on an empty reactor returns 0."""
+    var r = Reactor()
+    var events = List[Event]()
+    var n = r.poll(0, events)
+    assert_equal(n, 0)
+
+
+def test_wakeup_after_drain_can_fire_again() raises:
+    """After one wakeup+poll cycle, subsequent wakeup() still works."""
+    var r = Reactor()
+    r.wakeup()
+    var events = List[Event]()
+    _ = r.poll(100, events)
+    # Drained — now fire another wakeup
+    r.wakeup()
+    events.clear()
+    var n = r.poll(100, events)
+    assert_true(n >= 1, "expected second wakeup to fire")
+
+
+def test_poll_reuses_event_buffer_across_calls() raises:
+    """D10: the reactor caches + reuses its event array. Poll many times
+    (including a grow to a larger max_events and a shrink back) and
+    confirm each wakeup is still delivered correctly -- guards the
+    reused-buffer path against stale reads / corruption.
+    """
+    var r = Reactor()
+    var events = List[Event]()
+    for _ in range(5):
+        r.wakeup()
+        events.clear()
+        var n = r.poll(100, events)
+        assert_true(n >= 1, "wakeup should fire on the reused buffer")
+    # Grow the buffer, then poll again with the default cap: the larger
+    # allocation must stay valid and keep delivering events.
+    r.wakeup()
+    events.clear()
+    var big = r.poll(100, events, max_events=256)
+    assert_true(big >= 1, "wakeup should fire after buffer grew")
+    r.wakeup()
+    events.clear()
+    var small = r.poll(100, events, max_events=8)
+    assert_true(small >= 1, "wakeup should fire after buffer reuse")
+
+
+# ── Max-events capping ────────────────────────────────────────────────────────
+
+
+def test_poll_honors_max_events_cap() raises:
+    """When more fds are ready than ``max_events``, only that many are returned.
+    """
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var c1 = TcpStream.connect(SocketAddr.localhost(port))
+    var s1 = listener.accept()
+    var c2 = TcpStream.connect(SocketAddr.localhost(port))
+    var s2 = listener.accept()
+    var c3 = TcpStream.connect(SocketAddr.localhost(port))
+    var s3 = listener.accept()
+    var c4 = TcpStream.connect(SocketAddr.localhost(port))
+    var s4 = listener.accept()
+    listener.close()
+    r.register(s1._socket.fd, UInt64(1), INTEREST_READ)
+    r.register(s2._socket.fd, UInt64(2), INTEREST_READ)
+    r.register(s3._socket.fd, UInt64(3), INTEREST_READ)
+    r.register(s4._socket.fd, UInt64(4), INTEREST_READ)
+
+    # Make all 4 servers readable.
+    var m = List[UInt8]()
+    m.append(UInt8(ord("X")))
+    _ = c1.write(Span[UInt8](m))
+    _ = c2.write(Span[UInt8](m))
+    _ = c3.write(Span[UInt8](m))
+    _ = c4.write(Span[UInt8](m))
+
+    # Ask for at most 2 events.
+    var events = List[Event]()
+    var n = r.poll(1000, events, max_events=2)
+    assert_true(n <= 2, "max_events=2 must cap result; got " + String(n))
+    assert_equal(len(events), n)
+
+    r.unregister(s1._socket.fd)
+    r.unregister(s2._socket.fd)
+    r.unregister(s3._socket.fd)
+    r.unregister(s4._socket.fd)
+    c1.close()
+    c2.close()
+    c3.close()
+    c4.close()
+    s1.close()
+    s2.close()
+    s3.close()
+    s4.close()
+
+
+# ── Event bit flags ───────────────────────────────────────────────────────────
+
+
+def test_event_flag_helpers() raises:
+    """Event.is_readable/writable/error/hup/wakeup return correct bools."""
+    var e = Event(UInt64(1), EVENT_READABLE)
+    assert_true(e.is_readable())
+    assert_false(e.is_writable())
+    assert_false(e.is_hup())
+    var e2 = Event(UInt64(2), EVENT_READABLE | EVENT_HUP)
+    assert_true(e2.is_readable())
+    assert_true(e2.is_hup())
+    var wake = Event(WAKEUP_TOKEN, EVENT_READABLE)
+    assert_true(wake.is_wakeup())
+
+
+def test_many_wakeups_never_block() raises:
+    """The macOS wakeup pipe was blocking: once about 64 KiB of wakeups
+    sat unread, the next wakeup() blocked its caller for good. Linux
+    uses an eventfd, which never fills."""
+    var r = Reactor()
+    for _ in range(100_000):
+        r.wakeup()
+    var out = List[Event]()
+    _ = r.poll(0, out)
+
+
+def test_register_of_a_bad_fd_raises() raises:
+    """The kqueue backend reported a failed EV_ADD in the result list and the result
+    was dropped, so registering a closed fd looked like it worked."""
+    var r = Reactor()
+    var raised = False
+    try:
+        r.register(c_int(100_000), UInt64(7), INTEREST_READ)
+    except:
+        raised = True
+    assert_true(raised, "registered an fd that is not open")
+
+
+# ── register_exclusive (Linux EPOLLEXCLUSIVE) ────────────────────────────────
+
+
+def _epoll_events_of(epfd: c_int, fd: c_int) raises -> Int:
+    """The event mask the kernel stored for ``fd`` in epoll instance
+    ``epfd`` (``events:`` in ``/proc/self/fdinfo/<epfd>``), or -1 if ``fd``
+    is not in the set. Reading it back shows what the kernel really
+    accepted, not what we asked for."""
+    var text: String
+    with open("/proc/self/fdinfo/" + String(Int(epfd)), "r") as f:
+        text = f.read()
+    for line in text.split("\n"):
+        var tok = line.split()
+        if len(tok) >= 4 and tok[0] == "tfd:" and Int(tok[1]) == Int(fd):
+            return atol(String(tok[3]), base=16)
+    return -1
+
+
+def test_register_exclusive_really_sets_epollexclusive() raises:
+    """EPOLLEXCLUSIVE and EPOLLRDHUP cannot be combined: ``epoll_ctl`` fails
+    with EINVAL, and ``register_exclusive`` then silently fell back to a
+    plain registration, so shared-listener workers all woke on every
+    connection. The stored mask must carry EPOLLEXCLUSIVE and not
+    EPOLLRDHUP."""
+    comptime if not CompilationTarget.is_linux():
+        return
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    r.register_exclusive(listener._socket.fd, UInt64(1), INTEREST_READ)
+    assert_true(r.is_registered(listener._socket.fd))
+
+    var mask = _epoll_events_of(r._fd, listener._socket.fd)
+    assert_true(mask >= 0, "listener missing from the epoll set")
+    assert_true(
+        (mask & Int(EPOLLEXCLUSIVE)) != 0,
+        "registration fell back to a plain one: no EPOLLEXCLUSIVE",
+    )
+    assert_true(
+        (mask & Int(EPOLLRDHUP)) == 0,
+        "EPOLLRDHUP is invalid together with EPOLLEXCLUSIVE",
+    )
+    assert_true((mask & Int(EPOLLIN)) != 0, "listener must watch EPOLLIN")
+
+    r.unregister(listener._socket.fd)
+    listener.close()
+
+
+def test_plain_register_keeps_rdhup() raises:
+    """Dropping EPOLLRDHUP is specific to the exclusive listener path:
+    ordinary registrations keep it (it feeds EVENT_HUP)."""
+    comptime if not CompilationTarget.is_linux():
+        return
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    r.register(listener._socket.fd, UInt64(1), INTEREST_READ)
+    var mask = _epoll_events_of(r._fd, listener._socket.fd)
+    assert_true((mask & Int(EPOLLRDHUP)) != 0)
+    assert_true((mask & Int(EPOLLEXCLUSIVE)) == 0)
+    r.unregister(listener._socket.fd)
+    listener.close()
+
+
+def main() raises:
+    print("=" * 60)
+    print("test_reactor.mojo — Reactor abstraction")
+    print("=" * 60)
+    print()
+    TestSuite.discover_tests[__functions_in_module()]().run()

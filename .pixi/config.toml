@@ -1,0 +1,3 @@
+# Keep the environment off the Windows drive: pixi envs on /mnt (9p) are
+# slow and can't hold symlinks. Envs land in ~/.cache/rattler/cache/envs-v0.
+detached-environments = true

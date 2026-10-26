@@ -1,0 +1,888 @@
+"""HTTP request router with method dispatch + path parameters.
+
+A ``Router`` is a ``Handler`` that dispatches each request to a
+per-(method, path) inner handler. It supports:
+
+- **Literal segments**: ``"/users"`` matches exactly ``/users``.
+- **Parameter segments**: ``":id"`` matches one segment of any non-empty
+  value; the captured value lands in ``req.params[name]``.
+- **Wildcard tail**: a final segment ``"*"`` matches the rest of the
+  path (captured as ``req.param("*")``, including path separators).
+- **Method dispatch**: ``get`` / ``post`` / ``put`` / ``patch`` /
+  ``delete`` / ``head`` register one handler per (method, path) pair.
+
+Unknown paths return **404 Not Found**; known paths called with the
+wrong method return **405 Method Not Allowed** with a synthesised
+``Allow:`` header listing the supported methods.
+
+Sub-router mounting (``mount(prefix, sub)``) attaches a whole nested
+``Router`` under a literal path prefix (e.g. ``/api/v1``). The mounted
+router is owned by value behind the same ``ArcPointer`` refcount the
+struct-handler registry uses, so Router copies (one per worker) share
+the mounted subtree without double-freeing it. A mounted prefix owns
+its entire subtree: direct routes registered on the parent take
+priority, and any unmatched request whose path starts with the prefix
+is delegated (with the prefix stripped) to the sub-router, which runs
+its own method dispatch and 404/405 synthesis.
+
+Example:
+
+```mojo
+from dodo.http import Router, Request, Response, ok, not_found
+
+def home(req: Request) raises -> Response:
+    return ok("home")
+
+def get_user(req: Request) raises -> Response:
+    return ok("user " + req.param("id"))
+
+def main() raises:
+    var r = Router()
+    r.get("/", home)
+    r.get("/users/:id", get_user)
+
+    # `r` is a Handler; pass it to HttpServer.serve.
+```
+
+This first release uses a simple runtime match (linear scan per depth
+plus a per-entry segment compare). A compile-time trie lives on the
+roadmap; the public Router API will not change when the trie
+lands, only the internal representation.
+"""
+
+from std.collections import Dict, Optional
+from std.memory import ArcPointer
+
+from ..runtime import Pool
+from .handler import Handler, FnHandler
+from .headers import HeaderMap
+from .proto.ascii import ascii_unchecked_string
+from .request import Request, Method, _child_request
+from .response import Response, Status
+from .server import not_found
+
+
+# ── Internal path compilation ────────────────────────────────────────────────
+
+
+struct _Segment(Copyable):
+    """A single compiled path segment.
+
+    ``kind`` is 0 for literal, 1 for parameter (``":name"``), 2 for
+    wildcard tail (``"*"``). ``text`` is the literal text for
+    ``kind=0`` or the parameter name for ``kind=1``.
+    """
+
+    var kind: Int
+    var text: String
+
+    def __init__(out self, kind: Int, text: String):
+        self.kind = kind
+        self.text = text
+
+
+comptime _SLASH: UInt8 = 47
+comptime _QMARK: UInt8 = 63
+comptime _COLON: UInt8 = 58
+comptime _STAR: UInt8 = 42
+
+
+@always_inline
+def _segs_to_openapi_template(segs: List[_Segment]) -> String:
+    """Render compiled segments as an OpenAPI path template.
+
+    Literal -> verbatim; ``:name`` -> ``{name}``; wildcard ``*`` ->
+    ``{path}``. The empty segment list (root) renders as ``/``.
+    """
+    if len(segs) == 0:
+        return "/"
+    var out = String("")
+    for i in range(len(segs)):
+        out += "/"
+        if segs[i].kind == 0:
+            out += segs[i].text
+        elif segs[i].kind == 1:
+            out += "{" + segs[i].text + "}"
+        else:
+            out += "{path}"
+    return out^
+
+
+def _split_path(path: String) -> List[String]:
+    """Split a path on ``/``. Drops empty segments produced by a
+    leading or trailing ``/`` so ``"/users/"`` and ``"users"`` both
+    yield ``["users"]``.
+    """
+    var out = List[String]()
+    var n = path.byte_length()
+    if n == 0:
+        return out^
+    var p = path.unsafe_ptr()
+    var start = 0
+    if p[unsafe_offset=0] == _SLASH:
+        start = 1
+    var i = start
+    while i < n:
+        if p[unsafe_offset=i] == _SLASH:
+            if i > start:
+                out.append(ascii_unchecked_string(path.as_bytes()[start:i]))
+            start = i + 1
+        i += 1
+    if start < n:
+        out.append(ascii_unchecked_string(path.as_bytes()[start:n]))
+    return out^
+
+
+def _compile_segments(path: String) raises -> List[_Segment]:
+    """Turn a route pattern like ``"/users/:id/posts"`` into a list of
+    ``_Segment`` values the matcher can consume one at a time.
+    """
+    var raw = _split_path(path)
+    var segs = List[_Segment]()
+    for i in range(len(raw)):
+        var s = raw[i]
+        var sn = s.byte_length()
+        if sn == 0:
+            continue
+        var sp = s.unsafe_ptr()
+        if sn == 1 and sp[unsafe_offset=0] == _STAR:
+            if i != len(raw) - 1:
+                raise Error("wildcard '*' must be the last segment in a route")
+            segs.append(_Segment(2, "*"))
+        elif sn >= 2 and sp[unsafe_offset=0] == _COLON:
+            segs.append(_Segment(1, ascii_unchecked_string(s.as_bytes()[1:sn])))
+        else:
+            segs.append(_Segment(0, s))
+    return segs^
+
+
+# ── Route entries ────────────────────────────────────────────────────────────
+
+
+comptime _ROUTE_KIND_FN: Int = 0
+"""Route handler is a plain ``def(Request) raises -> Response``
+wrapped in ``FnHandler``. ``handler_idx`` indexes into
+``Router._handlers``."""
+
+comptime _ROUTE_KIND_STRUCT: Int = 1
+"""Route handler is an arbitrary ``H: Handler`` struct
+(). ``handler_idx`` indexes into
+``Router._struct_handlers``; the struct lives behind a
+heap-allocated opaque pointer with monomorphised serve / destroy
+thunks (see ``_StructHandler``)."""
+
+
+struct _Route(Copyable):
+    """Compiled pattern + method + handler index into the router's
+    handler storage.
+    """
+
+    var method: String
+    var segs: List[_Segment]
+    var handler_kind: Int
+    """One of ``_ROUTE_KIND_FN`` / ``_ROUTE_KIND_STRUCT``."""
+    var handler_idx: Int
+
+    def __init__(
+        out self,
+        method: String,
+        var segs: List[_Segment],
+        handler_kind: Int,
+        handler_idx: Int,
+    ):
+        self.method = method
+        self.segs = segs^
+        self.handler_kind = handler_kind
+        self.handler_idx = handler_idx
+
+
+struct _Mount(Copyable):
+    """A mounted sub-router: a literal path prefix plus an index into
+    the shared struct-handler registry where the boxed
+    ``_MountedRouter`` wrapper lives.
+
+    ``segs`` are literal-only (mount prefixes are static); a request
+    whose leading path segments equal ``segs`` is delegated to the
+    wrapper, which strips the prefix before calling the sub-router.
+    """
+
+    var segs: List[_Segment]
+    var handler_idx: Int
+
+    def __init__(out self, var segs: List[_Segment], handler_idx: Int):
+        self.segs = segs^
+        self.handler_idx = handler_idx
+
+
+# ── Struct-handler boxing ───────────────────────
+
+# Mojo can't yet store heterogeneous ``H: Handler`` structs in a
+# single ``List``, so we type-erase via a heap-allocated opaque
+# pointer paired with two monomorphised function pointers: a serve
+# thunk that bitcasts the pointer back to the concrete ``H`` and
+# calls ``H.serve``, and a destroy thunk that does the same for
+# ``H``'s destructor + ``free``. Both thunks are monomorphised at
+# the registration site (``Router.get[H](...)``) so the call
+# inside ``Router.serve`` is a direct call through a function
+# pointer with no runtime trait dispatch.
+#
+# This is the same opaque-pointer + typed-thunk idiom the multicore
+# ``Scheduler`` uses for ``_WorkerCtx[H]``. The Router's lifecycle
+# differs only in that the destroy thunk runs on the Router's
+# destructor (when the server stops) rather than after a pthread
+# join.
+
+
+def _struct_serve_thunk[
+    H: Handler & Copyable
+](addr: Int, req: Request) raises -> Response:
+    """Thunk that materialises the boxed ``H`` from its address
+    and forwards to ``H.serve``.
+
+    Monomorphised per ``H`` at the call site so Mojo emits a direct
+    call to the inlined ``H.serve`` body — no per-request trait
+    dispatch.
+
+    Routes through ``Pool[H].get_ptr`` rather than reconstructing
+    the ``Pointer`` arithmetic in-line — keeps the unsafe
+    pointer plumbing confined to ``dodo/runtime/``.
+    """
+    var ptr = Pool[H].get_ptr(addr)
+    return ptr[].serve(req).lower()
+
+
+def _struct_destroy_thunk[H: Handler & Copyable](addr: Int) -> None:
+    """Thunk that destroys + frees the heap-allocated ``H`` at
+    ``addr``. Called once per route from ``Router.__deinit__`` via
+    the parallel ``_struct_destroy_thunks`` list.
+    """
+    Pool[H].free(addr)
+
+
+# ``_StructHandler`` is represented as three parallel lists on
+# ``Router`` rather than a single ``List[_StructHandler]`` because
+# Mojo's ``List`` requires ``T: Copyable`` and a Copyable wrapper
+# around an owning heap pointer would double-free on copy. The
+# parallel-lists trick stores only ``Int`` and function-pointer
+# values (all Copyable) and Router's destructor walks the
+# ``destroy_thunks`` list once to free every owned allocation.
+
+
+# ── Shared registry for boxed Handler-struct addresses ─────────
+#
+# Router shares the boxed Handler-struct addresses across copies
+# via ``ArcPointer``: the struct-handler addresses + monomorphised
+# serve / destroy thunks live inside a single
+# ``_StructHandlerRegistry`` value that every Router copy shares
+# through ``ArcPointer[_StructHandlerRegistry]``. The Arc bumps
+# the refcount on Router copy and, on the last drop, runs the
+# registry's destructor -- which walks the destroy thunks once and
+# frees every boxed Handler struct.
+#
+# This shape replaces an earlier hand-rolled refcount cell. The
+# important invariants are preserved: ``_routes`` and ``_handlers``
+# are still per-Router value-typed lists (so each worker carries
+# its own deep-copy and read-side dispatch is allocation-free), the
+# heap-allocated boxed handlers are shared, and Mojo's auto-derived
+# ``Copyable`` does the right thing memberwise (``ArcPointer``'s
+# own ``__copyinit__`` bumps; ``List`` clones value-by-value).
+#
+# Lifetime invariant: at most one mutating "owner" exists at a
+# time (the call site that does the ``r.get(...)`` registration
+# before the first ``serve``); copies that exist only to be moved
+# into worker threads are read-only post-copy. ``ArcPointer``'s
+# shared-mutable handle makes all copies see the same registry,
+# which is exactly the desired multi-worker semantics.
+
+
+struct _StructHandlerRegistry(Movable):
+    """Shared registry of boxed Handler-struct addresses + thunks.
+
+    Lives behind an ``ArcPointer`` on every ``Router``; the last
+    Router drop runs this destructor, which walks
+    ``destroy_thunks`` and frees each boxed handler exactly once.
+    Intentionally not ``Copyable``: the only legitimate way to
+    share it is through the ``ArcPointer``, which handles refcount
+    bumps for us.
+    """
+
+    var addrs: List[Int]
+    """Heap addresses of boxed ``H: Handler`` structs."""
+    var serve_thunks: List[def(Int, Request) raises thin -> Response]
+    """Monomorphised serve thunks; ``serve_thunks[i]`` is the
+    thunk for ``addrs[i]``."""
+    var destroy_thunks: List[def(Int) thin -> None]
+    """Monomorphised destroy thunks; ``destroy_thunks[i]`` is the
+    thunk for ``addrs[i]``."""
+
+    def __init__(out self):
+        self.addrs = List[Int]()
+        self.serve_thunks = List[def(Int, Request) raises thin -> Response]()
+        self.destroy_thunks = List[def(Int) thin -> None]()
+
+    def __deinit__(deinit self):
+        """Run every destroy thunk and free the boxed handlers.
+
+        Called once -- by the last ``ArcPointer`` drop -- so the
+        owned heap allocations are freed exactly once regardless
+        of how many Router copies existed.
+        """
+        for i in range(len(self.addrs)):
+            var addr = self.addrs[i]
+            if addr != 0:
+                self.destroy_thunks[i](addr)
+
+
+# ── Router ───────────────────────────────────────────────────────────────────
+
+
+struct Router(Copyable, Defaultable, Handler):
+    """HTTP router with method dispatch, path parameters, and nesting.
+
+    Accepts both plain ``def(Request) raises -> Response`` functions
+    (wrapped internally in ``FnHandler``) **and** arbitrary
+    ``H: Handler & Copyable`` structs (boxed via ``_StructHandler``
+    with monomorphised serve / destroy thunks).
+    Use the latter to register
+    ``Extracted[H]()``, app-state-bearing handlers, middleware
+    wrappers, and any other stateful Handler.
+
+    Routes are stored as ``(method, compiled-segments,
+    handler-kind, handler-index)`` quadruples; ``handler-kind``
+    selects ``_handlers`` (FnHandler list) or ``_struct_handlers``
+    (boxed Handler structs) for the actual call site.
+
+    Example:
+        ```mojo
+        var r = Router()
+        r.get("/", home) # def(Request)
+        r.get("/users/:id", Extracted[GetUser]()) # Handler struct
+        ```
+    """
+
+    var _routes: List[_Route]
+    """Per-Router routing table; deep-copied on each Router clone."""
+    var _handlers: List[FnHandler]
+    """Per-Router function-handler list; deep-copied on each clone."""
+    var _mounts: List[_Mount]
+    """Per-Router mounted-subtree table; deep-copied on each clone.
+    Each entry indexes the shared registry where the boxed
+    ``_MountedRouter`` wrapper lives, so mounted sub-routers are
+    shared (and freed once) the same way struct handlers are."""
+    var _struct_registry: ArcPointer[_StructHandlerRegistry]
+    """Shared registry of boxed Handler-struct addresses + thunks.
+
+    All Router copies share the same registry via
+    :attr:`ArcPointer`; the auto-derived ``Copyable`` bumps the
+    refcount on copy and the last drop runs the registry's
+    destructor (which walks the destroy thunks). This replaces an
+    earlier hand-rolled refcount cell.
+    """
+    var _fallback: Optional[FnHandler]
+    """Optional custom fallback invoked when no route matched and no
+    mount claimed the path. When unset, ``serve`` returns the default
+    404 (or 405 when the path exists under other methods)."""
+
+    def __init__(out self):
+        """Create an empty router (no routes)."""
+        self._routes = List[_Route]()
+        self._handlers = List[FnHandler]()
+        self._mounts = List[_Mount]()
+        self._struct_registry = ArcPointer[_StructHandlerRegistry](
+            _StructHandlerRegistry()
+        )
+        self._fallback = Optional[FnHandler]()
+
+    # ── Registration per method (def-function overloads) ────────────────────
+
+    def get(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``GET path``.
+
+        Args:
+            path: Route pattern (e.g. ``"/users/:id"``).
+            handler: The function to call on a match.
+        """
+        self._add_fn(Method.GET, path, handler)
+
+    def post(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``POST path``."""
+        self._add_fn(Method.POST, path, handler)
+
+    def put(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``PUT path``."""
+        self._add_fn(Method.PUT, path, handler)
+
+    def patch(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``PATCH path``."""
+        self._add_fn(Method.PATCH, path, handler)
+
+    def delete(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``DELETE path``."""
+        self._add_fn(Method.DELETE, path, handler)
+
+    def head(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``HEAD path``."""
+        self._add_fn(Method.HEAD, path, handler)
+
+    def options(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``OPTIONS path``."""
+        self._add_fn(Method.OPTIONS, path, handler)
+
+    def trace(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``TRACE path``."""
+        self._add_fn(Method.TRACE, path, handler)
+
+    def connect(
+        mut self,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        """Register ``handler`` for ``CONNECT path``."""
+        self._add_fn(Method.CONNECT, path, handler)
+
+    def fallback(
+        mut self,
+        handler: def(Request) raises thin -> Response,
+    ):
+        """Set a custom fallback handler.
+
+        Invoked when no registered route matched and no mounted
+        sub-router claimed the path. Replaces the default 404 body
+        (the 405 path for a known path under other methods still
+        fires first). Registering twice keeps the last handler.
+        """
+        self._fallback = Optional[FnHandler](FnHandler(handler))
+
+    def _add_fn(
+        mut self,
+        method: String,
+        path: String,
+        handler: def(Request) raises thin -> Response,
+    ) raises:
+        var segs = _compile_segments(path)
+        self._handlers.append(FnHandler(handler))
+        self._routes.append(
+            _Route(method, segs^, _ROUTE_KIND_FN, len(self._handlers) - 1)
+        )
+
+    # ── Registration per method (Handler-struct overloads, ) ──
+
+    def get[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``GET path``.
+
+        ``H`` is type-erased into ``_StructHandler`` via heap
+        allocation + monomorphised serve / destroy thunks; the
+        per-request dispatch is a direct call through the cached
+        thunk pointer with no trait-table lookup.
+
+        Use this overload to register ``Extracted[H]()``, app-state
+        handlers, middleware-wrapped handlers, and any user-defined
+        Handler struct. The ``def(Request) raises -> Response``
+        overload above continues to work unchanged.
+
+        Args:
+            path: Route pattern (e.g. ``"/users/:id"``).
+            handler: A ``Handler & Copyable`` instance;
+                     ownership transfers into the Router (the
+                     Router owns the heap allocation and frees it
+                     in its destructor).
+        """
+        self._add_struct[H](Method.GET, path, handler^)
+
+    def post[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``POST path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.POST, path, handler^)
+
+    def put[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``PUT path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.PUT, path, handler^)
+
+    def patch[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``PATCH path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.PATCH, path, handler^)
+
+    def delete[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``DELETE path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.DELETE, path, handler^)
+
+    def head[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``HEAD path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.HEAD, path, handler^)
+
+    def options[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``OPTIONS path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.OPTIONS, path, handler^)
+
+    def trace[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``TRACE path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.TRACE, path, handler^)
+
+    def connect[
+        H: Handler & Copyable
+    ](mut self, path: String, var handler: H) raises:
+        """Register ``handler`` (a Handler struct) for ``CONNECT path``.
+        See ``get[H]`` for the type-erasure shape."""
+        self._add_struct[H](Method.CONNECT, path, handler^)
+
+    def _add_struct[
+        H: Handler & Copyable
+    ](mut self, method: String, path: String, var handler: H) raises:
+        """Heap-allocate ``handler`` via ``Pool[H]`` (which gates
+        on ``size_of[H]() > 0`` internally for ZST handlers like
+        ``Extracted[GetUser]``), capture monomorphised serve /
+        destroy thunks, append to the route + struct-handler
+        tables.
+
+        Per the follow-up cleanup, this routes through
+        ``Pool[H]`` rather than reaching into ``alloc[H]``
+        directly — keeps the unsafe-pointer plumbing confined to
+        ``dodo/runtime/`` and drops the ``_Boxed[H]``
+        1-byte phantom pad now that ``size_of`` is public.
+        """
+        var segs = _compile_segments(path)
+        var addr = Pool[H].alloc_move(handler^)
+        ref reg = self._struct_registry[]
+        reg.addrs.append(addr)
+        reg.serve_thunks.append(_struct_serve_thunk[H])
+        reg.destroy_thunks.append(_struct_destroy_thunk[H])
+        self._routes.append(
+            _Route(
+                method,
+                segs^,
+                _ROUTE_KIND_STRUCT,
+                len(reg.addrs) - 1,
+            )
+        )
+
+    # ── Sub-router mounting ─────────────────────────────────────────────────
+
+    def mount(mut self, prefix: String, var sub: Router) raises:
+        """Mount ``sub`` under the literal path ``prefix``.
+
+        Every request whose path starts with ``prefix`` (and which no
+        directly-registered route on this Router already handled) is
+        delegated to ``sub`` with ``prefix`` stripped, so ``sub`` sees
+        paths relative to its mount point. ``sub`` performs its own
+        method dispatch and 404/405 synthesis.
+
+        The sub-router is boxed into the shared struct-handler registry
+        (heap-allocated, monomorphised destroy thunk) so it is owned by
+        value and freed exactly once on the last Router drop -- the same
+        ownership model as struct handlers.
+
+        Args:
+            prefix: A literal path prefix, e.g. ``"/api/v1"``. Parameter
+                    (``:id``) and wildcard (``*``) segments are rejected.
+            sub:    The sub-router to mount; ownership transfers in.
+        """
+        var psegs = _compile_segments(prefix)
+        for i in range(len(psegs)):
+            if psegs[i].kind != 0:
+                raise Error(
+                    "mount prefix must be literal segments only (no ':param'"
+                    " or '*')"
+                )
+        if len(psegs) == 0:
+            raise Error("mount prefix must have at least one segment")
+        var wrapper = _MountedRouter(sub^, len(psegs))
+        var addr = Pool[_MountedRouter].alloc_move(wrapper^)
+        ref reg = self._struct_registry[]
+        reg.addrs.append(addr)
+        reg.serve_thunks.append(_struct_serve_thunk[_MountedRouter])
+        reg.destroy_thunks.append(_struct_destroy_thunk[_MountedRouter])
+        self._mounts.append(_Mount(psegs^, len(reg.addrs) - 1))
+
+    # ── Route introspection (OpenAPI derivation) ───────────────────────────────
+
+    def route_count(self) -> Int:
+        """Number of registered top-level routes (excludes mounts)."""
+        return len(self._routes)
+
+    def route_method(self, i: Int) -> String:
+        """HTTP method of route ``i`` (uppercase, e.g. ``GET``)."""
+        return self._routes[i].method
+
+    def route_openapi_template(self, i: Int) -> String:
+        """Route ``i``'s path as an OpenAPI template: ``:id`` -> ``{id}``,
+        wildcard ``*`` -> ``{path}`` (``/`` for the empty root)."""
+        return _segs_to_openapi_template(self._routes[i].segs)
+
+    def route_path_params(self, i: Int) -> List[String]:
+        """Names of route ``i``'s path parameters (``:name`` segments)."""
+        var out = List[String]()
+        for j in range(len(self._routes[i].segs)):
+            if self._routes[i].segs[j].kind == 1:
+                out.append(self._routes[i].segs[j].text)
+        return out^
+
+    # ── Handler impl ─────────────────────────────────────────────────────────
+
+    def _call_route(self, i: Int, req: Request) raises -> Response:
+        """Run route ``i``'s handler: a ``_ROUTE_KIND_FN`` handler directly,
+        a struct handler through the serve thunk captured at registration."""
+        if self._routes[i].handler_kind == _ROUTE_KIND_FN:
+            return self._handlers[self._routes[i].handler_idx].serve(req)
+        var sh_idx = self._routes[i].handler_idx
+        ref reg = self._struct_registry[]
+        return reg.serve_thunks[sh_idx](reg.addrs[sh_idx], req)
+
+    def serve(self, req: Request) raises -> Response:
+        """Dispatch ``req`` to the matching handler.
+
+        Returns the handler's response, or a 404 / 405 if no
+        route matches.
+        """
+        var url_path = _path_only(req.url)
+        var segs_in = _split_path(url_path)
+
+        var allowed = List[String]()
+        for i in range(len(self._routes)):
+            var m_result = _match(segs_in, self._routes[i].segs)
+            if not m_result.matched:
+                continue
+            if self._routes[i].method != req.method:
+                if not _contains(allowed, self._routes[i].method):
+                    allowed.append(self._routes[i].method)
+                continue
+            # Match: a route with no params to add gets ``req`` itself.
+            if len(m_result.params) == 0 and not req.has_params():
+                return self._call_route(i, req)
+            var child = _child_request(req, req.url)
+            # Copy the captures from this match. ``_MatchResult.params``
+            # is always populated (even if empty), so guard on length to
+            # avoid a pointless lazy-allocate for literal-only routes.
+            if len(m_result.params) > 0:
+                for kv in m_result.params.items():
+                    child.params_mut()[kv.key] = kv.value
+            return self._call_route(i, child)
+
+        # No direct route handled the request. A mounted sub-router
+        # owns its whole subtree, so delegate to the first mount whose
+        # literal prefix the path starts with. The wrapper strips the
+        # prefix and the sub-router runs its own dispatch (including its
+        # own 404/405), which is why this runs even when ``allowed`` was
+        # populated by an unrelated direct route on the parent.
+        for i in range(len(self._mounts)):
+            if _prefix_match(segs_in, self._mounts[i].segs):
+                var sh_idx = self._mounts[i].handler_idx
+                ref reg = self._struct_registry[]
+                var addr = reg.addrs[sh_idx]
+                var thunk = reg.serve_thunks[sh_idx]
+                if not req.has_params():
+                    return thunk(addr, req)
+                var child = _child_request(req, req.url)
+                return thunk(addr, child)
+
+        if len(allowed) > 0:
+            return _method_not_allowed(allowed)
+        if self._fallback:
+            if not req.has_params():
+                return self._fallback.value().serve(req)
+            var child = _child_request(req, req.url)
+            return self._fallback.value().serve(child)
+        return not_found(req.url)
+
+
+# ── Mounted sub-router wrapper ───────────────────────────────────────────────
+
+
+struct _MountedRouter(Copyable, Handler):
+    """Boxed wrapper that strips a mount prefix and forwards to a
+    nested ``Router``.
+
+    Stored in the parent Router's struct-handler registry; its
+    ``serve`` rebuilds the request path with the first
+    ``prefix_segs`` segments removed (preserving the query string and
+    any captured params) before delegating, so the sub-router matches
+    against paths relative to its mount point.
+    """
+
+    var sub: Router
+    var prefix_segs: Int
+
+    def __init__(out self, var sub: Router, prefix_segs: Int):
+        self.sub = sub^
+        self.prefix_segs = prefix_segs
+
+    def serve(self, req: Request) raises -> Response:
+        var segs = _split_path(_path_only(req.url))
+        var rebuilt = String("/")
+        for i in range(self.prefix_segs, len(segs)):
+            if i > self.prefix_segs:
+                rebuilt += "/"
+            rebuilt += segs[i]
+        var q = _query_of(req.url)
+        if q.byte_length() > 0:
+            rebuilt += "?"
+            rebuilt += q
+        var child = _child_request(req, rebuilt)
+        return self.sub.serve(child)
+
+
+# ── Internals ────────────────────────────────────────────────────────────────
+
+
+struct _MatchResult(Movable):
+    var matched: Bool
+    var params: Dict[String, String]
+
+    def __init__(out self):
+        self.matched = False
+        self.params = Dict[String, String]()
+
+
+def _match(
+    url_segs: List[String], pattern: List[_Segment]
+) raises -> _MatchResult:
+    """Return whether ``url_segs`` matches the pattern; on match,
+    fills in captured params.
+    """
+    var result = _MatchResult()
+    var i = 0
+    var j = 0
+    while j < len(pattern):
+        var kind = pattern[j].kind
+        if kind == 2:
+            # Wildcard tail — must consume at least one segment.
+            if i >= len(url_segs):
+                return result^
+            var tail = String("")
+            while i < len(url_segs):
+                if tail.byte_length() > 0:
+                    tail += "/"
+                tail += url_segs[i]
+                i += 1
+            result.params["*"] = tail
+            result.matched = True
+            return result^
+        if i >= len(url_segs):
+            return result^
+        if kind == 0:
+            if url_segs[i] != pattern[j].text:
+                return result^
+        else:
+            result.params[pattern[j].text] = url_segs[i]
+        i += 1
+        j += 1
+    if i == len(url_segs):
+        result.matched = True
+    return result^
+
+
+def _method_not_allowed(allowed: List[String]) raises -> Response:
+    """Synthesise a 405 Method Not Allowed response with an ``Allow``
+    header listing the supported methods.
+    """
+    var allow_value = String("")
+    for i in range(len(allowed)):
+        if i > 0:
+            allow_value += ", "
+        allow_value += allowed[i]
+    var body_bytes = List[UInt8]()
+    var msg = "Method Not Allowed"
+    for b in msg.as_bytes():
+        body_bytes.append(b)
+    var resp = Response(
+        status=Status.METHOD_NOT_ALLOWED,
+        reason="Method Not Allowed",
+        body=body_bytes^,
+    )
+    resp.headers.set("Content-Type", "text/plain; charset=utf-8")
+    resp.headers.set("Allow", allow_value)
+    return resp^
+
+
+def _prefix_match(url_segs: List[String], prefix: List[_Segment]) -> Bool:
+    """True if ``url_segs`` starts with every literal segment in
+    ``prefix`` (the bare prefix itself counts as a match)."""
+    if len(url_segs) < len(prefix):
+        return False
+    for i in range(len(prefix)):
+        if url_segs[i] != prefix[i].text:
+            return False
+    return True
+
+
+@always_inline
+def _query_of(url: String) -> String:
+    """Return the query portion of ``url`` (after ``?``), or empty."""
+    var n = url.byte_length()
+    var p = url.unsafe_ptr()
+    for i in range(n):
+        if p[unsafe_offset=i] == _QMARK:
+            return ascii_unchecked_string(url.as_bytes()[i + 1 : n])
+    return String("")
+
+
+@always_inline
+def _path_only(url: String) -> String:
+    """Return the path portion of ``url`` (strip query string)."""
+    var n = url.byte_length()
+    var p = url.unsafe_ptr()
+    for i in range(n):
+        if p[unsafe_offset=i] == _QMARK:
+            return ascii_unchecked_string(url.as_bytes()[0:i])
+    return url
+
+
+@always_inline
+def _contains(xs: List[String], x: String) -> Bool:
+    for i in range(len(xs)):
+        if xs[i] == x:
+            return True
+    return False

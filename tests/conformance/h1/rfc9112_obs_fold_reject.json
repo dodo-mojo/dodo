@@ -1,0 +1,8 @@
+{
+  "name": "obs_fold_strict",
+  "spec": "RFC 9112 §5.2 (obs-fold rejected -- request smuggling vector)",
+  "input_hex": "47 45 54 20 2f 20 48 54 54 50 2f 31 2e 31 0d 0a 58 2d 4d 79 3a 20 76 61 6c 75 65 31 0d 0a 20 76 61 6c 75 65 32 0d 0a 0d 0a",
+  "expect": "reject",
+  "expect_reason": "obs-fold (folded header value with leading whitespace on next line) is a request-smuggling primitive",
+  "leniency": {}
+}

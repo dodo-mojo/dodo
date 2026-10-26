@@ -1,0 +1,315 @@
+"""TCP listener: a socket bound and listening for incoming connections.
+
+``TcpListener`` wraps a ``RawSocket`` in the listening state. Call
+``accept()`` to receive incoming connections as ``TcpStream`` instances.
+
+Design rules enforced here:
+- ``SO_REUSEADDR`` is set before every ``bind()`` call.
+- ``TCP_NODELAY`` is set on every accepted ``TcpStream``.
+- ``accept()`` sets ``TCP_NODELAY`` on the client socket automatically.
+"""
+
+from std.ffi import c_int, c_uint, get_errno, ErrNo
+from std.memory import stack_allocation
+
+from ..net import (
+    SocketAddr,
+    NetworkError,
+    AddressInUse,
+)
+from ..net.socket import (
+    RawSocket,
+    AF_INET,
+    AF_INET6,
+    SOCK_STREAM,
+    _build_sockaddr_in,
+    _sockaddr_to_socket_addr,
+)
+from ..net._libc import (
+    _bind,
+    _listen,
+    _accept,
+    _strerror,
+    SOCKADDR_IN_SIZE,
+    SOCKADDR_IN6_SIZE,
+)
+from .stream import TcpStream
+
+
+trait _PeerDecoder:
+    """Decodes the peer address ``accept(2)`` wrote into its sockaddr buffer.
+
+    The production decoder (:struct:`_SockaddrDecoder`) cannot fail for the
+    buffers ``accept(2)`` fills, so this one-method seam lets a test make the
+    decode raise and check that the accepted fd is still released. Internal;
+    see ``formal/Dodo/Bugs/NET_05.lean``.
+    """
+
+    def decode(self, buf: Pointer[UInt8, _]) raises -> SocketAddr:
+        ...
+
+
+struct _SockaddrDecoder(_PeerDecoder):
+    """The real decoder: ``_sockaddr_to_socket_addr``."""
+
+    def __init__(out self):
+        pass
+
+    def decode(self, buf: Pointer[UInt8, _]) raises -> SocketAddr:
+        return _sockaddr_to_socket_addr(buf)
+
+
+def _adopt_accepted[
+    D: _PeerDecoder
+](
+    client_fd: c_int, peer_buf: Pointer[UInt8, _], decoder: D
+) raises -> TcpStream:
+    """Turn the fd ``accept(2)`` returned into a ``TcpStream``.
+
+    The fd is wrapped in a ``RawSocket`` *before* anything that can raise, so
+    a failing peer-address decode (or ``TCP_NODELAY``) runs the socket's
+    destructor and closes the fd instead of leaking it.
+    """
+    # AF_INET is a placeholder until the peer address says otherwise.
+    var client_sock = RawSocket(client_fd, AF_INET, SOCK_STREAM, True)
+    var peer = decoder.decode(peer_buf)
+    client_sock.family = AF_INET6 if peer.ip.is_v6() else AF_INET
+    client_sock.set_tcp_nodelay(True)
+
+    return TcpStream(client_sock^, peer)
+
+
+struct TcpListener(Movable):
+    """A TCP socket in the listening state.
+
+    ``TcpListener`` accepts incoming TCP connections and returns each one
+    as a ``TcpStream``. ``SO_REUSEADDR`` is always set before ``bind()``.
+
+    The listener is closed automatically when the struct is destroyed.
+
+    Thread safety:
+        Not thread-safe . Do not call ``accept()`` concurrently.
+
+    Example:
+        ```mojo
+        from dodo.tcp import TcpListener, TcpStream
+        from dodo.net import SocketAddr
+
+        var listener = TcpListener.bind(SocketAddr.localhost(8080))
+        var stream = listener.accept() # blocks until a client connects
+        stream.write_all("welcome".as_bytes())
+        ```
+    """
+
+    var _socket: RawSocket
+    var _local: SocketAddr
+
+    def __init__(out self, var socket: RawSocket, local: SocketAddr):
+        """Wrap an already-bound, listening ``RawSocket``.
+
+        Args:
+            socket: Open, listening socket (ownership transferred).
+            local: The address the socket was bound to.
+
+        Safety:
+            ``socket`` must already be in the listening state (``listen(2)``
+            was called). The caller must not close ``socket`` after this.
+        """
+        self._socket = socket^
+        self._local = local
+
+    def __deinit__(deinit self):
+        self._socket.close()
+
+    # ── Factory ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def bind(addr: SocketAddr) raises -> TcpListener:
+        """Bind a TCP listener to ``addr`` with default options.
+
+        ``SO_REUSEADDR`` is set before binding. The backlog is 128.
+
+        Args:
+            addr: The local address to bind (use port 0 for OS-assigned port).
+
+        Returns:
+            A ``TcpListener`` ready to call ``accept()``.
+
+        Raises:
+            AddressInUse: If the port is already in use.
+            NetworkError: For any other OS bind/listen error.
+
+        Example:
+            ```mojo
+            var l = TcpListener.bind(SocketAddr.localhost(8080))
+            ```
+        """
+        return TcpListener.bind_with_options(addr)
+
+    @staticmethod
+    def bind_with_options(
+        addr: SocketAddr,
+        backlog: Int = 128,
+        reuse_port: Bool = False,
+    ) raises -> TcpListener:
+        """Bind with explicit backlog and ``SO_REUSEPORT`` control.
+
+        Args:
+            addr: The local address to bind.
+            backlog: Maximum length of the pending-connections queue.
+            reuse_port: If ``True``, set ``SO_REUSEPORT`` (useful for
+                        multi-process load balancing).
+
+        Returns:
+            A ``TcpListener`` ready to call ``accept()``.
+
+        Raises:
+            AddressInUse: If the port is already in use.
+            NetworkError: For any other OS error.
+
+        Example:
+            ```mojo
+            var l = TcpListener.bind_with_options(
+                SocketAddr.localhost(8080), backlog=1024, reuse_port=True
+            )
+            ```
+        """
+        var family = AF_INET6 if addr.ip.is_v6() else AF_INET
+        var sock = RawSocket(family, SOCK_STREAM)
+
+        sock.set_reuse_addr(True)
+        if reuse_port:
+            sock.set_reuse_port(True)
+
+        var sa = _build_sockaddr_in(addr)
+        var rc = _bind(sock.fd, sa[0], sa[1])
+        sa[0].unsafe_free()
+
+        if rc < 0:
+            var e = get_errno()
+            var s = String(addr)
+            if e == ErrNo.EADDRINUSE:
+                raise AddressInUse(s, Int(e.value))
+            raise NetworkError(
+                _strerror(e.value) + " (bind " + s + ")", Int(e.value)
+            )
+
+        var lr = _listen(sock.fd, c_int(backlog))
+        if lr < 0:
+            var e = get_errno()
+            raise NetworkError(_strerror(e.value) + " (listen)", Int(e.value))
+
+        # Query the actual local address (handles port 0 → OS-assigned port)
+        var local = sock.local_addr()
+        return TcpListener(sock^, local)
+
+    # ── Accept ────────────────────────────────────────────────────────────────
+
+    def accept(self) raises -> TcpStream:
+        """Block until an incoming connection arrives and return it.
+
+        Sets ``TCP_NODELAY`` on the accepted socket automatically.
+
+        Returns:
+            A connected ``TcpStream`` for the new client.
+
+        Raises:
+            NetworkError: If ``accept(2)`` fails. If the peer address cannot
+                be decoded afterwards the accepted socket is closed before
+                the error propagates (it is never leaked).
+
+        Example:
+            ```mojo
+            while True:
+                var client = listener.accept()
+                client.write_all("hello".as_bytes())
+                client.close()
+            ```
+        """
+        var peer_buf = stack_allocation[Int(SOCKADDR_IN6_SIZE), UInt8]()
+        for i in range(Int(SOCKADDR_IN6_SIZE)):
+            peer_buf.unsafe_offset(i).unsafe_write(0)
+        var peer_len = stack_allocation[1, c_uint]()
+        peer_len.unsafe_write(SOCKADDR_IN6_SIZE)
+
+        var client_fd = _accept(self._socket.fd, peer_buf, peer_len)
+        if client_fd < 0:
+            var e = get_errno()
+            raise NetworkError(_strerror(e.value) + " (accept)", Int(e.value))
+
+        return _adopt_accepted(client_fd, peer_buf, _SockaddrDecoder())
+
+    # ── Introspection ─────────────────────────────────────────────────────────
+
+    def local_addr(self) -> SocketAddr:
+        """Return the local address the listener is bound to.
+
+        Returns:
+            The bound ``SocketAddr`` (useful when port 0 was requested).
+        """
+        return self._local
+
+    def as_raw_fd(self) -> c_int:
+        """Return the underlying file descriptor.
+
+        Intended for the shared-listener scheduler: bind once on
+        the main thread, then hand the fd (a small integer) to every
+        worker via the per-worker context struct. Workers call
+        ``dodo.tcp.accept_fd`` directly rather than touching the
+        non-thread-safe ``TcpListener`` object.
+
+        The returned fd is borrowed; its lifetime is tied to ``self``.
+        Callers must not ``close(fd)`` themselves; let ``TcpListener``
+        own the close.
+
+        Returns:
+            The kernel file descriptor for the listening socket.
+        """
+        return self._socket.fd
+
+    def close(mut self):
+        """Close the listening socket. Idempotent."""
+        self._socket.close()
+
+
+def accept_fd(listener_fd: c_int) raises -> TcpStream:
+    """Accept one connection on a borrowed listener fd.
+
+    Functionally equivalent to ``TcpListener.accept(self)`` but takes
+    the listener as a raw integer fd, so the caller can share a single
+    listener across multiple workers without giving any one worker
+    ownership of the underlying ``TcpListener`` (multi-worker
+    scheduler path; see ``dodo.runtime.scheduler``).
+
+    The returned ``TcpStream`` owns the accepted client fd and has
+    ``TCP_NODELAY`` already set, matching ``TcpListener.accept``'s
+    contract. Same error semantics: raises ``NetworkError`` on
+    ``accept(2)`` failure (including ``EAGAIN`` / ``EWOULDBLOCK``,
+    which the multi-worker reactor catches as a normal "no more
+    pending conns" signal).
+
+    Args:
+        listener_fd: Fd of a listener socket. Caller must keep the
+            socket open for the duration of this call; this function
+            does NOT take ownership of the fd.
+
+    Returns:
+        A connected ``TcpStream`` for the new client.
+
+    Raises:
+        NetworkError: If ``accept(2)`` fails. The errno-bearing
+            variant lets the caller distinguish ``EAGAIN`` (drain the
+            accept loop) from a hard failure.
+    """
+    var peer_buf = stack_allocation[Int(SOCKADDR_IN6_SIZE), UInt8]()
+    for i in range(Int(SOCKADDR_IN6_SIZE)):
+        peer_buf.unsafe_offset(i).unsafe_write(0)
+    var peer_len = stack_allocation[1, c_uint]()
+    peer_len.unsafe_write(SOCKADDR_IN6_SIZE)
+
+    var client_fd = _accept(listener_fd, peer_buf, peer_len)
+    if client_fd < 0:
+        var e = get_errno()
+        raise NetworkError(_strerror(e.value) + " (accept)", Int(e.value))
+
+    return _adopt_accepted(client_fd, peer_buf, _SockaddrDecoder())

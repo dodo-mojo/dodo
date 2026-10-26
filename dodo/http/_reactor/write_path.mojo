@@ -1,0 +1,432 @@
+"""Response serialisation helpers for the H1 reactor write path.
+
+This module owns the byte-emitting half of the per-connection
+state machine: turning a parsed :class:`dodo.http.response.Response`
+or a pre-encoded :class:`dodo.http.static_response.StaticResponse`
+into the HTTP/1.1 wire bytes that
+:meth:`dodo.http._reactor.conn_handle.ConnHandle.on_writable`
+flushes to the socket.
+
+Splitting the serialise-path helpers out of
+:mod:`dodo.http._reactor.conn_handle` keeps that module focused
+on the connection state machine; the helpers here are pure
+functions over the connection's ``write_buf`` and ``DateCache``
+and only mutate those caller-supplied references.
+
+The hot-path optimisations (response-side ``DateCache`` reuse,
+single-allocation header skip predicates, bulk-copy body append)
+match the byte-fast-path / keep-alive helpers in
+:mod:`dodo.http._reactor.keepalive_scan`.
+"""
+
+from std.collections import List
+from std.memory import unsafe_memcpy, Pointer
+
+from dodo.http.response import Response
+from dodo.http._scan import parse_content_length
+from dodo.http.server import (
+    _status_reason,
+    _append_str,
+)
+from dodo.http.static_response import StaticResponse
+from dodo.runtime import DateCache
+
+from .keepalive_scan import (
+    _is_connection,
+    _is_content_length,
+    _is_date,
+    _is_transfer_encoding,
+)
+
+
+@always_inline
+def _decimal_digits(n: Int) -> Int:
+    """Number of ASCII digits in the non-negative decimal form of ``n``."""
+    if n < 10:
+        return 1
+    var d = 1
+    var x = n
+    while x >= 10:
+        x //= 10
+        d += 1
+    return d
+
+
+@always_inline
+def _put_str(mut buf: List[UInt8], off: Int, s: StringSlice) -> Int:
+    """memcpy ``s`` into ``buf`` at ``off``; return the advanced offset.
+
+    The caller is responsible for having sized ``buf`` to fit
+    (``serialize_response_into`` computes the exact total up front).
+    """
+    var n = s.byte_length()
+    if n > 0:
+        unsafe_memcpy(
+            dest=buf.unsafe_ptr().unsafe_offset(off),
+            src=s.unsafe_ptr(),
+            count=n,
+        )
+    return off + n
+
+
+@always_inline
+def _put_int(mut buf: List[UInt8], off: Int, n: Int) -> Int:
+    """Write the ASCII decimal form of non-negative ``n`` at ``off``.
+
+    Writes digits most-significant first by computing the digit count
+    and filling backwards from the end -- no temporary buffer, no
+    allocation.
+    """
+    var p = buf.unsafe_ptr()
+    if n == 0:
+        p[unsafe_offset=off] = 48
+        return off + 1
+    var d = _decimal_digits(n)
+    var end = off + d
+    var k = end
+    var x = n
+    while x > 0:
+        k -= 1
+        p[unsafe_offset=k] = UInt8(48 + (x % 10))
+        x //= 10
+    return end
+
+
+@always_inline
+def _put_bytes(
+    mut buf: List[UInt8], off: Int, src: Pointer[UInt8, _], n: Int
+) -> Int:
+    """memcpy ``n`` bytes from ``src`` into ``buf`` at ``off``."""
+    if n > 0:
+        unsafe_memcpy(
+            dest=buf.unsafe_ptr().unsafe_offset(off), src=src, count=n
+        )
+    return off + n
+
+
+def _head_length(buf: List[UInt8]) -> Int:
+    """Length of ``buf`` up to and including the first CRLFCRLF; the whole
+    buffer when there is no header terminator."""
+    var n = len(buf)
+    var i = 0
+    while i + 3 < n:
+        if (
+            buf[i] == 13
+            and buf[i + 1] == 10
+            and buf[i + 2] == 13
+            and buf[i + 3] == 10
+        ):
+            return i + 4
+        i += 1
+    return n
+
+
+def serialize_static_into(
+    mut write_buf: List[UInt8],
+    mut write_pos: Int,
+    resp: StaticResponse,
+    keep_alive: Bool,
+    head_request: Bool = False,
+) -> None:
+    """Queue a pre-encoded static response into ``write_buf``.
+
+    Reuses the buffer's existing capacity across requests (same
+    pattern as :func:`serialize_response_into`) and pulls either
+    the keep-alive or close variant of the pre-encoded bytes
+    depending on ``keep_alive``.
+
+    When ``head_request`` is ``True`` (the request was ``HEAD``) only
+    the bytes up to and including the first ``CRLFCRLF`` are queued:
+    a response to HEAD MUST NOT carry content (RFC 9110 §9.3.2) and
+    ends at the header terminator (RFC 9112 §6.3).
+    """
+    write_buf.clear()
+    write_pos = 0
+    # Pick the keep-alive or close variant by branch rather than via
+    # a conditional expression. ``List[UInt8]`` is not
+    # ``ImplicitlyCopyable``, so binding the selected variant to a
+    # single ``var`` would force an implicit copy that the compiler
+    # rejects. Splitting the branch
+    # keeps both arms in pure borrow + ``unsafe_ptr()`` form and
+    # avoids any copy at all.
+    var n: Int
+    if keep_alive:
+        n = len(resp.keepalive_bytes)
+        if head_request:
+            n = _head_length(resp.keepalive_bytes)
+    else:
+        n = len(resp.close_bytes)
+        if head_request:
+            n = _head_length(resp.close_bytes)
+    if write_buf.capacity() < n:
+        write_buf.reserve(n)
+    write_buf.resize(n, UInt8(0))
+    if keep_alive:
+        unsafe_memcpy(
+            dest=write_buf.unsafe_ptr(),
+            src=resp.keepalive_bytes.unsafe_ptr(),
+            count=n,
+        )
+    else:
+        unsafe_memcpy(
+            dest=write_buf.unsafe_ptr(),
+            src=resp.close_bytes.unsafe_ptr(),
+            count=n,
+        )
+
+
+def _wire_status(status: Int) -> Int:
+    """A status code fit for the status line: 100-599, else 500."""
+    if status < 100 or status > 599:
+        return 500
+    return status
+
+
+def _wire_reason(resp: Response, status: Int) -> String:
+    """The reason phrase to put on the wire.
+
+    RFC 9112 sec 4 allows only HTAB, SP, VCHAR and obs-text there. A
+    handler-set reason holding anything else -- above all CR or LF, which
+    end the status line -- is replaced by the standard phrase instead of
+    being written verbatim, where it split the response.
+    """
+    var reason = resp.reason
+    if reason.byte_length() == 0 or status != resp.status:
+        return _status_reason(status)
+    var p = reason.unsafe_ptr()
+    for i in range(reason.byte_length()):
+        var c = p[unsafe_offset=i]
+        if (c < 32 and c != 9) or c == 127:
+            return _status_reason(status)
+    return reason
+
+
+def _declared_length(resp: Response) -> Int:
+    """The handler's own ``Content-Length``, or -1 when it set none (or
+    set one that is not a plain decimal)."""
+    for i in range(resp.headers.len()):
+        if _is_content_length(resp.headers._keys[i]):
+            return parse_content_length(resp.headers._values[i])
+    return -1
+
+
+def serialize_response_into(
+    mut write_buf: List[UInt8],
+    mut date_cache: DateCache,
+    resp: Response,
+    keep_alive: Bool,
+    head_request: Bool = False,
+    length_known: Bool = True,
+) -> None:
+    """Serialise ``resp`` into ``write_buf`` ready to be sent.
+
+    Reuses ``write_buf``'s allocated capacity across requests --
+    callers clear the buffer after the previous response has been
+    flushed, so the backing storage is idle when serialise starts.
+    The ``Date`` header is emitted from the caller-supplied
+    :class:`dodo.runtime.DateCache` (RFC 9110 §6.6.1); any
+    caller-supplied ``Date`` field on ``resp`` is dropped.
+
+    Responses to HEAD, and 1xx, 204 and 304 responses, never carry
+    content (RFC 9110 sec 6.4.1). Writing the body anyway put bytes on
+    the wire that a keep-alive client -- or a proxy multiplexing many
+    users onto this connection -- reads as the start of the *next*
+    response. For HEAD and 304, ``Content-Length`` describes the
+    representation a GET would have returned: the handler's own
+    ``Content-Length`` if it set one, otherwise the length of the body
+    it produced. 1xx and 204 carry no ``Content-Length`` at all.
+
+    Args:
+        write_buf: Output buffer, cleared first.
+        date_cache: Per-connection ``Date`` formatter.
+        resp: Response to serialise.
+        keep_alive: Emit ``keep-alive`` rather than ``close``.
+        head_request: The request was HEAD: send the head only.
+        length_known: False for a streamed response whose length is
+            unknown; ``Content-Length`` is then written only if the
+            handler set it.
+    """
+    var status = _wire_status(resp.status)
+    var reason = _wire_reason(resp, status)
+    var body_len = len(resp.body)
+    var no_length_field = status < 200 or status == 204
+    var no_content = no_length_field or head_request or status == 304
+    var length_value = body_len
+    if no_content:
+        var declared = _declared_length(resp)
+        if declared >= 0:
+            length_value = declared
+        elif not length_known:
+            no_length_field = True
+    var emit_len = not no_length_field
+    var emit_body = not no_content and body_len > 0
+
+    # Date: RFC 9110 §6.6.1, IMF-fixdate from the per-connection
+    # DateCache. The cache calls clock_gettime + (re)formats only
+    # when the wall-clock second has advanced; reads on the same
+    # second return the cached buffer directly.
+    date_cache.refresh()
+    var date_bytes = date_cache.current_bytes()
+    var date_len = len(date_bytes)
+
+    # Compute the EXACT serialized length up front so the buffer is
+    # sized in a single pass. The previous form issued ~10 separate
+    # ``_append_str`` calls, each doing a ``resize(.,0)`` that
+    # zero-filled its new tail (showing up as ``__memset_avx2`` on the
+    # hot path) before the memcpy overwrote it. Sizing once and writing
+    # through a raw cursor drops both the repeated resize overhead and
+    # the redundant zero-fill -- the bytes emitted are identical.
+    #
+    # Fixed segment widths:
+    #   "HTTP/1.1 " = 9, status digits, " " = 1, reason, "\r\n" = 2
+    #   "Content-Length: " = 16, body_len digits, "\r\n" = 2
+    #   "Date: " = 6, date_bytes, "\r\n" = 2
+    #   "Connection: keep-alive\r\n" = 24  /  "Connection: close\r\n" = 19
+    #   "\r\n" = 2 (header terminator), then body
+    var total = 9 + _decimal_digits(status) + 1 + reason.byte_length() + 2
+    for i in range(resp.headers.len()):
+        var k = resp.headers._keys[i]
+        # Case-insensitive skip of Content-Length, Connection, and Date
+        # without allocating a lowercased copy each header. Date is
+        # always emitted by us from the per-connection DateCache
+        # (RFC 9110 §6.6.1 mandates a single Date field-line).
+        if _is_content_length(k) or _is_connection(k) or _is_date(k):
+            continue
+        total += k.byte_length() + 2 + resp.headers._values[i].byte_length() + 2
+    if emit_len:
+        total += 16 + _decimal_digits(length_value) + 2
+    total += 6 + date_len + 2
+    total += 24 if keep_alive else 19
+    total += 2
+    if emit_body:
+        total += body_len
+
+    write_buf.clear()
+    write_buf.resize(unsafe_uninit_length=total)
+    var off = 0
+
+    off = _put_str(write_buf, off, "HTTP/1.1 ")
+    off = _put_int(write_buf, off, status)
+    off = _put_str(write_buf, off, " ")
+    off = _put_str(write_buf, off, reason)
+    off = _put_str(write_buf, off, "\r\n")
+
+    for i in range(resp.headers.len()):
+        var k = resp.headers._keys[i]
+        if _is_content_length(k) or _is_connection(k) or _is_date(k):
+            continue
+        off = _put_str(write_buf, off, k)
+        off = _put_str(write_buf, off, ": ")
+        off = _put_str(write_buf, off, resp.headers._values[i])
+        off = _put_str(write_buf, off, "\r\n")
+
+    if emit_len:
+        off = _put_str(write_buf, off, "Content-Length: ")
+        off = _put_int(write_buf, off, length_value)
+        off = _put_str(write_buf, off, "\r\n")
+
+    off = _put_str(write_buf, off, "Date: ")
+    off = _put_bytes(write_buf, off, date_bytes.unsafe_ptr(), date_len)
+    off = _put_str(write_buf, off, "\r\n")
+
+    if keep_alive:
+        off = _put_str(write_buf, off, "Connection: keep-alive\r\n")
+    else:
+        off = _put_str(write_buf, off, "Connection: close\r\n")
+
+    off = _put_str(write_buf, off, "\r\n")
+
+    if emit_body:
+        _ = _put_bytes(write_buf, off, resp.body.unsafe_ptr(), body_len)
+
+
+def serialize_response_headers_chunked_into(
+    mut write_buf: List[UInt8],
+    mut date_cache: DateCache,
+    resp: Response,
+    keep_alive: Bool,
+) -> None:
+    """Serialise ``resp``'s status line + headers with
+    ``Transfer-Encoding: chunked`` framing (no ``Content-Length``, no
+    body) into ``write_buf``.
+
+    Used for the streaming-response path: the reactor emits these
+    headers once, then frames each pulled chunk (see
+    ``dodo.http.response_stream``) on subsequent writable edges. Not
+    on the plaintext hot path -- correctness over micro-optimisation,
+    so it uses the append-based writer rather than the single-pass
+    exact-size writer ``serialize_response_into`` uses.
+    """
+    var status = _wire_status(resp.status)
+    var reason = _wire_reason(resp, status)
+    date_cache.refresh()
+    var date_bytes = date_cache.current_bytes()
+
+    write_buf.clear()
+    var wire = write_buf^
+    _append_str(wire, "HTTP/1.1 ")
+    _append_str(wire, String(status))
+    _append_str(wire, " ")
+    _append_str(wire, reason)
+    _append_str(wire, "\r\n")
+    for i in range(resp.headers.len()):
+        var k = resp.headers._keys[i]
+        # Drop caller-supplied framing / hop headers -- we emit the
+        # canonical Transfer-Encoding, Date, and Connection ourselves.
+        if (
+            _is_content_length(k)
+            or _is_connection(k)
+            or _is_date(k)
+            or _is_transfer_encoding(k)
+        ):
+            continue
+        _append_str(wire, k)
+        _append_str(wire, ": ")
+        _append_str(wire, resp.headers._values[i])
+        _append_str(wire, "\r\n")
+    _append_str(wire, "Transfer-Encoding: chunked\r\n")
+    _append_str(wire, "Date: ")
+    for i in range(len(date_bytes)):
+        wire.append(date_bytes[i])
+    _append_str(wire, "\r\n")
+    if keep_alive:
+        _append_str(wire, "Connection: keep-alive\r\n")
+    else:
+        _append_str(wire, "Connection: close\r\n")
+    _append_str(wire, "\r\n")
+    write_buf = wire^
+
+
+def build_error_response(status: Int, reason: String) -> Response:
+    """Build a minimal text/plain error response. The caller threads
+    the result through :func:`serialize_response_into` to queue it
+    onto the wire.
+
+    ``reason`` may be handler-authored text (``HttpStatusError`` or, with
+    ``expose_error_messages``, any error string), so it goes in the body
+    only. The status line carries the standard phrase for ``status``.
+    """
+    var body_str = String(status) + " " + reason
+    var resp = Response(status=status)
+    var body_bytes = body_str.as_bytes()
+    for i in range(len(body_bytes)):
+        resp.body.append(body_bytes[i])
+    try:
+        resp.headers.set("Content-Type", "text/plain")
+    except:
+        pass
+    return resp^
+
+
+def queue_h2c_upgrade_101(mut write_buf: List[UInt8]) -> None:
+    """Queue the ``101 Switching Protocols`` response for an h2c
+    upgrade (RFC 7540 §3.2) into ``write_buf``. ``Connection: close``
+    is intentionally omitted so the same TCP fd carries the
+    subsequent HTTP/2 frames.
+    """
+    write_buf.clear()
+    var wire = write_buf^
+    _append_str(wire, "HTTP/1.1 101 Switching Protocols\r\n")
+    _append_str(wire, "Connection: Upgrade\r\n")
+    _append_str(wire, "Upgrade: h2c\r\n\r\n")
+    write_buf = wire^

@@ -1,0 +1,454 @@
+"""Mojo bindings for the server-side TLS FFI helpers.
+
+Exposes the C-side functions added to
+``dodo/tls/ffi/openssl_wrapper.cpp`` for the server-side SSL_CTX
++ SSL lifecycle. Mirrors the ``dodo/tls/stream.mojo`` binding
+pattern: ``OwnedDLHandle`` to ``libdodo_tls.so``, individually
+typed ``get_function`` calls per FFI export.
+
+Minimum-friction surface for the C7 reactor state machine:
+
+- ``ServerCtx``: holds an ``SSL_CTX*`` (as ``Int``) plus the
+  loaded ``OwnedDLHandle``.
+- ``ServerCtx.new(cert_path, key_path)``: combine new + load.
+- ``ServerCtx.set_alpn(protos)``: ALPN preference (servers
+  bound here advertise + select via the C-side callback).
+- ``ServerCtx.set_verify_client_cert(ca_path)``: mTLS opt-in.
+- ``ServerCtx.reload(cert_path, key_path)``: cert rotation.
+- ``ServerCtx.new_accept(fd)``: returns an ``Int`` SSL handle.
+- ``ServerSsl``: holds the SSL handle + a borrow on the loaded
+  library; ``do_handshake`` returns 0 / 1 / 2 / -1 per the C
+  contract; ``alpn_selected``, ``protocol``, ``cipher``, and
+  ``sni_host`` read introspection state.
+
+Wiring into ``TlsAcceptor`` (whose reactor-side handshake state
+machine is not yet mounted) plugs into the reactor
+``STATE_TLS_HANDSHAKE`` path; this file is the FFI layer those
+wires use.
+
+## OwnedDLHandle / ASAP-destruction discipline
+
+Mojo's ASAP destruction policy reclaims an ``OwnedDLHandle`` right
+after its last Mojo-visible use. In a naive ``var lib =
+OwnedDLHandle(...); var fn = lib.get_function(...); fn(...)``
+sequence the runtime considers ``lib`` dead immediately after
+``get_function`` returns and runs the destructor (``dlclose``)
+before ``fn`` is invoked, leaving the cached function pointer
+dangling into freed memory. The same applies in subtler ways to
+struct-field handles when the JIT can prove no further field reads
+follow within a method.
+
+The discipline this file follows: every FFI call goes through a
+``_do_*(imm lib: OwnedDLHandle, ...)`` borrow helper that does
+both ``get_function`` and the invocation inside the borrow. Public
+methods open the handle (or read it from ``self._lib``) and
+delegate. Same idiom as ``dodo.http.encoding._do_compress`` and
+``dodo.http.middleware._dodo_fs_access``.
+"""
+
+from std.ffi import c_int, OwnedDLHandle
+from std.memory import Pointer
+
+from ..net import _find_dodo_lib
+from ..utils.dylib import dl_sym
+
+
+# ── FFI handle wrappers ────────────────────────────────────────────────────
+
+
+# ── Borrow helpers (one per FFI export) ───────────────────────────────────
+#
+# Every helper takes ``read lib: OwnedDLHandle`` and does both
+# ``get_function`` and the call inside the borrow, so the dylib
+# stays mapped across the entire FFI surface.
+#
+# Path arguments are taken as owned ``var`` and NUL-terminated in place
+# with ``as_c_string_slice`` before the C call: a path materialized from
+# a StringSlice is not NUL-terminated under ``unsafe_ptr``, so OpenSSL's
+# file open would read past it (same defect as the SNI host fixed in
+# ``dodo/tls/stream.mojo`` ``_do_ssl_connect``). The owned arg outlives
+# the call; the slice views its now-terminated buffer.
+
+
+def _do_ssl_ctx_new_server(
+    imm lib: OwnedDLHandle, var cert_path: String, var key_path: String
+) raises -> Int:
+    var f = dl_sym[def(Int, Int) thin abi("C") -> Int](
+        lib, "dodo_ssl_ctx_new_server"
+    )
+    var cert_c = cert_path.as_c_string_span()
+    var key_c = key_path.as_c_string_span()
+    var addr = f(Int(cert_c.ptr()), Int(key_c.ptr()))
+    # The C-string pointers escape as raw Int, so the compiler does not
+    # see that the owned path buffers must stay live across the call.
+    # as_c_string_slice may reallocate (a slice-derived, exact-length
+    # path has no spare byte for the NUL), and without anchoring the
+    # owner is ASAP-destroyed before OpenSSL reads the path -- a
+    # heap-use-after-free. Keep both alive until the synchronous call
+    # has consumed them.
+    _ = cert_path^
+    _ = key_path^
+    if addr == 0:
+        raise Error("dodo_ssl_ctx_new_server failed (see TLS error log)")
+    return addr
+
+
+def _do_ssl_ctx_free(imm lib: OwnedDLHandle, addr: Int) raises:
+    var f = dl_sym[def(Int) thin abi("C") -> None](lib, "dodo_ssl_ctx_free")
+    f(addr)
+
+
+def _do_ssl_ctx_reload(
+    imm lib: OwnedDLHandle,
+    addr: Int,
+    var cert_path: String,
+    var key_path: String,
+) raises:
+    var f = dl_sym[def(Int, Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_reload"
+    )
+    var cert_c = cert_path.as_c_string_span()
+    var key_c = key_path.as_c_string_span()
+    var rc = Int(f(addr, Int(cert_c.ptr()), Int(key_c.ptr())))
+    # Anchor the owned buffers past the call (see _do_ssl_ctx_new_server).
+    _ = cert_path^
+    _ = key_path^
+    if rc != 0:
+        raise Error("dodo_ssl_ctx_reload failed")
+
+
+def _do_ssl_ctx_set_cert(
+    imm lib: OwnedDLHandle,
+    addr: Int,
+    var host: String,
+    var cert_path: String,
+    var key_path: String,
+) raises:
+    var f = dl_sym[def(Int, Int, Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_set_cert"
+    )
+    var host_c = host.as_c_string_span()
+    var cert_c = cert_path.as_c_string_span()
+    var key_c = key_path.as_c_string_span()
+    var rc = Int(
+        f(addr, Int(host_c.ptr()), Int(cert_c.ptr()), Int(key_c.ptr()))
+    )
+    _ = host^
+    _ = cert_path^
+    _ = key_path^
+    if rc != 0:
+        raise Error("dodo_ssl_ctx_set_cert failed")
+
+
+def _do_ssl_ctx_set_alpn(
+    imm lib: OwnedDLHandle, addr: Int, protos: List[UInt8]
+) raises:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_set_alpn_server"
+    )
+    if Int(f(addr, Int(protos.unsafe_ptr()), c_int(len(protos)))) != 0:
+        raise Error("dodo_ssl_ctx_set_alpn_server failed")
+
+
+def _do_ssl_ctx_set_verify_client_cert(
+    imm lib: OwnedDLHandle, addr: Int, var ca_path: String
+) raises:
+    var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_set_verify_client_cert"
+    )
+    var ca_c = ca_path.as_c_string_span()
+    var rc = Int(f(addr, Int(ca_c.ptr())))
+    # Anchor the owned buffer past the call (see _do_ssl_ctx_new_server).
+    _ = ca_path^
+    if rc != 0:
+        raise Error("dodo_ssl_ctx_set_verify_client_cert failed")
+
+
+def _do_ssl_ctx_enable_session_tickets(
+    imm lib: OwnedDLHandle, addr: Int, lifetime_s: Int
+) raises:
+    var f = dl_sym[def(Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_enable_session_tickets"
+    )
+    if Int(f(addr, c_int(lifetime_s))) != 0:
+        raise Error("dodo_ssl_ctx_enable_session_tickets failed")
+
+
+def _do_ssl_ctx_disable_session_tickets(
+    imm lib: OwnedDLHandle, addr: Int
+) raises:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_disable_session_tickets"
+    )
+    if Int(f(addr)) != 0:
+        raise Error("dodo_ssl_ctx_disable_session_tickets failed")
+
+
+def _do_ssl_ctx_set_min_proto(
+    imm lib: OwnedDLHandle, addr: Int, version: Int
+) raises:
+    var f = dl_sym[def(Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_set_min_proto"
+    )
+    if Int(f(addr, c_int(version))) != 0:
+        raise Error("dodo_ssl_ctx_set_min_proto: unsupported TLS version")
+
+
+def _do_ssl_new_accept(
+    imm lib: OwnedDLHandle, ctx_addr: Int, fd: Int
+) raises -> Int:
+    var f = dl_sym[def(Int, c_int) thin abi("C") -> Int](
+        lib, "dodo_ssl_new_accept"
+    )
+    return f(ctx_addr, c_int(fd))
+
+
+def _do_ssl_do_handshake(imm lib: OwnedDLHandle, ssl_addr: Int) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_do_handshake"
+    )
+    return Int(f(ssl_addr))
+
+
+# Non-blocking I/O sentinels; mirror the DODO_SSL_IO_* macros in
+# ``openssl_wrapper.h``. Positive returns are byte counts.
+comptime SSL_IO_WANT_READ: Int = -1
+comptime SSL_IO_WANT_WRITE: Int = -2
+comptime SSL_IO_CLOSED: Int = -3
+comptime SSL_IO_FATAL: Int = -4
+comptime SSL_IO_EOF_UNCLEAN: Int = -5
+"""The peer closed without close_notify (``dodo_ssl_read_blocking``
+only). A close-delimited body cannot tell this from truncation."""
+
+
+def _do_ssl_read_ex(
+    imm lib: OwnedDLHandle, ssl_addr: Int, buf_ptr: Int, buf_len: Int
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_read_ex"
+    )
+    return Int(f(ssl_addr, buf_ptr, c_int(buf_len)))
+
+
+def _do_ssl_write_ex(
+    imm lib: OwnedDLHandle, ssl_addr: Int, buf_ptr: Int, buf_len: Int
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_write_ex"
+    )
+    return Int(f(ssl_addr, buf_ptr, c_int(buf_len)))
+
+
+def _do_ssl_get_alpn_selected(
+    imm lib: OwnedDLHandle, ssl_addr: Int
+) raises -> String:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_get_alpn_selected"
+    )
+    var buf = List[UInt8](capacity=64)
+    buf.resize(64, UInt8(0))
+    var n = Int(f(ssl_addr, Int(buf.unsafe_ptr()), c_int(64)))
+    if n <= 0:
+        return ""
+    return String(unsafe_from_utf8=Span[UInt8, _](buf[:n]))
+
+
+def _do_ssl_get_sni_host(
+    imm lib: OwnedDLHandle, ssl_addr: Int
+) raises -> String:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_get_sni_host"
+    )
+    var buf = List[UInt8](capacity=256)
+    buf.resize(256, UInt8(0))
+    var n = Int(f(ssl_addr, Int(buf.unsafe_ptr()), c_int(256)))
+    if n <= 0:
+        return ""
+    return String(unsafe_from_utf8=Span[UInt8, _](buf[:n]))
+
+
+def _do_ssl_free(imm lib: OwnedDLHandle, ssl_addr: Int) raises:
+    var f = dl_sym[def(Int) thin abi("C") -> None](lib, "dodo_ssl_free")
+    f(ssl_addr)
+
+
+# ── ServerCtx wrapper ─────────────────────────────────────────────────────
+
+
+struct ServerCtx(Movable):
+    """Server-side ``SSL_CTX`` wrapper.
+
+    Owns the underlying ``SSL_CTX*`` and the loaded
+    ``libdodo_tls.so`` handle. Drop runs ``dodo_ssl_ctx_free``
+    so the OpenSSL reference is released.
+    """
+
+    var _addr: Int
+    """Raw ``SSL_CTX*`` as an ``Int``. Zero means uninitialised
+    or already freed."""
+
+    var _lib: OwnedDLHandle
+    """Pinned library handle so dlclose doesn't tear the .so out
+    from under any in-flight ``SSL`` we created."""
+
+    def __init__(out self, var lib: OwnedDLHandle, addr: Int):
+        self._lib = lib^
+        self._addr = addr
+
+    def __deinit__(deinit self):
+        if self._addr != 0:
+            try:
+                _do_ssl_ctx_free(self._lib, self._addr)
+            except:
+                pass
+
+    @staticmethod
+    def new(cert_path: String, key_path: String) raises -> ServerCtx:
+        """Construct a server ``SSL_CTX`` configured with TLS 1.2+
+        / forward-secret AEAD ciphers and the supplied cert /
+        key. Raises on cert load / key mismatch / null alloc.
+        """
+        var lib = OwnedDLHandle(_find_dodo_lib())
+        var addr = _do_ssl_ctx_new_server(lib, cert_path, key_path)
+        return ServerCtx(lib^, addr)
+
+    def reload(self, cert_path: String, key_path: String) raises:
+        """Reload cert + key without restarting. Raises on file
+        load error / key mismatch, and leaves the context serving the
+        pair it had when it does."""
+        _do_ssl_ctx_reload(self._lib, self._addr, cert_path, key_path)
+
+    def set_cert(
+        self, host: String, cert_path: String, key_path: String
+    ) raises:
+        """Serve this pair to clients whose SNI is ``host`` (``""`` for
+        the default, ``*.example.com`` for one-label wildcards),
+        replacing any pair for it. Safe while other threads handshake;
+        a pair that fails to load raises and changes nothing."""
+        _do_ssl_ctx_set_cert(self._lib, self._addr, host, cert_path, key_path)
+
+    def key_matches(self) raises -> Bool:
+        """Whether the context's certificate and private key match."""
+        var f = dl_sym[def(Int) thin abi("C") -> c_int](
+            self._lib, "dodo_ssl_ctx_check_private_key"
+        )
+        return Int(f(self._addr)) == 1
+
+    def set_alpn(self, protos: List[UInt8]) raises:
+        """Set the wire-format ALPN protocols list.
+
+        ``protos`` is the OpenSSL wire format:
+        ``len_byte || proto_bytes || len_byte || proto_bytes || ...``
+        For example, advertising ``["h2", "http/1.1"]`` is:
+        ``[2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1']``.
+        """
+        _do_ssl_ctx_set_alpn(self._lib, self._addr, protos)
+
+    def set_verify_client_cert(self, ca_path: String) raises:
+        """Enable mTLS — clients must present a cert signed by a
+        CA in ``ca_path``."""
+        _do_ssl_ctx_set_verify_client_cert(self._lib, self._addr, ca_path)
+
+    def enable_session_tickets(self, lifetime_s: Int) raises:
+        """Turn on RFC 5077 / RFC 8446 §4.6.1 session ticket
+        emission with the given lifetime in seconds. Sets the
+        OpenSSL session-id-context (required whenever tickets are
+        on) to a stable per-process value; clears
+        ``SSL_OP_NO_TICKET`` if it was set; and configures the
+        server-side cache mode so resuming peers find their
+        session.
+        """
+        _do_ssl_ctx_enable_session_tickets(self._lib, self._addr, lifetime_s)
+
+    def disable_session_tickets(self) raises:
+        """Turn session resumption off: no RFC 5077 tickets, no TLS 1.3
+        NewSessionTicket messages and no server-side session cache, so no
+        session is issued and none can be resumed."""
+        _do_ssl_ctx_disable_session_tickets(self._lib, self._addr)
+
+    def set_min_protocol(self, version: Int) raises:
+        """Refuse protocol versions below ``version``
+        (``TLS_PROTOCOL_TLS12`` or ``TLS_PROTOCOL_TLS13``); anything else
+        raises."""
+        _do_ssl_ctx_set_min_proto(self._lib, self._addr, version)
+
+    def addr(self) -> Int:
+        """Underlying ``SSL_CTX*`` as an Int."""
+        return self._addr
+
+
+def server_ssl_new_accept(ctx: ServerCtx, fd: Int) raises -> Int:
+    """Wrap ``SSL_new + SSL_set_fd + SSL_set_accept_state`` into
+    a single FFI call. Returns the ``SSL*`` as an ``Int`` (or 0
+    on failure). The reactor caller is responsible for calling
+    ``dodo_ssl_free`` to release."""
+    return _do_ssl_new_accept(ctx._lib, ctx._addr, fd)
+
+
+def server_ssl_do_handshake(ctx: ServerCtx, ssl_addr: Int) raises -> Int:
+    """Drive ``SSL_accept`` one step and return the next-step code.
+
+    - 0 → handshake complete.
+    - 1 → WANT_READ; reactor should re-arm readable interest.
+    - 2 → WANT_WRITE; reactor should re-arm writable interest.
+    - -1 → fatal; close the connection.
+    """
+    return _do_ssl_do_handshake(ctx._lib, ssl_addr)
+
+
+def server_ssl_read_ex(
+    ctx: ServerCtx, ssl_addr: Int, mut buf: List[UInt8], max_bytes: Int
+) raises -> Int:
+    """Non-blocking ``SSL_read`` of up to ``max_bytes`` into ``buf``.
+
+    Appends the plaintext bytes to ``buf`` and returns the number read
+    (>0) or a ``SSL_IO_*`` sentinel (WANT_READ / WANT_WRITE / CLOSED /
+    FATAL). ``max_bytes`` bounds one read (the caller's chunk size).
+    """
+    if max_bytes <= 0:
+        return 0
+    var old_len = len(buf)
+    buf.resize(old_len + max_bytes, UInt8(0))
+    var dst = Int(buf.unsafe_ptr()) + old_len
+    var n = _do_ssl_read_ex(ctx._lib, ssl_addr, dst, max_bytes)
+    if n > 0:
+        buf.resize(old_len + n, UInt8(0))
+    else:
+        buf.resize(old_len, UInt8(0))
+    return n
+
+
+def server_ssl_write_ex(
+    ctx: ServerCtx, ssl_addr: Int, bytes: Span[UInt8, _], off: Int = 0
+) raises -> Int:
+    """Non-blocking ``SSL_write`` of ``bytes[off:]``.
+
+    Returns the number of bytes consumed (>0) or a ``SSL_IO_*``
+    sentinel. Partial writes are the caller's responsibility to resume
+    (advance ``off`` by the return value)."""
+    var n = len(bytes) - off
+    if n <= 0:
+        return 0
+    var ptr = Int(bytes.unsafe_ptr()) + off
+    return _do_ssl_write_ex(ctx._lib, ssl_addr, ptr, n)
+
+
+def server_ssl_get_alpn_selected(
+    ctx: ServerCtx, ssl_addr: Int
+) raises -> String:
+    """Return the negotiated ALPN protocol, or empty string if
+    none was negotiated."""
+    return _do_ssl_get_alpn_selected(ctx._lib, ssl_addr)
+
+
+def server_ssl_get_sni_host(ctx: ServerCtx, ssl_addr: Int) raises -> String:
+    """Return the SNI hostname the client sent, or empty string
+    if no SNI extension was present."""
+    return _do_ssl_get_sni_host(ctx._lib, ssl_addr)
+
+
+def server_ssl_free(ctx: ServerCtx, ssl_addr: Int) raises:
+    """Release an ``SSL*`` allocated via ``server_ssl_new_accept``."""
+    if ssl_addr == 0:
+        return
+    _do_ssl_free(ctx._lib, ssl_addr)

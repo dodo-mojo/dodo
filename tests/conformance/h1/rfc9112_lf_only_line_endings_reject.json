@@ -1,0 +1,8 @@
+{
+  "name": "lf_only_line_endings_strict",
+  "spec": "RFC 9112 §2.2 (CRLF required by default)",
+  "input_hex": "47 45 54 20 2f 20 48 54 54 50 2f 31 2e 31 0a 48 6f 73 74 3a 20 65 78 61 6d 70 6c 65 2e 63 6f 6d 0a 0a",
+  "expect": "reject",
+  "expect_reason": "bare LF line terminators violate the strict CRLF requirement",
+  "leniency": {}
+}

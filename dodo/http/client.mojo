@@ -1,0 +1,2158 @@
+"""HTTP client: HTTP/1.1 and HTTP/2, over TCP or TLS.
+
+- ``Content-Length``, chunked, and read-until-close response bodies
+- Up to ``_max_redirects`` automatic 3xx redirects
+- Automatic ``Host``, ``User-Agent``, ``Connection`` headers
+- Optional ``Authorization`` header via the ``Auth`` trait
+
+Module-level convenience functions (``get``, ``post``, ``put``,
+``delete``, ``head``) create a one-shot ``HttpClient`` per call and are
+suitable for quick scripts. For multiple requests, prefer instantiating
+a shared ``HttpClient``.
+
+``post`` and ``put`` accept a ``String`` body (sets
+``Content-Type: application/json`` automatically), a ``json.Value``
+body (serialised with ``dumps`` first), or a ``List[UInt8]`` body (sent
+as raw bytes with no implicit ``Content-Type``).
+
+Example:
+    ```mojo
+    from dodo.http import get, post, HttpClient, BasicAuth, BearerAuth, Status
+
+    # One-shot GET
+    var resp = get("https://httpbin.org/get")
+
+    # One-shot POST JSON — String body sets Content-Type automatically
+    var r2 = post("https://httpbin.org/post", '{"k": 1}')
+
+    # Session with base URL and authentication
+    with HttpClient("https://httpbin.org", BasicAuth("alice", "s3cr3t")) as c:
+        var r = c.get("/basic-auth/alice/s3cr3t")
+        r.raise_for_status()
+        print(r.text())
+    ```
+"""
+
+# This file is long because Mojo can't split one struct's methods across
+# files. Free helpers and per-wire dial code live in ``_client/``.
+from .request import Request, Method
+from .response import Response, Status
+from .headers import HeaderMap
+from .url import Url
+from .auth import Auth, BasicAuth, BearerAuth
+from .error import HttpError, TooManyRedirects
+from .redirect_policy import RedirectPolicy, RedirectAction, RedirectMode
+from .reliability import RetryPolicy, _backoff_sleep_ms
+from .encoding import DEFAULT_MAX_DECOMPRESSED_BYTES, decode_content
+from ._client.cookie_store import CookieStore
+from .body import ChunkSource
+from .cancel import Cancel
+from ..runtime._libc_time import libc_nanosleep_ms
+from ..tcp import TcpStream
+from ..tcp.stream import _connect_with_fallback
+from ..tls import TlsStream, TlsConfig
+from ..net import NetworkError
+from json import dumps, Value as JsonValue
+from ..net import SocketAddr
+from ..dns import resolve
+
+from ..http2.client import Http2ClientConnection
+from ..http2.hpack import HpackHeader
+from std.os import getenv
+from std.memory import Pointer
+from .client_pool import ClientPool
+from ._client.parse import (
+    _decode_chunked,
+    _extract_body_and_trailers,
+    _parse_http_response,
+    _read_http_response_framed_tcp,
+    _wire_method,
+    NO_REPLY_ERROR,
+    _read_http_response_framed_tls,
+    _read_http_response_tcp,
+    _read_http_response_tls,
+)
+from ._client.download import HttpDownload
+from ..runtime.pool import Pool
+from ._client.stream_request import prepare_stream_headers
+from ._client.stream_response import HttpStreamResponse
+from ._client.h2_download import Http2Download
+from ._client.h2_transport import _H2Transport
+from ._client.h2_send import (
+    H2Link,
+    h2_roundtrip,
+    _build_h2_request_headers,
+    _send_h2c_via_upgrade,
+)
+from ._client.idle_pool import IdleConnPool
+from ._client.tls_pool import TlsConnectionPool
+from ..net.socket import RawSocket
+from ..net._libc import (
+    AF_INET,
+    SOCK_STREAM,
+    INVALID_FD,
+)
+from std.ffi import c_int
+
+
+def _chunk_frame_prefix(n: Int) -> String:
+    """Return the chunked-transfer size line for a chunk of ``n`` bytes:
+    the lowercase hex length followed by CRLF (RFC 7230 sec 4.1). The
+    caller writes this, then the chunk bytes, then a trailing CRLF."""
+    if n <= 0:
+        return String("0\r\n")
+    var digits = String("0123456789abcdef")
+    var rev = List[UInt8]()
+    var v = n
+    while v > 0:
+        rev.append(digits.as_bytes()[v & 0xF])
+        v = v >> 4
+    var out = String("")
+    for i in range(len(rev) - 1, -1, -1):
+        out += String(unsafe_from_utf8=Span[UInt8, _](rev)[i : i + 1])
+    return out + "\r\n"
+
+
+def _same_origin(a: String, b: String) -> Bool:
+    """Scheme, host and port all equal (RFC 6454). Unparseable means
+    not the same."""
+    try:
+        var ua = Url.parse(a)
+        var ub = Url.parse(b)
+        return (
+            ua.scheme.lower() == ub.scheme.lower()
+            and ua.host.lower() == ub.host.lower()
+            and ua.port == ub.port
+        )
+    except:
+        return False
+
+
+def _is_idempotent(method: String) -> Bool:
+    """Whether ``method`` is idempotent per RFC 9110 sec 9.2.2 (safe to
+    send more than once with the same effect). Gates every automatic
+    replay. The ``Retry`` middleware uses the same set."""
+    from dodo.http.reliability import _is_idempotent_method
+
+    return _is_idempotent_method(method.upper())
+
+
+def _may_replay(method: String, write_failed: Bool, err: String) -> Bool:
+    """Whether a request that failed on a reused connection may be sent
+    again on a fresh one (RFC 9112 sec 9.3.1).
+
+    A failed write is the stale-connection signature before the
+    request reached the server. A read that failed before any reply
+    byte is the other (the peer closed an idle keep-alive), but the
+    request may have been processed, so only an idempotent one is
+    re-sent. Once reply bytes have arrived, nothing is re-sent.
+    """
+    if write_failed:
+        return True
+    # ``in``, not ``startswith``: String(e) prefixes the error type.
+    return NO_REPLY_ERROR in err and _is_idempotent(method)
+
+
+@fieldwise_init
+struct PoolStats(Copyable):
+    """A point-in-time view of an ``HttpClient``'s connection pools."""
+
+    var h1_idle: Int
+    """Idle cleartext HTTP/1.1 connections."""
+    var tls_idle: Int
+    """Idle HTTPS HTTP/1.1 connections."""
+
+
+comptime DODO_VERSION: String = "0.0.1"
+"""The library version, as reported in the default ``User-Agent``.
+
+Bump alongside ``pixi.toml`` at release."""
+
+comptime DEFAULT_USER_AGENT: String = "dodo/" + DODO_VERSION
+"""Default ``User-Agent`` sent when the caller does not set one."""
+
+
+struct HttpClient(Movable):
+    """A blocking HTTP client (HTTP/1.1 and HTTP/2).
+
+    Opens one connection per request by default; opt into keep-alive
+    reuse with :meth:`with_pool`. Follows
+    redirects per a configurable :meth:`with_redirect_policy`, optionally
+    auto-decompresses responses, retries transient failures via
+    :meth:`with_retry`, and keeps a session cookie jar via
+    :meth:`with_cookies`.
+
+    This type is ``Movable`` but not ``Copyable``. It supports the context
+    manager protocol (``__enter__``) for use with ``with``.
+
+    Constructors follow a natural ergonomic order:
+
+    - ``HttpClient()`` — defaults only
+    - ``HttpClient("https://api.example.com")`` — base URL positional
+    - ``HttpClient(BearerAuth("token"))`` — auth first
+    - ``HttpClient("https://api.example.com", BearerAuth("token"))`` — base URL + auth
+
+    Example:
+        ```mojo
+        # Simple one-liner
+        var resp = HttpClient().get("https://httpbin.org/get")
+
+        # Session with base URL and auth — no repeated prefixes
+        with HttpClient("https://api.example.com", BearerAuth("tok")) as c:
+            c.post("/items", '{"name": "dodo"}').raise_for_status()
+            var items = c.get("/items").json()
+        ```
+    """
+
+    var _config: TlsConfig
+    var _max_redirects: Int
+    var _timeout_ms: Int
+    var _user_agent: String
+    var _base_url: String
+    var _auth_header: String  # "" = no auth; "Basic ..." or "Bearer ..."
+    var _prefer_h2c: Bool
+    """When ``True``, ``http://`` requests speak HTTP/2 cleartext
+    via prior knowledge (RFC 9113 §3.4 connection preface
+    immediately, no ``Upgrade`` dance). Defaults to ``False``
+    so a plain ``HttpClient().get("http://...")`` keeps the
+    HTTP/1.1 wire it has always used. ``https://`` URLs are
+    independent of this flag -- they always advertise ALPN
+    ``["h2", "http/1.1"]`` and dispatch on what the server
+    picks."""
+    var _h2c_upgrade: Bool
+    """When ``True``, ``http://`` requests negotiate HTTP/2 over
+    cleartext via the RFC 7540 §3.2 Upgrade dance: send the
+    request as HTTP/1.1 with ``Connection: Upgrade,
+    HTTP2-Settings`` + ``Upgrade: h2c`` + ``HTTP2-Settings:
+    <base64url(SETTINGS)>``; if the server replies
+    ``101 Switching Protocols``, switch the connection to h2
+    and read the response from stream id 1. Servers that don't
+    speak h2 just answer the original request as h1 and the
+    client returns that response unchanged. Orthogonal to
+    :attr:`_prefer_h2c` (prior-knowledge path); both default
+    ``False``."""
+    var _pool: ClientPool
+    """Idle HTTP/1.1 connection pool keyed on ``(scheme, host,
+    port)``. ``ClientPool.disabled()`` (the default) keeps the
+    legacy close-after-each-request behaviour; calling
+    :meth:`with_pool` (or
+    :meth:`HttpClient.__init__(... pool=...)`) opts in. Only
+    cleartext ``http://`` requests reuse pooled fds; ``https://``
+    connections go through :attr:`_tls_pool`."""
+    var _h2_pool: IdleConnPool[H2Link]
+    """Idle HTTP/2 connections (h2 over TLS, and h2c prior knowledge)
+    keyed by ``scheme://host:port``, so consecutive h2 requests to one
+    origin share a connection. Freed in :meth:`__deinit__`."""
+    var _tls_pool: TlsConnectionPool
+    """Idle HTTPS (TLS HTTP/1.1) connection pool keyed on
+    ``scheme://host:port``, behind a pointer-backed interior-mutable
+    handle so the read-``self`` :meth:`_send_h2_or_h1_tls` can acquire /
+    release. ``TlsConnectionPool.disabled()`` (the default) keeps the
+    close-after-each-request behaviour; :meth:`with_pool` opts in
+    alongside the cleartext pool. Only the ``http/1.1`` ALPN result is
+    pooled (an ``h2`` connection is multiplexed on the h2 path). Freed
+    in :meth:`__deinit__`."""
+    var _redirect_policy: RedirectPolicy
+    """Redirect-following policy (RFC 9110 sec 15.4). Defaults to
+    :meth:`RedirectPolicy.follow_all` with the constructor's
+    ``max_redirects`` cap, preserving the legacy unconditional-follow
+    behaviour byte-for-byte. :meth:`with_redirect_policy` swaps in a
+    ``same_origin_only`` / ``deny`` policy; the decision (and any
+    cross-origin Authorization suppression) flows through
+    :meth:`RedirectPolicy.decide` in :meth:`_send_once`."""
+    var _auto_decompress: Bool
+    """When ``True`` (default), the client advertises
+    ``Accept-Encoding: gzip, deflate, br`` (unless the caller set one)
+    and transparently decodes a compressed response body via
+    :func:`dodo.http.encoding.decode_content`, stripping the
+    ``Content-Encoding`` header and fixing ``Content-Length``. Identity
+    / absent encodings pass through untouched, so a non-compressed
+    response is byte-for-byte unchanged."""
+    var _max_decompressed_bytes: Int
+    """Decompressed-size ceiling for auto-decompressed response bodies
+    (zip-bomb guard). Defaults to
+    :data:`dodo.http.encoding.DEFAULT_MAX_DECOMPRESSED_BYTES` (16 MiB);
+    change it via :meth:`with_max_decompressed_bytes`."""
+    var _retry: RetryPolicy
+    """Client request-level retry policy (distinct from the server-side
+    :class:`dodo.http.reliability.Retry` middleware). Only consulted
+    when :attr:`_retry_enabled` is set via :meth:`with_retry`."""
+    var _retry_enabled: Bool
+    """Whether :meth:`with_retry` opted this client into request
+    retries. ``False`` by default so a plain client issues exactly one
+    attempt per request (legacy behaviour)."""
+    var _proxy: String
+    """Explicit proxy URL (``http://host:port``) set via
+    :meth:`with_proxy`. When empty the standard ``HTTP_PROXY`` /
+    ``HTTPS_PROXY`` / ``NO_PROXY`` / ``ALL_PROXY`` env policy applies
+    (see :meth:`_resolve_proxy`)."""
+    var _cookies: CookieStore
+    """Per-client cookie jar behind a pointer-backed interior-mutable
+    handle. Disabled (no-op) by default;
+    :meth:`with_cookies` opts in. When enabled, :meth:`_send_once`
+    captures ``Set-Cookie`` response headers and replays them as a
+    ``Cookie`` request header. Freed in :meth:`__deinit__`."""
+    var _read_timeout_ms: Int
+    """Opt-in read timeout applied to every TCP and TLS connection
+    this client dials, via ``SO_RCVTIMEO`` on the underlying socket.
+    ``0`` (the default) leaves body reads unbounded;
+    :meth:`with_read_timeout` opts in. Distinct from
+    :attr:`_timeout_ms`, which bounds ``connect(2)`` and the TLS
+    handshake."""
+
+    def __init__(
+        out self,
+        base_url: String = "",
+        max_redirects: Int = 10,
+        timeout_ms: Int = 30_000,
+        user_agent: String = DEFAULT_USER_AGENT,
+        prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
+        auto_decompress: Bool = True,
+    ):
+        """Initialise an ``HttpClient`` with secure defaults.
+
+        Args:
+            base_url: Optional base URL prepended to relative paths.
+            max_redirects: Maximum number of redirects to follow (default 10).
+            timeout_ms: Connect timeout in milliseconds (default 30 s).
+                Body reads stay unbounded unless
+                :meth:`with_read_timeout` sets a read timeout.
+            user_agent: Value for the ``User-Agent`` header.
+            prefer_h2c: When ``True``, ``http://`` requests speak
+                HTTP/2 over cleartext via prior knowledge. ``https://``
+                requests always negotiate via ALPN regardless.
+            h2c_upgrade: When ``True``, ``http://`` requests issue an
+                HTTP/1.1 ``Upgrade: h2c`` handshake (RFC 7540 §3.2)
+                instead of using prior knowledge; the connection switches
+                to HTTP/2 only if the server returns ``101 Switching
+                Protocols``, otherwise it stays on HTTP/1.1.
+            auto_decompress: When ``True`` (default), compressed response
+                bodies are decoded transparently.
+        """
+        self._config = TlsConfig()
+        self._max_redirects = max_redirects
+        self._timeout_ms = timeout_ms
+        self._user_agent = user_agent
+        self._base_url = base_url
+        self._auth_header = ""
+        self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
+        self._pool = ClientPool.disabled()
+        self._h2_pool = IdleConnPool[H2Link].new()
+        self._tls_pool = TlsConnectionPool.disabled()
+        self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
+        self._auto_decompress = auto_decompress
+        self._max_decompressed_bytes = DEFAULT_MAX_DECOMPRESSED_BYTES
+        self._retry = RetryPolicy()
+        self._retry_enabled = False
+        self._cookies = CookieStore.disabled()
+        self._proxy = String("")
+        self._read_timeout_ms = 0
+
+    def __init__(
+        out self,
+        tls: TlsConfig,
+        base_url: String = "",
+        max_redirects: Int = 10,
+        timeout_ms: Int = 30_000,
+        user_agent: String = DEFAULT_USER_AGENT,
+        prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
+        auto_decompress: Bool = True,
+    ):
+        """Initialise an ``HttpClient`` with custom TLS configuration."""
+        self._config = tls.copy()
+        self._max_redirects = max_redirects
+        self._timeout_ms = timeout_ms
+        self._user_agent = user_agent
+        self._base_url = base_url
+        self._auth_header = ""
+        self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
+        self._pool = ClientPool.disabled()
+        self._h2_pool = IdleConnPool[H2Link].new()
+        self._tls_pool = TlsConnectionPool.disabled()
+        self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
+        self._auto_decompress = auto_decompress
+        self._max_decompressed_bytes = DEFAULT_MAX_DECOMPRESSED_BYTES
+        self._retry = RetryPolicy()
+        self._retry_enabled = False
+        self._cookies = CookieStore.disabled()
+        self._proxy = String("")
+        self._read_timeout_ms = 0
+
+    def __init__[
+        A: Auth
+    ](
+        out self,
+        auth: A,
+        base_url: String = "",
+        max_redirects: Int = 10,
+        timeout_ms: Int = 30_000,
+        user_agent: String = DEFAULT_USER_AGENT,
+        prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
+        auto_decompress: Bool = True,
+    ) raises:
+        """Initialise an ``HttpClient`` with authentication."""
+        self._config = TlsConfig()
+        self._max_redirects = max_redirects
+        self._timeout_ms = timeout_ms
+        self._user_agent = user_agent
+        self._base_url = base_url
+        var auth_headers = HeaderMap()
+        auth.apply(auth_headers)
+        self._auth_header = auth_headers.get("Authorization")
+        self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
+        self._pool = ClientPool.disabled()
+        self._h2_pool = IdleConnPool[H2Link].new()
+        self._tls_pool = TlsConnectionPool.disabled()
+        self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
+        self._auto_decompress = auto_decompress
+        self._max_decompressed_bytes = DEFAULT_MAX_DECOMPRESSED_BYTES
+        self._retry = RetryPolicy()
+        self._retry_enabled = False
+        self._cookies = CookieStore.disabled()
+        self._proxy = String("")
+        self._read_timeout_ms = 0
+
+    def __init__[
+        A: Auth
+    ](
+        out self,
+        base_url: String,
+        auth: A,
+        max_redirects: Int = 10,
+        timeout_ms: Int = 30_000,
+        user_agent: String = DEFAULT_USER_AGENT,
+        prefer_h2c: Bool = False,
+        h2c_upgrade: Bool = False,
+        auto_decompress: Bool = True,
+    ) raises:
+        """Initialise an ``HttpClient`` with a base URL and authentication."""
+        self._config = TlsConfig()
+        self._max_redirects = max_redirects
+        self._timeout_ms = timeout_ms
+        self._user_agent = user_agent
+        self._base_url = base_url
+        var auth_headers = HeaderMap()
+        auth.apply(auth_headers)
+        self._auth_header = auth_headers.get("Authorization")
+        self._prefer_h2c = prefer_h2c
+        self._h2c_upgrade = h2c_upgrade
+        self._pool = ClientPool.disabled()
+        self._h2_pool = IdleConnPool[H2Link].new()
+        self._tls_pool = TlsConnectionPool.disabled()
+        self._redirect_policy = RedirectPolicy.follow_all(max_redirects)
+        self._auto_decompress = auto_decompress
+        self._max_decompressed_bytes = DEFAULT_MAX_DECOMPRESSED_BYTES
+        self._retry = RetryPolicy()
+        self._retry_enabled = False
+        self._cookies = CookieStore.disabled()
+        self._proxy = String("")
+        self._read_timeout_ms = 0
+
+    def __deinit__(deinit self):
+        """Free the pools and cookie jar owned by this client.
+
+        Idempotent on a moved-from client (``_pool._addr == 0``).
+        ``HttpClient`` is :trait:`Movable` only, so each heap state is
+        freed exactly once."""
+        try:
+            self._pool.free()
+        except:
+            pass
+        try:
+            self._h2_pool.free()
+        except:
+            pass
+        try:
+            self._tls_pool.free()
+        except:
+            pass
+        try:
+            self._cookies.free()
+        except:
+            pass
+
+    def with_pool(
+        var self,
+        max_idle_per_host: Int = 8,
+        max_idle_total: Int = 64,
+        idle_timeout_ms: Int = 90_000,
+    ) raises -> HttpClient:
+        """Enable connection pooling on this client.
+
+        Returns the client (move-in / move-out so the call chains
+        with the regular ``HttpClient(...)`` constructor). Two pools
+        are enabled, both keyed on the origin: the cleartext HTTP/1.1
+        pool (``http://``, reuses idle fds) and the HTTPS HTTP/1.1 pool
+        (``https://``, reuses the whole established ``TlsStream`` so the
+        TLS handshake is skipped on keep-alive reuse). An ``h2``-
+        negotiated TLS connection is multiplexed on the h2 path and is
+        not pooled here.
+
+        Args:
+            max_idle_per_host: Per-origin idle cap. Default ``8``.
+            max_idle_total: Total idle cap across origins (cleartext
+                pool). Default ``64``. ``0`` disables the total cap.
+            idle_timeout_ms: Max wallclock age for a pooled connection
+                before lazy eviction. Default ``90_000`` ms.
+
+        Returns:
+            ``self`` with pooling enabled.
+
+        Example:
+            ```mojo
+            with HttpClient(base_url="https://api.example.com")
+                .with_pool() as c:
+                # Two GETs reuse the same TLS connection on idle reuse.
+                _ = c.get("/users")
+                _ = c.get("/items")
+            ```
+        """
+        try:
+            self._pool.free()
+        except:
+            pass
+        self._pool = ClientPool.new(
+            max_idle_per_host=max_idle_per_host,
+            max_idle_total=max_idle_total,
+            idle_timeout_ms=idle_timeout_ms,
+        )
+        try:
+            self._tls_pool.free()
+        except:
+            pass
+        self._tls_pool = TlsConnectionPool.new(
+            max_idle_per_host=max_idle_per_host,
+            idle_timeout_ms=idle_timeout_ms,
+        )
+        return self^
+
+    def idle_count(imm self) -> Int:
+        """Return the total number of connections currently sitting idle
+        across both keep-alive pools (cleartext HTTP/1.1 fds + HTTPS
+        ``TlsStream`` connections). Returns 0 when pooling is disabled.
+        """
+        return self._pool.total_idle() + self._tls_pool.idle_count()
+
+    def tls_idle_count(imm self) -> Int:
+        """Return the number of idle HTTPS (TLS HTTP/1.1) connections in
+        the pool. Returns 0 when pooling is disabled."""
+        return self._tls_pool.idle_count()
+
+    def with_h2c(
+        var self, prior_knowledge: Bool = True, upgrade: Bool = False
+    ) -> HttpClient:
+        """Choose how cleartext HTTP/2 is reached.
+
+        Args:
+            prior_knowledge: Open with the HTTP/2 preface directly, no
+                negotiation. Correct when you already know the origin
+                speaks h2c.
+            upgrade: Offer ``Upgrade: h2c`` on an HTTP/1.1 request and
+                switch on a 101. Costs a round trip; works against an
+                origin you have not probed. The streaming calls
+                (:meth:`get_streaming` and friends) do not take this
+                path -- they use prior knowledge when it is set and
+                HTTP/1.1 otherwise.
+
+        Returns:
+            The client, for chaining.
+        """
+        self._prefer_h2c = prior_knowledge
+        self._h2c_upgrade = upgrade
+        return self^
+
+    def pool_stats(imm self) -> PoolStats:
+        """Idle-connection counts for the cleartext and TLS pools.
+
+        ``idle_count()`` is ``h1_idle + tls_idle``.
+
+        Returns:
+            A snapshot; the pools keep moving after it is taken.
+        """
+        return PoolStats(
+            h1_idle=self._pool.total_idle(),
+            tls_idle=self._tls_pool.idle_count(),
+        )
+
+    def with_read_timeout(var self, ms: Int) -> HttpClient:
+        """Bound body reads, not just ``connect(2)`` (move-in /
+        move-out so it chains off the constructor like
+        :meth:`with_pool`).
+
+        ``timeout_ms`` only ever reached ``connect``; once the
+        connection was up a read could block forever. That is what a
+        half-open connection looks like to the client -- the network
+        drops after the request goes out, the peer never learns it
+        should FIN, and ``recv`` waits for bytes that will never
+        arrive. ``ms`` sets ``SO_RCVTIMEO`` on the socket, so a read
+        that stalls that long raises ``Timeout`` instead.
+
+        The bound is per-read inactivity, not a deadline on the whole
+        response: a large body that keeps arriving never trips it, and
+        a stalled one trips it after ``ms`` of silence. The client has
+        no whole-request deadline.
+
+        Set it before the first request. The timeout rides on the
+        socket, so a connection keeps it for its whole lifetime.
+        Cleartext pooled fds are re-armed on checkout; pooled TLS
+        connections keep whatever was armed when they were dialled,
+        and lowering ``ms`` to ``0`` clears neither.
+
+        Args:
+            ms: Read timeout in milliseconds. ``0`` (the default)
+                disables it and restores the unbounded behaviour.
+
+        Returns:
+            The client, for chaining.
+
+        Example:
+            ```mojo
+            with HttpClient().with_read_timeout(10_000) as c:
+                _ = c.get("https://example.com/")
+            ```
+        """
+        self._read_timeout_ms = ms
+        return self^
+
+    def _arm_read_timeout(self, stream: TcpStream) raises:
+        """Apply :attr:`_read_timeout_ms` to a TCP connection about to
+        carry a request -- a fresh dial, or a pooled fd rewrapped on
+        checkout. A no-op when no read timeout is configured, so it
+        never clears one already on the socket."""
+        if self._read_timeout_ms > 0:
+            stream.set_recv_timeout(self._read_timeout_ms)
+
+    def _arm_read_timeout(self, stream: TlsStream) raises:
+        """Apply :attr:`_read_timeout_ms` to a freshly dialled TLS
+        connection (it delegates to the underlying TCP socket). A
+        no-op when no read timeout is configured. Pooled TLS
+        connections are not re-armed on checkout -- they still carry
+        what was armed at dial time."""
+        if self._read_timeout_ms > 0:
+            stream.set_recv_timeout(self._read_timeout_ms)
+
+    def with_redirect_policy(var self, policy: RedirectPolicy) -> HttpClient:
+        """Set the redirect-following policy (move-in / move-out so it
+        chains off the constructor like :meth:`with_pool`).
+
+        The default (:meth:`RedirectPolicy.follow_all`) preserves the
+        legacy unconditional-follow behaviour. Swap in
+        :meth:`RedirectPolicy.same_origin_only` to refuse cross-origin
+        redirects (and never leak the Authorization header across
+        origins), or :meth:`RedirectPolicy.deny` to surface 3xx
+        responses to the caller unfollowed.
+
+        Example:
+            ```mojo
+            var pol = RedirectPolicy.same_origin_only(max_redirects=5)
+            with HttpClient("https://api.example.com")
+                .with_redirect_policy(pol) as c:
+                _ = c.get("/protected")
+            ```
+        """
+        self._redirect_policy = policy.copy()
+        return self^
+
+    def with_retry(var self, policy: RetryPolicy = RetryPolicy()) -> HttpClient:
+        """Opt into request-level retries on transient failure
+        (move-in / move-out, chains off the constructor).
+
+        Retries fire when a request raises (connection/I/O error) or
+        returns a ``>= 500`` status, up to ``policy.max_attempts``
+        total attempts. By default only idempotent methods (RFC 9110
+        sec 9.2.2) are retried; set ``policy.retry_only_idempotent =
+        False`` to retry any method. Backoff follows the same jittered
+        exponential schedule as the server-side
+        :class:`dodo.http.reliability.Retry` middleware.
+
+        Example:
+            ```mojo
+            var pol = RetryPolicy()
+            pol.max_attempts = 4
+            pol.initial_backoff_ms = 50
+            with HttpClient().with_retry(pol) as c:
+                _ = c.get("https://flaky.example.com/data")
+            ```
+        """
+        self._retry = policy.copy()
+        self._retry_enabled = True
+        return self^
+
+    def with_max_decompressed_bytes(var self, n: Int) -> HttpClient:
+        """Set the decompressed-size ceiling for auto-decompressed
+        response bodies (move-in / move-out, chains off the constructor).
+
+        Guards against a decompression bomb: a small compressed body that
+        inflates without bound. Defaults to 16 MiB; raise or lower it to
+        fit the largest legitimate response this client expects.
+
+        Example:
+            ```mojo
+            with HttpClient().with_max_decompressed_bytes(64 * 1024 * 1024) as c:
+                _ = c.get("https://example.com/big.json.gz")
+            ```
+        """
+        self._max_decompressed_bytes = n
+        return self^
+
+    def with_proxy(var self, proxy_url: String) raises -> HttpClient:
+        """Route every request through the HTTP proxy at ``proxy_url``
+        (move-in / move-out, chains off the constructor).
+
+        Establishes a ``CONNECT`` tunnel to the origin through the proxy
+        for both ``http://`` and ``https://`` (TLS then runs over the
+        tunnel). Overrides the ``HTTP_PROXY`` / ``HTTPS_PROXY`` env
+        policy; ``NO_PROXY`` is still honored. Pass ``""`` to clear.
+
+        Example:
+            ```mojo
+            with HttpClient().with_proxy("http://127.0.0.1:8080") as c:
+                var r = c.get("http://example.com/")
+            ```
+        """
+        self._proxy = proxy_url
+        return self^
+
+    def with_cookies(var self) raises -> HttpClient:
+        """Enable a per-client cookie jar (move-in / move-out, chains
+        off the constructor).
+
+        When enabled, the client captures ``Set-Cookie`` response
+        headers and replays the stored cookies as a ``Cookie`` request
+        header on subsequent requests -- the standard session-cookie
+        flow for a logged-in client. The jar is origin-agnostic (every
+        stored cookie is sent on every request from this client), which
+        matches the common single-origin ``HttpClient(base_url=...)``
+        session.
+
+        Example:
+            ```mojo
+            with HttpClient("https://api.example.com")
+                .with_cookies() as c:
+                _ = c.post("/login", '{"u":"a","p":"b"}')  # stores session
+                _ = c.get("/me")                            # replays cookie
+            ```
+        """
+        try:
+            self._cookies.free()
+        except:
+            pass
+        self._cookies = CookieStore.new()
+        return self^
+
+    def cookie_header(imm self, url: String) raises -> String:
+        """The ``Cookie`` request header value the jar would send to
+        ``url``, or ``""`` when cookies are disabled / none match.
+        Useful for tests and introspection."""
+        return self._cookies.request_header(self._resolve_url(url))
+
+    def _send_h2_or_h1_tls(
+        self,
+        u: Url,
+        method: String,
+        extra_headers: HeaderMap,
+        body: List[UInt8],
+        wire: String,
+        auth_header: String,
+    ) raises -> Response:
+        """The proven TLS path: ALPN-negotiate ``["h2", "http/1.1"]``
+        and drive the request over HTTP/2 (via the internal
+        :class:`Http2ClientConnection`) or HTTP/1.1, returning a
+        :class:`Response` either way so the caller can't tell which
+        wire was used. Used both as the direct h2/h1 path and as the
+        h2 leg of the happy-eyeballs race. ``auth_header`` is the
+        effective Authorization value for this hop (the h1 ``wire``
+        already carries it; this gates the h2 path).
+
+        When :meth:`with_pool` enabled the HTTPS pool, an idle
+        ``http/1.1``-over-TLS connection is reused (skipping the TLS
+        handshake) and returned to the pool when the response permits
+        keep-alive; a stale pooled connection is dropped and the
+        request retried once on a fresh dial (RFC 7230 sec 6.3.1). An
+        ``h2`` connection is never pooled here."""
+        var proxy = self._resolve_proxy(u)
+        # A proxy tunnel dials a fresh CONNECT each time; pooled direct
+        # connections would bypass the proxy, so pooling is off when one
+        # is active.
+        var pool_on = self._tls_pool.enabled() and proxy.byte_length() == 0
+        var key = TlsConnectionPool.build_key(u.scheme, u.host, Int(u.port))
+
+        # 0. Reuse a pooled h2 connection to this origin.
+        if proxy.byte_length() == 0:
+            var reused_h2 = self._h2_pooled(
+                key, u, method, extra_headers, body, auth_header
+            )
+            if reused_h2:
+                return reused_h2.take()
+
+        # 1. Reuse a pooled http/1.1-over-TLS connection if available.
+        #    The helper owns the moved-in stream so a stale connection
+        #    is closed there and signalled back as a miss (None).
+        if pool_on:
+            var pooled = self._tls_pool.acquire(key)
+            if pooled:
+                var reused = self._send_h1_tls_pooled_once(
+                    key, pooled.take(), wire, body
+                )
+                if reused:
+                    return reused.take()
+                # Stale pooled connection: dial fresh below.
+
+        # 2. Fresh dial with ALPN negotiation.
+        var tls_cfg = self._config.copy()
+        if len(tls_cfg.alpn) == 0:
+            tls_cfg.alpn = List[String]()
+            tls_cfg.alpn.append("h2")
+            tls_cfg.alpn.append("http/1.1")
+        var stream: TlsStream
+        if proxy.byte_length() > 0:
+            var tcp = self._connect_tunnel(proxy, u.host, u.port)
+            stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg)
+        else:
+            stream = TlsStream.connect_timeout(
+                u.host, u.port, tls_cfg, self._timeout_ms
+            )
+        self._arm_read_timeout(stream)
+        var negotiated = stream.alpn_selected()
+        if negotiated == "h2":
+            var link = H2Link(stream^)
+            var resp_h2 = h2_roundtrip(
+                link,
+                method,
+                u,
+                extra_headers,
+                body,
+                self._user_agent,
+                auth_header,
+            )
+            self._h2_release(key, link^, proxy.byte_length() == 0)
+            return resp_h2^
+        # HTTP/1.1 over TLS.
+        var wire_bytes = wire.as_bytes()
+        stream.write_all(Span[UInt8, _](wire_bytes))
+        if len(body) > 0:
+            stream.write_all(Span[UInt8, _](body))
+        if pool_on:
+            # Framed read so the connection can return to the pool.
+            var can_reuse2 = False
+            var resp_f = _read_http_response_framed_tls(
+                stream, can_reuse2, method
+            )
+            if can_reuse2:
+                self._tls_pool.release(key, stream^)
+            else:
+                stream.close()
+            return resp_f^
+        var resp = _read_http_response_tls(stream, method)
+        stream.close()
+        return resp^
+
+    def _h2_pooled(
+        self,
+        key: String,
+        u: Url,
+        method: String,
+        extra_headers: HeaderMap,
+        body: List[UInt8],
+        auth_header: String,
+    ) raises -> Optional[Response]:
+        """Run the request on a pooled HTTP/2 connection to ``key``, if
+        one is idle and usable; None means dial a fresh one. A pooled
+        connection that fails (closed while idle) is dropped; the request
+        is then re-sent on a fresh connection only when it is idempotent,
+        since the server may have processed it."""
+        var pooled = self._h2_pool.acquire(key)
+        if not pooled:
+            return None
+        var link = pooled.take()
+        if not link.usable():
+            link.retire()
+            return None
+        var resp: Response
+        try:
+            resp = h2_roundtrip(
+                link,
+                method,
+                u,
+                extra_headers,
+                body,
+                self._user_agent,
+                auth_header,
+            )
+        except e:
+            link.close()
+            if not _is_idempotent(method):
+                raise e^
+            return None
+        self._h2_release(key, link^, True)
+        return Optional(resp^)
+
+    def _h2_release(self, key: String, var link: H2Link, poolable: Bool) raises:
+        """Keep ``link`` for the next request to ``key`` (when it can take
+        one), else GOAWAY and close it."""
+        if poolable and link.usable():
+            self._h2_pool.release(key, link^)
+        else:
+            link.retire()
+
+    def _send_h1_tls_pooled_once(
+        self,
+        key: String,
+        var st: TlsStream,
+        wire: String,
+        body: List[UInt8],
+    ) raises -> Optional[Response]:
+        """Drive one HTTP/1.1 request over a pooled ``TlsStream``.
+
+        Owns ``st``: on a clean keep-alive response the stream is
+        released back to the pool and the ``Response`` is returned; on a
+        stale connection (write/read failure -- the canonical idle-keep-
+        alive-closed signature) the stream is closed and ``None`` is
+        returned so the caller dials a fresh connection (RFC 7230
+        sec 6.3.1)."""
+        var io_failed = False
+        try:
+            var wb = wire.as_bytes()
+            st.write_all(Span[UInt8, _](wb))
+            if len(body) > 0:
+                st.write_all(Span[UInt8, _](body))
+        except:
+            io_failed = True
+        var read_err = String("")
+        if not io_failed:
+            var can_reuse = False
+            var parsed = True
+            var resp = Response(0, "", List[UInt8]())
+            try:
+                resp = _read_http_response_framed_tls(
+                    st, can_reuse, _wire_method(wire)
+                )
+            except e:
+                parsed = False
+                read_err = String(e)
+            if parsed:
+                if can_reuse:
+                    self._tls_pool.release(key, st^)
+                else:
+                    st.close()
+                return Optional(resp^)
+        st.close()
+        # Signal a pool miss (the caller dials fresh and re-sends) only
+        # when re-sending cannot repeat the request's effect.
+        if not _may_replay(_wire_method(wire), io_failed, read_err):
+            raise NetworkError("HTTPS/1.1 request failed: " + read_err)
+        return None
+
+    # ── Streaming request body ────────────────────────────────────────────────
+
+    def send_chunked[
+        B: ChunkSource
+    ](
+        self,
+        method: String,
+        url: String,
+        mut source: B,
+        content_type: String = "application/octet-stream",
+        body_size: Int = -1,
+        cancel: Cancel = Cancel.never(),
+    ) raises -> Response:
+        """Send a request whose body is streamed from a ``ChunkSource``
+        using ``Transfer-Encoding: chunked``, without materializing the
+        full body in memory.
+
+        For large uploads (multi-MB / multi-GB) this keeps client memory
+        bounded to one chunk in flight: the source's ``next(cancel)`` is
+        pulled, framed as a chunked-transfer chunk, and written straight
+        to the socket. The body is never assembled into a single buffer.
+
+        This is an explicit bounded-memory path over HTTP/1.1 (cleartext
+        or TLS, ALPN forced to ``http/1.1``); it deliberately does not
+        go through connection pooling, redirects, retries, or h2
+        (all of which buffer or re-send the body). Use :meth:`post` /
+        :meth:`send` for those.
+
+        Args:
+            method: HTTP method (e.g. ``"POST"`` / ``"PUT"``).
+            url: Target URL (absolute or relative to ``base_url``).
+            source: A ``ChunkSource`` yielding body chunks; pulled to
+                exhaustion (``next`` returns ``None``).
+            content_type: ``Content-Type`` header value. Defaults to
+                ``application/octet-stream``.
+            body_size: Total body length in bytes when known (sent as
+                ``Content-Length``); negative selects chunked framing.
+            cancel: Cancellation token checked while the body is pulled.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+        """
+        var u = Url.parse(self._resolve_url(url))
+
+        var host_header = u.host
+        if (u.scheme == "http" and u.port != 80) or (
+            u.scheme == "https" and u.port != 443
+        ):
+            host_header = host_header + ":" + String(Int(u.port))
+
+        var wire = method + " " + u.request_target() + " HTTP/1.1\r\n"
+        wire += "Host: " + host_header + "\r\n"
+        wire += "User-Agent: " + self._user_agent + "\r\n"
+        wire += "Accept: */*\r\n"
+        wire += "Content-Type: " + content_type + "\r\n"
+        if body_size >= 0:
+            # Known length: Content-Length is cheaper on the wire than
+            # chunk framing and lets the origin size its buffer up front.
+            wire += "Content-Length: " + String(body_size) + "\r\n"
+        else:
+            wire += "Transfer-Encoding: chunked\r\n"
+        # Streaming uploads do not pool the connection.
+        wire += "Connection: close\r\n"
+        wire += "\r\n"
+
+        if u.is_tls():
+            return self._send_chunked_tls(u, wire, source, body_size, cancel)
+        return self._send_chunked_tcp(u, wire, source, body_size, cancel)
+
+    def _send_chunked_tcp[
+        B: ChunkSource
+    ](
+        self,
+        u: Url,
+        wire: String,
+        mut source: B,
+        body_size: Int,
+        cancel: Cancel,
+    ) raises -> Response:
+        var stream = _connect_with_fallback(u.host, u.port, self._timeout_ms)
+        self._arm_read_timeout(stream)
+        var wb = wire.as_bytes()
+        stream.write_all(Span[UInt8, _](wb))
+        # One chunk in flight at a time -- the body is never materialized.
+        while True:
+            var chunk_opt = source.next(cancel)
+            if not chunk_opt:
+                break
+            var chunk = chunk_opt.take()
+            if len(chunk) == 0:
+                continue
+            if body_size >= 0:
+                stream.write_all(Span[UInt8, _](chunk))
+            else:
+                var frame = _chunk_frame_prefix(len(chunk))
+                var fb = frame.as_bytes()
+                stream.write_all(Span[UInt8, _](fb))
+                stream.write_all(Span[UInt8, _](chunk))
+                var crlf = String("\r\n")
+                var cb = crlf.as_bytes()
+                stream.write_all(Span[UInt8, _](cb))
+        if body_size < 0:
+            # Chunked only: a Content-Length body ends at its length.
+            # Reaching here means the source completed, so the
+            # terminator is owed. A source that raised never gets here,
+            # which is deliberate -- a truncated body must not be framed
+            # as a complete one.
+            var last = String("0\r\n\r\n")
+            var lb = last.as_bytes()
+            stream.write_all(Span[UInt8, _](lb))
+        var resp = _read_http_response_tcp(stream)
+        stream.close()
+        return resp^
+
+    def _send_chunked_tls[
+        B: ChunkSource
+    ](
+        self,
+        u: Url,
+        wire: String,
+        mut source: B,
+        body_size: Int,
+        cancel: Cancel,
+    ) raises -> Response:
+        # Force http/1.1 -- a chunked upload is an h1 construct.
+        var tls_cfg = self._config.copy()
+        tls_cfg.alpn = List[String]()
+        tls_cfg.alpn.append("http/1.1")
+        var stream = TlsStream.connect_timeout(
+            u.host, u.port, tls_cfg, self._timeout_ms
+        )
+        self._arm_read_timeout(stream)
+        var wb = wire.as_bytes()
+        stream.write_all(Span[UInt8, _](wb))
+        while True:
+            var chunk_opt = source.next(cancel)
+            if not chunk_opt:
+                break
+            var chunk = chunk_opt.take()
+            if len(chunk) == 0:
+                continue
+            if body_size >= 0:
+                stream.write_all(Span[UInt8, _](chunk))
+            else:
+                var frame = _chunk_frame_prefix(len(chunk))
+                var fb = frame.as_bytes()
+                stream.write_all(Span[UInt8, _](fb))
+                stream.write_all(Span[UInt8, _](chunk))
+                var crlf = String("\r\n")
+                var cb = crlf.as_bytes()
+                stream.write_all(Span[UInt8, _](cb))
+        if body_size < 0:
+            # Chunked only: a Content-Length body ends at its length.
+            # Reaching here means the source completed, so the
+            # terminator is owed. A source that raised never gets here,
+            # which is deliberate -- a truncated body must not be framed
+            # as a complete one.
+            var last = String("0\r\n\r\n")
+            var lb = last.as_bytes()
+            stream.write_all(Span[UInt8, _](lb))
+        var resp = _read_http_response_tls(stream)
+        stream.close()
+        return resp^
+
+    # ── Context manager ───────────────────────────────────────────────────────
+
+    def __enter__(var self) -> HttpClient:
+        """Transfer ownership of ``self`` into the ``with`` block.
+
+        Returns:
+            This ``HttpClient`` (moved).
+        """
+        return self^
+
+    # ── Factory ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def default() -> HttpClient:
+        """Return a client with secure defaults (TLS verification enabled).
+
+        Returns:
+            An ``HttpClient`` with 30-second timeout and TLS verification.
+        """
+        return HttpClient()
+
+    # ── URL resolution ────────────────────────────────────────────────────────
+
+    def _resolve_url(self, url: String) -> String:
+        """Prepend ``_base_url`` if ``url`` is a relative path.
+
+        Args:
+            url: The URL or path to resolve.
+
+        Returns:
+            Absolute URL string.
+        """
+        if self._base_url.byte_length() == 0:
+            return url
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        return self._base_url + url
+
+    # ── Proxy (CONNECT tunnel + env policy) ────────────────────────────────────
+
+    def _resolve_proxy(self, u: Url) raises -> String:
+        """Return the proxy URL to use for ``u`` per the standard env
+        policy, or ``""`` for a direct connection.
+
+        Honors ``NO_PROXY`` (comma-separated host suffixes; ``*`` bypasses
+        all), then ``HTTPS_PROXY`` / ``HTTP_PROXY`` by scheme, falling
+        back to ``ALL_PROXY`` (lowercase variants accepted, matching
+        curl / requests).
+        """
+        var host = u.host.lower()
+        var no = getenv("NO_PROXY", getenv("no_proxy", ""))
+        if no.byte_length() > 0:
+            if no == "*":
+                return ""
+            for entry in no.split(","):
+                var e = String(entry).strip().lower()
+                if e.byte_length() == 0:
+                    continue
+                if host == e or host.endswith("." + e):
+                    return ""
+        # Explicit with_proxy() overrides env.
+        if self._proxy.byte_length() > 0:
+            return self._proxy
+        if u.is_tls():
+            var ph = getenv("HTTPS_PROXY", getenv("https_proxy", ""))
+            if ph.byte_length() > 0:
+                return ph
+        else:
+            var ph = getenv("HTTP_PROXY", getenv("http_proxy", ""))
+            if ph.byte_length() > 0:
+                return ph
+        return getenv("ALL_PROXY", getenv("all_proxy", ""))
+
+    def _connect_tunnel(
+        self, proxy_url: String, host: String, port: UInt16
+    ) raises -> TcpStream:
+        """Open a TCP connection to ``proxy_url`` and establish a
+        ``CONNECT host:port`` tunnel, returning the tunneled stream ready
+        to carry the origin request (cleartext GET or a TLS handshake).
+        """
+        var pu = Url.parse(proxy_url)
+        var tcp = _connect_with_fallback(pu.host, pu.port, self._timeout_ms)
+        self._arm_read_timeout(tcp)
+        var target = host + ":" + String(Int(port))
+        var req = String("CONNECT ") + target + " HTTP/1.1\r\n"
+        req += "Host: " + target + "\r\n"
+        req += "Proxy-Connection: keep-alive\r\n\r\n"
+        var rb = req.as_bytes()
+        tcp.write_all(Span[UInt8, _](rb))
+        # Read the proxy response head (until CRLFCRLF) and require 2xx.
+        var buf = List[UInt8](capacity=1024)
+        buf.resize(1024, 0)
+        var acc = List[UInt8]()
+        var hdr_end = -1
+        while hdr_end < 0:
+            var n = tcp.read(buf.unsafe_ptr(), 1024)
+            if n == 0:
+                raise NetworkError("proxy CONNECT: closed before reply")
+            for i in range(n):
+                acc.append(buf[i])
+            var m = len(acc)
+            if m >= 4:
+                for j in range(m - 3):
+                    if (
+                        acc[j] == 13
+                        and acc[j + 1] == 10
+                        and acc[j + 2] == 13
+                        and acc[j + 3] == 10
+                    ):
+                        hdr_end = j
+                        break
+        # Status line: "HTTP/1.1 200 ...". Require the code to start '2'.
+        var line_end = 0
+        while line_end < len(acc) and acc[line_end] != 13:
+            line_end += 1
+        var sp = 0
+        while sp < line_end and acc[sp] != 32:
+            sp += 1
+        if sp + 1 >= line_end or acc[sp + 1] != UInt8(ord("2")):
+            raise NetworkError("proxy CONNECT: non-2xx from proxy")
+        return tcp^
+
+    # ── High-level helpers ────────────────────────────────────────────────────
+
+    def get(self, url: String) raises -> Response:
+        """Perform a GET request.
+
+        Args:
+            url: The URL to request (``http://``, ``https://``, or relative
+                 path when ``base_url`` is set).
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var req = Request(method=Method.GET, url=self._resolve_url(url))
+        return self.send(req)
+
+    def get_streaming(self, url: String) raises -> HttpStreamResponse:
+        """Stream a GET response body without buffering it.
+
+        Works on ``http://`` and ``https://`` alike. The wire is chosen
+        the way :meth:`send` chooses it, with one exception: ALPN
+        settles h2 versus HTTP/1.1 on TLS, and cleartext uses HTTP/1.1
+        unless :meth:`with_h2c` asked for prior-knowledge h2c. The
+        ``Upgrade: h2c`` handshake is the exception -- a streaming
+        response cannot be re-read if the origin declines the upgrade,
+        so this path stays on HTTP/1.1 rather than guessing.
+
+        The response head is parsed before this returns; the body is
+        pulled by :meth:`HttpStreamResponse.read_chunk`, so a
+        multi-gigabyte download costs one buffer rather than one
+        allocation the size of the body. The connection is exclusive to
+        this response and is not pooled.
+
+        Args:
+            url: Absolute URL, or a path when the client has a base URL.
+
+        Returns:
+            The response head plus an incremental body reader.
+
+        Raises:
+            NetworkError: On a connect, TLS or read failure.
+            Error: On an unparseable URL.
+        """
+        var req = Request(method=String("GET"), url=self._resolve_url(url))
+        return self.send_streaming(req^)
+
+    def post_streaming(
+        self, url: String, body: String
+    ) raises -> HttpStreamResponse:
+        """POST a JSON body and stream the response.
+
+        The shape server-sent events and JSON-lines APIs want: a small
+        request, then a response read incrementally for as long as the
+        server keeps writing.
+
+        Args:
+            url: Absolute URL, or a path when the client has a base URL.
+            body: Request body, sent as ``application/json``.
+
+        Returns:
+            The response head plus an incremental body reader.
+
+        Raises:
+            NetworkError: On a connect, TLS or read failure.
+        """
+        var req = Request(method=String("POST"), url=self._resolve_url(url))
+        req.headers.set("content-type", "application/json")
+        req.body = List[UInt8](body.as_bytes())
+        return self.send_streaming(req^)
+
+    def send_streaming(self, var req: Request) raises -> HttpStreamResponse:
+        """Send ``req`` and stream the response body.
+
+        The primitive the other two are written in terms of. Redirects,
+        retries and cookie handling apply only up to the point the head
+        is parsed; after that the body belongs to the caller and cannot
+        be replayed, so nothing re-sends it.
+
+        Args:
+            req: The request (ownership transferred). Framing headers on
+                it are ignored -- the writer owns framing.
+
+        Returns:
+            The response head plus an incremental body reader.
+
+        Raises:
+            NetworkError: On a connect, TLS or read failure.
+            Error: On an unparseable URL or an unusable header.
+        """
+        var u = Url.parse(self._resolve_url(req.url))
+        var headers = prepare_stream_headers(
+            req.method, u, req.headers, self._user_agent
+        )
+        if self._auth_header != "":
+            headers.set("authorization", self._auth_header)
+        if self._cookies.enabled():
+            var cookie = self._cookies.request_header(
+                self._resolve_url(req.url)
+            )
+            if cookie != "":
+                headers.set("cookie", cookie)
+
+        if u.is_tls():
+            return self._stream_tls(u, req.method, headers^)
+        return self._stream_cleartext(u, req.method, headers^)
+
+    def _stream_head_wire(
+        self, method: String, u: Url, headers: HeaderMap, default_port: Int
+    ) -> String:
+        """Serialise an HTTP/1.1 request head for a streaming request."""
+        var host_header = u.host
+        if Int(u.port) != default_port:
+            host_header += ":" + String(u.port)
+        var wire = method.upper() + " " + u.request_target() + " HTTP/1.1\r\n"
+        wire += "Host: " + host_header + "\r\n"
+        for i in range(headers.len()):
+            wire += headers._keys[i] + ": " + headers._values[i] + "\r\n"
+        # Exclusive connection: the reader owns it until the body ends.
+        wire += "Connection: close\r\n\r\n"
+        return wire^
+
+    def _stream_cleartext(
+        self, u: Url, method: String, var headers: HeaderMap
+    ) raises -> HttpStreamResponse:
+        """Open a cleartext streaming response, h2c or HTTP/1.1."""
+        var wire = self._stream_head_wire(method, u, headers, 80)
+        var proxy = self._resolve_proxy(u)
+        var tcp: TcpStream
+        if proxy.byte_length() > 0:
+            tcp = self._connect_tunnel(proxy, u.host, u.port)
+        else:
+            tcp = _connect_with_fallback(u.host, u.port, self._timeout_ms)
+        self._arm_read_timeout(tcp)
+        if self._prefer_h2c:
+            # Prior knowledge (RFC 9113 sec 3.4): the preface goes out
+            # first and the whole exchange is h2 from byte one. The
+            # ``Upgrade: h2c`` dance is deliberately not taken here --
+            # see the note on :meth:`with_h2c`.
+            return self._stream_h2(
+                _H2Transport.from_tcp(tcp^),
+                u,
+                method,
+                headers^,
+                String("http"),
+            )
+        var wb = wire.as_bytes()
+        tcp.write_all(Span[UInt8, _](wb))
+        var t = _H2Transport.from_tcp(tcp^)
+        var dl = HttpDownload[_H2Transport](t^, method.upper())
+        return self._wrap_h1(dl^, String("http/1.1"))
+
+    def _stream_tls(
+        self, u: Url, method: String, var headers: HeaderMap
+    ) raises -> HttpStreamResponse:
+        """Open a streaming response over TLS, h2 or HTTP/1.1 by ALPN."""
+        var wire = self._stream_head_wire(method, u, headers, 443)
+        var tls_cfg = self._config.copy()
+        tls_cfg.alpn = List[String]()
+        tls_cfg.alpn.append("h2")
+        tls_cfg.alpn.append("http/1.1")
+        var stream: TlsStream
+        var proxy = self._resolve_proxy(u)
+        if proxy.byte_length() > 0:
+            var tcp = self._connect_tunnel(proxy, u.host, u.port)
+            stream = TlsStream.connect_over_tcp(tcp^, u.host, tls_cfg)
+        else:
+            stream = TlsStream.connect_timeout(
+                u.host, u.port, tls_cfg, self._timeout_ms
+            )
+        self._arm_read_timeout(stream)
+        var negotiated = stream.alpn_selected()
+        if negotiated == "h2":
+            return self._stream_h2(
+                _H2Transport.from_tls(stream^),
+                u,
+                method,
+                headers^,
+                String("https"),
+            )
+        var wb = wire.as_bytes()
+        stream.write_all(Span[UInt8, _](wb))
+        var t = _H2Transport.from_tls(stream^)
+        var dl = HttpDownload[_H2Transport](t^, method.upper())
+        return self._wrap_h1(dl^, String("http/1.1"))
+
+    def _wrap_h1(
+        self, var dl: HttpDownload[_H2Transport], var wire: String
+    ) raises -> HttpStreamResponse:
+        """Move a finished HTTP/1.1 head into an HttpStreamResponse."""
+        var status = dl.status
+        var reason = dl.reason
+        var headers = dl.headers.copy()
+        var addr = Pool[HttpDownload[_H2Transport]].alloc_move(dl^)
+        return HttpStreamResponse(status, reason, headers^, wire^, h1_addr=addr)
+
+    def _stream_h2(
+        self,
+        var t: _H2Transport,
+        u: Url,
+        method: String,
+        var headers: HeaderMap,
+        scheme: String,
+    ) raises -> HttpStreamResponse:
+        """Open an h2 stream and read its head, leaving the body unread.
+
+        Args:
+            t: The transport, TLS or cleartext (ownership transferred).
+            u: The parsed request URL.
+            method: Request method.
+            headers: Request headers, already vetted.
+            scheme: ``"https"`` after ALPN, ``"http"`` for h2c.
+        """
+        var conn = Http2ClientConnection()
+        var preface = conn.drain()
+        if len(preface) > 0:
+            t.write_all(Span[UInt8, _](preface))
+        var sid = conn.next_stream_id()
+        var extra = List[HpackHeader]()
+        for i in range(headers.len()):
+            extra.append(HpackHeader(headers._keys[i], headers._values[i]))
+        conn.send_request_open(
+            sid,
+            method.upper(),
+            scheme,
+            u.host,
+            u.request_target(),
+            extra,
+        )
+        conn.finish_upload(sid)
+        conn.enable_response_streaming(sid)
+        var out = conn.drain()
+        if len(out) > 0:
+            t.write_all(Span[UInt8, _](out))
+
+        # Read until the response head lands, leaving the body for the
+        # reader to pull.
+        var buf = List[UInt8](capacity=16384)
+        buf.resize(16384, 0)
+        while not conn.headers_received(sid):
+            var err = conn.stream_error(sid)
+            if err:
+                raise NetworkError(
+                    "h2 streaming request: stream reset with code "
+                    + String(err.value())
+                )
+            var n = t.read(Pointer(to=buf[0]), 16384)
+            if n <= 0:
+                raise NetworkError(
+                    "h2 streaming request: peer closed before response headers"
+                )
+            conn.receive(Span[UInt8, _](buf)[0:n])
+            var pending = conn.drain()
+            if len(pending) > 0:
+                t.write_all(Span[UInt8, _](pending))
+
+        var hdrs = conn.initial_response_headers(sid)
+        var status = 0
+        var rh = HeaderMap()
+        for i in range(len(hdrs)):
+            if hdrs[i].name == ":status":
+                status = Int(hdrs[i].value)
+            elif not hdrs[i].name.startswith(":"):
+                rh.append(hdrs[i].name, hdrs[i].value)
+        var dl = Http2Download(t^, conn^, sid)
+        var addr = Pool[Http2Download].alloc_move(dl^)
+        return HttpStreamResponse(
+            status, String(""), rh^, String("h2"), h2_addr=addr
+        )
+
+    def post(self, url: String, body: String) raises -> Response:
+        """Perform a POST request with a JSON string body.
+
+        Sets ``Content-Type: application/json`` automatically. This is the
+        default for string bodies because virtually every HTTP API that accepts
+        a string payload expects JSON.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: The JSON request body as a ``String``.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+
+        Example:
+            ```mojo
+            var resp = client.post("https://httpbin.org/post", '{"key": "value"}')
+            resp.raise_for_status()
+            ```
+        """
+        var body_bytes = List[UInt8](body.as_bytes())
+        var req = Request(
+            method=Method.POST, url=self._resolve_url(url), body=body_bytes
+        )
+        req.headers.set("Content-Type", "application/json")
+        return self.send(req)
+
+    def post(self, url: String, body: JsonValue) raises -> Response:
+        """Perform a POST request with a ``json.Value`` body.
+
+        Serialises ``body`` to JSON with ``dumps`` and sets
+        ``Content-Type: application/json`` automatically.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: A ``json.Value`` to serialise and send.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        return self.post(url, dumps(body))
+
+    def post(self, url: String, body: List[UInt8]) raises -> Response:
+        """Perform a POST request with a raw byte body.
+
+        No ``Content-Type`` header is set automatically; the caller is
+        responsible for setting it via a custom ``Request`` if required.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: The raw request body bytes.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var req = Request(
+            method=Method.POST, url=self._resolve_url(url), body=body
+        )
+        return self.send(req)
+
+    def put(self, url: String, body: String) raises -> Response:
+        """Perform a PUT request with a JSON string body.
+
+        Sets ``Content-Type: application/json`` automatically.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: The JSON request body as a ``String``.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var body_bytes = List[UInt8](body.as_bytes())
+        var req = Request(
+            method=Method.PUT, url=self._resolve_url(url), body=body_bytes
+        )
+        req.headers.set("Content-Type", "application/json")
+        return self.send(req)
+
+    def put(self, url: String, body: JsonValue) raises -> Response:
+        """Perform a PUT request with a ``json.Value`` body.
+
+        Serialises ``body`` to JSON with ``dumps`` and sets
+        ``Content-Type: application/json`` automatically.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: A ``json.Value`` to serialise and send.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        return self.put(url, dumps(body))
+
+    def put(self, url: String, body: List[UInt8]) raises -> Response:
+        """Perform a PUT request with a raw byte body.
+
+        No ``Content-Type`` header is set automatically.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: The raw request body bytes.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var req = Request(
+            method=Method.PUT, url=self._resolve_url(url), body=body
+        )
+        return self.send(req)
+
+    def delete(self, url: String) raises -> Response:
+        """Perform a DELETE request.
+
+        Args:
+            url: The target URL.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var req = Request(method=Method.DELETE, url=self._resolve_url(url))
+        return self.send(req)
+
+    def head(self, url: String) raises -> Response:
+        """Perform a HEAD request.
+
+        Identical to ``GET`` but the server MUST NOT include a message body
+        in the response (RFC 7231 §4.3.2).
+
+        Args:
+            url: The target URL.
+
+        Returns:
+            The server's ``Response`` (empty body).
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var req = Request(method=Method.HEAD, url=self._resolve_url(url))
+        return self.send(req)
+
+    def patch(self, url: String, body: String) raises -> Response:
+        """Perform a PATCH request with a JSON string body.
+
+        Sets ``Content-Type: application/json`` automatically.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: The JSON request body as a ``String``.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var body_bytes = List[UInt8](body.as_bytes())
+        var req = Request(
+            method=Method.PATCH, url=self._resolve_url(url), body=body_bytes
+        )
+        req.headers.set("Content-Type", "application/json")
+        return self.send(req)
+
+    def patch(self, url: String, body: JsonValue) raises -> Response:
+        """Perform a PATCH request with a ``json.Value`` body.
+
+        Serialises ``body`` to JSON with ``dumps`` and sets
+        ``Content-Type: application/json`` automatically.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: A ``json.Value`` to serialise and send.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        return self.patch(url, dumps(body))
+
+    def patch(self, url: String, body: List[UInt8]) raises -> Response:
+        """Perform a PATCH request with a raw byte body.
+
+        No ``Content-Type`` header is set automatically.
+
+        Args:
+            url: The target URL (absolute or relative to ``base_url``).
+            body: The raw request body bytes.
+
+        Returns:
+            The server's ``Response``.
+
+        Raises:
+            NetworkError: On connection or I/O failure.
+            TooManyRedirects: If the redirect limit is exceeded.
+        """
+        var req = Request(
+            method=Method.PATCH, url=self._resolve_url(url), body=body
+        )
+        return self.send(req)
+
+    # ── Core ──────────────────────────────────────────────────────────────────
+
+    def send(self, req: Request) raises -> Response:
+        """Send an HTTP request and return the response.
+
+        Follows redirects per the configured :class:`RedirectPolicy`
+        (default: follow all, capped at ``max_redirects``), transparently
+        decodes a compressed body when ``auto_decompress`` is on, and
+        replays / captures cookies when the jar is enabled. When
+        :meth:`with_retry` opted in, the whole exchange is retried on a
+        transient failure per the :class:`RetryPolicy`.
+
+        Args:
+            req: The request to send.
+
+        Returns:
+            The final (possibly redirected) ``Response``.
+
+        Raises:
+            NetworkError: On I/O failure.
+            TooManyRedirects: If the redirect cap is exceeded.
+            Error: On a cross-origin redirect refused by a
+                ``same_origin_only`` policy.
+        """
+        if self._retry_enabled:
+            return self._send_with_retry(req)
+        return self._send_once(req)
+
+    def _send_with_retry(self, req: Request) raises -> Response:
+        """Run :meth:`_send_once` under the client retry policy.
+
+        Retries on a raised error or a ``>= 500`` status, up to
+        ``policy.max_attempts`` total attempts, gated on method
+        idempotency unless the policy opts out. Backoff reuses the
+        server-middleware jittered-exponential schedule."""
+        var attempts = self._retry.max_attempts
+        if attempts < 1:
+            attempts = 1
+        var gate = (not self._retry.retry_only_idempotent) or _is_idempotent(
+            req.method.upper()
+        )
+        if not gate:
+            return self._send_once(req)
+        var attempt = 1
+        while True:
+            try:
+                var resp = self._send_once(req)
+                if resp.status < 500 or attempt >= attempts:
+                    return resp^
+            except e:
+                if attempt >= attempts:
+                    raise e^
+            var sleep_ms = _backoff_sleep_ms(self._retry, attempt + 1)
+            if sleep_ms > 0:
+                _ = libc_nanosleep_ms(sleep_ms)
+            attempt += 1
+
+    def _send_once(self, req: Request) raises -> Response:
+        """One redirect-following exchange (no retry wrapper).
+
+        Threads the effective Authorization through each hop (cleared on
+        a cross-origin redirect unless the policy forwards it), attaches
+        / records cookies, and decompresses the final body."""
+        var current_url = req.url
+        var hops = 0
+        var method = req.method
+        var body = req.body.copy()
+        var auth_header = self._auth_header
+        var headers = req.headers.copy()
+        if self._auto_decompress and not headers.contains("Accept-Encoding"):
+            headers.set("Accept-Encoding", "gzip, deflate, br")
+
+        while True:
+            # Attach session cookies for this hop (jar wins over a stale
+            # caller-supplied Cookie since it carries the live session).
+            var cookie_hdr = self._cookies.request_header(
+                self._resolve_url(current_url)
+            )
+            if cookie_hdr.byte_length() > 0:
+                headers.set("Cookie", cookie_hdr)
+
+            var resp = self._do_request(
+                method, current_url, headers, body, auth_header
+            )
+
+            # Capture Set-Cookie(s) into the jar (no-op if disabled).
+            if self._cookies.enabled():
+                var set_cookies = resp.headers.get_all("Set-Cookie")
+                for i in range(len(set_cookies)):
+                    self._cookies.record_set_cookie(
+                        set_cookies[i], self._resolve_url(current_url)
+                    )
+
+            if not resp.is_redirect():
+                return self._maybe_decompress(resp^)
+
+            var location = resp.headers.get("Location")
+            var decision = self._redirect_policy.decide(
+                current_url, method, resp.status, location, hops
+            )
+
+            if decision.action == RedirectAction.FOLLOW:
+                # Credentials the *caller* attached were meant for the
+                # origin they asked for. Authorization is handled by the
+                # policy below; Cookie and Proxy-Authorization used to
+                # ride along to any origin a 3xx pointed at. Jar cookies
+                # are re-selected per hop by URL, so they stay scoped.
+                if not _same_origin(
+                    self._resolve_url(current_url),
+                    self._resolve_url(decision.next_url),
+                ):
+                    _ = headers.remove("Cookie")
+                    _ = headers.remove("Proxy-Authorization")
+                current_url = decision.next_url
+                method = decision.next_method
+                if decision.next_body_dropped:
+                    body = List[UInt8]()
+                    _ = headers.remove("Content-Type")
+                if not decision.forward_authorization:
+                    auth_header = String("")
+                    _ = headers.remove("Authorization")
+                hops += 1
+                continue
+
+            if decision.action == RedirectAction.REJECT:
+                raise Error(
+                    String("RedirectPolicy: cross-origin redirect to '")
+                    + location
+                    + String("' refused (same_origin_only)")
+                )
+
+            # STOP: empty Location or DENY -> surface the 3xx unchanged;
+            # otherwise the hop cap was hit -> raise (legacy behaviour).
+            if (
+                location.byte_length() == 0
+                or self._redirect_policy.mode == RedirectMode.DENY
+            ):
+                return self._maybe_decompress(resp^)
+            raise TooManyRedirects(current_url, hops)
+
+    def _maybe_decompress(self, var resp: Response) raises -> Response:
+        """Decode a compressed response body in place when
+        ``auto_decompress`` is on. Identity / absent / multi-stacked /
+        unsupported encodings are left untouched."""
+        if not self._auto_decompress:
+            return resp^
+        var enc = resp.headers.get("Content-Encoding")
+        if enc.byte_length() == 0:
+            return resp^
+        var el = String(enc.strip()).lower()
+        if el == "identity" or el == "":
+            return resp^
+        if el.find(",") >= 0:
+            return resp^  # stacked encodings unsupported: leave raw
+        try:
+            var decoded = decode_content(
+                Span[UInt8, _](resp.body), el, self._max_decompressed_bytes
+            )
+            resp.body = decoded^
+            _ = resp.headers.remove("Content-Encoding")
+            resp.headers.set("Content-Length", String(len(resp.body)))
+        except:
+            pass  # unsupported / corrupt payload: leave the raw bytes
+        return resp^
+
+    def _do_request(
+        self,
+        method: String,
+        url: String,
+        extra_headers: HeaderMap,
+        body: List[UInt8],
+        auth_header: String,
+    ) raises -> Response:
+        """Perform a single HTTP/1.1 request (no redirect handling).
+
+        Args:
+            method: HTTP method string.
+            url: Full URL string.
+            extra_headers: Headers from the original request.
+            body: Request body bytes.
+            auth_header: Effective Authorization value for this hop
+                (the redirect policy may have cleared it across a
+                cross-origin redirect).
+
+        Returns:
+            Parsed ``Response``.
+
+        Raises:
+            NetworkError: On I/O or parse failure.
+        """
+        var u = Url.parse(url)
+
+        # Pooling is enabled only for cleartext h1. The TLS path
+        # always full-handshakes (TLS resumption keeps that cheap;
+        # pool key-with-ALPN lands in a follow-up).
+        var pool_enabled = (
+            self._pool._addr != 0
+            and not u.is_tls()
+            and not self._prefer_h2c
+            and not self._h2c_upgrade
+        )
+        # The HTTPS pool keeps the http/1.1-over-TLS connection alive;
+        # the wire below must then advertise keep-alive (an h2 dial
+        # ignores the h1 wire entirely, so this is harmless there).
+        var tls_pool_enabled = (
+            self._tls_pool._addr != 0
+            and u.is_tls()
+            and not self._prefer_h2c
+            and not self._h2c_upgrade
+        )
+
+        # ── Build wire request ─────────────────────────────────────────────
+        var wire = method + " " + u.request_target() + " HTTP/1.1\r\n"
+        # Host header (RFC 7230 §5.4 — required)
+        var host_header = u.host
+        if (u.scheme == "http" and u.port != 80) or (
+            u.scheme == "https" and u.port != 443
+        ):
+            host_header = host_header + ":" + String(Int(u.port))
+        wire += "Host: " + host_header + "\r\n"
+        wire += "User-Agent: " + self._user_agent + "\r\n"
+        if pool_enabled or tls_pool_enabled:
+            wire += "Connection: keep-alive\r\n"
+        else:
+            wire += "Connection: close\r\n"
+        wire += "Accept: */*\r\n"
+
+        # Authorization header from the effective (redirect-gated) auth
+        if auth_header.byte_length() > 0:
+            wire += "Authorization: " + auth_header + "\r\n"
+
+        # Forward caller-supplied headers (skip Host — already set)
+        for i in range(extra_headers.len()):
+            var k = extra_headers._keys[i]
+            if k.lower() != "host":
+                # Only skip caller's Authorization when the effective auth
+                # is set, matching the h2/h2c paths (_build_h2_request_headers).
+                if (
+                    k.lower() == "authorization"
+                    and auth_header.byte_length() > 0
+                ):
+                    continue
+                wire += k + ": " + extra_headers._values[i] + "\r\n"
+
+        if len(body) > 0:
+            wire += "Content-Length: " + String(len(body)) + "\r\n"
+
+        wire += "\r\n"  # end of headers
+
+        # ── Connect and send ───────────────────────────────────────────────
+        if u.is_tls():
+            return self._send_h2_or_h1_tls(
+                u, method, extra_headers, body, wire, auth_header
+            )
+        else:
+            var proxy = self._resolve_proxy(u)
+            if (
+                pool_enabled
+                and proxy.byte_length() == 0
+                and not self._prefer_h2c
+                and not self._h2c_upgrade
+            ):
+                # Pooled keep-alive path with one stale-conn retry
+                # (RFC 9112 sec 9.3.1; see _may_replay). Decided before
+                # dialing: this branch used to open a fresh connection
+                # first and close it unused, so every pooled request
+                # paid a TCP handshake and the server saw twice the
+                # connections. Skipped when a proxy tunnel is active
+                # (pooled direct connections would bypass the proxy).
+                var key = ClientPool.build_key(u.scheme, u.host, Int(u.port))
+                return self._send_h1_pooled(key, u.host, u.port, wire, body)
+            var h2c_key = ClientPool.build_key(u.scheme, u.host, Int(u.port))
+            if self._prefer_h2c and proxy.byte_length() == 0:
+                var reused = self._h2_pooled(
+                    h2c_key, u, method, extra_headers, body, auth_header
+                )
+                if reused:
+                    return reused.take()
+            var stream: TcpStream
+            if proxy.byte_length() > 0:
+                stream = self._connect_tunnel(proxy, u.host, u.port)
+            else:
+                stream = _connect_with_fallback(
+                    u.host, u.port, self._timeout_ms
+                )
+            self._arm_read_timeout(stream)
+            if self._prefer_h2c:
+                # h2c via prior knowledge (RFC 9113 §3.4):
+                # send the connection preface immediately and
+                # drive the request through Http2ClientConnection
+                # over the cleartext TCP stream. The response
+                # comes back lowered to a regular Response.
+                var link = H2Link(stream^)
+                var resp_h2c = h2_roundtrip(
+                    link,
+                    method,
+                    u,
+                    extra_headers,
+                    body,
+                    self._user_agent,
+                    auth_header,
+                )
+                self._h2_release(h2c_key, link^, proxy.byte_length() == 0)
+                return resp_h2c^
+            if self._h2c_upgrade:
+                # h2c via the RFC 7540 §3.2 Upgrade dance: send the
+                # request as h1 with ``Upgrade: h2c`` +
+                # ``HTTP2-Settings``; if the server replies 101 the
+                # response arrives over h2 on stream id 1, otherwise
+                # the helper returns the plain h1 response.
+                var resp_upg = _send_h2c_via_upgrade(
+                    stream^,
+                    method,
+                    u,
+                    extra_headers,
+                    body,
+                    self._user_agent,
+                    auth_header,
+                )
+                return resp_upg^
+            var wire_bytes = wire.as_bytes()
+            stream.write_all(Span[UInt8, _](wire_bytes))
+            if len(body) > 0:
+                stream.write_all(Span[UInt8, _](body))
+            var resp = _read_http_response_tcp(stream, method)
+            stream.close()
+            return resp^
+
+    def _send_h1_pooled(
+        self,
+        key: String,
+        host: String,
+        port: UInt16,
+        wire: String,
+        body: List[UInt8],
+    ) raises -> Response:
+        """Send one HTTP/1.1 request through the connection pool.
+
+        Tries to acquire an idle fd for ``key``; if that fails or
+        the pooled fd is stale (peer FIN'd the keep-alive while
+        idle), opens a fresh connection. On success, releases the
+        fd back to the pool when the response permits keep-alive,
+        otherwise closes it.
+        """
+        # First try a pooled fd.
+        var pooled_fd = self._pool.acquire(key)
+        var attempted_pooled = pooled_fd >= 0
+        var stream: TcpStream
+        if attempted_pooled:
+            var sock = RawSocket(
+                c_int(pooled_fd), AF_INET, SOCK_STREAM, _wrap=True
+            )
+            stream = TcpStream(sock^, SocketAddr.localhost(port))
+        else:
+            stream = _connect_with_fallback(host, port, self._timeout_ms)
+        self._arm_read_timeout(stream)
+
+        var wire_bytes = wire.as_bytes()
+        var io_failed = False
+        try:
+            stream.write_all(Span[UInt8, _](wire_bytes))
+            if len(body) > 0:
+                stream.write_all(Span[UInt8, _](body))
+        except:
+            io_failed = True
+
+        var read_err = String("")
+        if not io_failed:
+            var can_reuse = False
+            try:
+                var resp = _read_http_response_framed_tcp(
+                    stream, can_reuse, _wire_method(wire)
+                )
+                if can_reuse:
+                    # Release fd to pool: capture fd, neutralise the
+                    # RawSocket so its destructor is a no-op, then
+                    # push.
+                    var fd = Int(stream._socket.fd)
+                    stream._socket.fd = INVALID_FD
+                    self._pool.release(key, fd)
+                else:
+                    stream.close()
+                return resp^
+            except e:
+                read_err = String(e)
+
+        # A failure on a *pooled* fd may be a stale keep-alive, and the
+        # request is re-sent on a fresh connection only when that cannot
+        # repeat its effect (see _may_replay). A read timeout after a
+        # POST was processed used to be replayed like any other error.
+        # Failure on a *fresh* fd is a real error.
+        stream.close()
+        if not attempted_pooled:
+            raise NetworkError("HTTP/1.1 pooled request failed: " + read_err)
+        if not _may_replay(_wire_method(wire), io_failed, read_err):
+            raise NetworkError("HTTP/1.1 request failed: " + read_err)
+
+        var fresh = _connect_with_fallback(host, port, self._timeout_ms)
+        self._arm_read_timeout(fresh)
+        fresh.write_all(Span[UInt8, _](wire_bytes))
+        if len(body) > 0:
+            fresh.write_all(Span[UInt8, _](body))
+        var can_reuse2 = False
+        var resp2 = _read_http_response_framed_tcp(
+            fresh, can_reuse2, _wire_method(wire)
+        )
+        if can_reuse2:
+            var fd2 = Int(fresh._socket.fd)
+            fresh._socket.fd = INVALID_FD
+            self._pool.release(key, fd2)
+        else:
+            fresh.close()
+        return resp2^

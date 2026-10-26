@@ -1,0 +1,959 @@
+"""WebSocket client (RFC 6455).
+
+Opening handshake (§4.1):
+  1. Parse ``ws://`` / ``wss://`` URL.
+  2. Open TCP (ws) or TLS (wss) stream.
+  3. Generate a random 16-byte nonce, base64-encode it as ``Sec-WebSocket-Key``.
+  4. Send HTTP/1.1 GET with ``Upgrade: websocket`` headers.
+  5. Parse the 101 Switching Protocols response.
+  6. Verify ``Sec-WebSocket-Accept = base64(SHA-1(key + GUID))``.
+
+SHA-1 is computed via libcrypto (OpenSSL) FFI -- the same library
+already bundled by the TLS FFI build step. Base64 (RFC 4648 §4
+standard alphabet) is the canonical helper at
+:mod:`dodo.crypto.base64`; the local ``_base64_encode`` alias
+keeps the call sites readable while routing through one source
+of truth (this used to ship as three near-identical private
+encoders).
+"""
+
+from std.ffi import OwnedDLHandle, c_int
+from .frame import (
+    DEFAULT_MAX_FRAME_BYTES,
+    WS_TOO_BIG_MARKER,
+    WsFrame,
+    WsOpcode,
+    WsCloseCode,
+    WsProtocolError,
+    _DecodeResult,
+)
+from ..crypto.base64 import base64_encode as _base64_encode
+from ..http.url import Url
+from ..tls import TlsStream, TlsConfig
+from ..tcp import TcpStream
+from ..tcp.stream import _connect_with_fallback
+from ..net import SocketAddr, NetworkError, _find_dodo_lib
+from ..net.socket import RawSocket, AF_INET, SOCK_STREAM
+from ..net.address import IpAddr
+from ..net._libc import INVALID_FD
+from ..dns import resolve
+from ..utils.dylib import dl_sym
+
+# RFC 6455 §1.3 magic GUID concatenated with the Sec-WebSocket-Key for SHA-1
+comptime _WS_GUID: String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# OpenSSL SHA-1 digest length (20 bytes)
+comptime _SHA1_LEN: Int = 20
+
+
+struct WsHandshakeError(Copyable, Writable):
+    """Raised when the WebSocket opening handshake fails."""
+
+    var message: String
+
+    def __init__(out self, message: String):
+        self.message = message
+
+    def write_to[W: Writer, //](self, mut writer: W):
+        writer.write("WsHandshakeError: ", self.message)
+
+
+# ── SHA-1 via libcrypto FFI ───────────────────────────────────────────────────
+#
+# ``_do_sha1`` takes ``lib`` as a ``read`` (borrow) so Mojo's ASAP destruction
+# policy can't reclaim the handle between ``get_function`` and the actual
+# ``fn_sha1`` invocation. Without this, the dylib is unmapped and the cached
+# function pointer dangles into freed memory by the time we call it. See the
+# long discussion in ``dodo/http/encoding.mojo`` and the matching idiom on
+# the server side in ``dodo/ws/server.mojo``.
+
+
+def _do_sha1(
+    imm lib: OwnedDLHandle, data_bytes: Span[UInt8, _]
+) raises -> List[UInt8]:
+    """Invoke SHA-1 with ``lib`` borrowed across both the symbol lookup
+    and the call.
+
+    Args:
+        lib: Borrowed handle to ``libdodo_tls`` (keeps it mapped).
+        data_bytes: Input bytes to hash.
+
+    Returns:
+        20-byte SHA-1 digest.
+    """
+    # SHA1(const unsigned char *d, size_t n, unsigned char *md) -> unsigned char*
+    var fn_sha1 = dl_sym[def(Int, Int, Int) thin abi("C") -> Int](lib, "SHA1")
+    var digest_buf = List[UInt8](capacity=_SHA1_LEN)
+    digest_buf.resize(_SHA1_LEN, 0)
+    _ = fn_sha1(
+        Int(data_bytes.unsafe_ptr()),
+        Int(len(data_bytes)),
+        Int(digest_buf.unsafe_ptr()),
+    )
+    return digest_buf^
+
+
+def _sha1(data: String) raises -> List[UInt8]:
+    """Compute SHA-1 of ``data`` using OpenSSL via the TLS shared library.
+
+    Uses the ``SHA1`` function from libcrypto (available via the bundled
+    ``libdodo_tls.so`` which links both libssl and libcrypto).
+
+    Args:
+        data: Input bytes to hash.
+
+    Returns:
+        20-byte SHA-1 digest.
+
+    Raises:
+        NetworkError: If the SHA-1 function cannot be loaded.
+    """
+    var lib = OwnedDLHandle(_find_dodo_lib())
+    return _do_sha1(lib, data.as_bytes())
+
+
+# ── HTTP upgrade helpers ──────────────────────────────────────────────────────
+
+
+def _generate_ws_key() raises -> String:
+    """Generate a random 16-byte nonce encoded as base64.
+
+    From the OS CSPRNG. There is no fallback: the one this replaced was a
+    constant, the same key for every handshake whenever /dev/urandom
+    could not be opened -- which is what running out of fds looks like.
+
+    Returns:
+        24-character base64 string suitable for ``Sec-WebSocket-Key``.
+    """
+    from dodo.crypto.random import random_bytes
+
+    var nonce = random_bytes(16)
+    return _base64_encode(Span[UInt8, _](nonce))
+
+
+def _compute_accept(key: String) raises -> String:
+    """Compute the expected ``Sec-WebSocket-Accept`` header value.
+
+    Per RFC 6455 §4.2.2: base64(SHA-1(key + GUID)).
+
+    Args:
+        key: The ``Sec-WebSocket-Key`` value sent in the upgrade request.
+
+    Returns:
+        Base64-encoded SHA-1 digest for comparison with the server response.
+    """
+    var combined = key + _WS_GUID
+    var digest = _sha1(combined)
+    return _base64_encode(Span[UInt8, _](digest))
+
+
+def _ws_url_to_http(url: String) raises -> String:
+    """Convert ``ws://`` or ``wss://`` URL to ``http://`` or ``https://``.
+
+    Args:
+        url: WebSocket URL.
+
+    Returns:
+        HTTP URL for use with ``Url.parse()``.
+
+    Raises:
+        WsHandshakeError: If the scheme is not ``ws`` or ``wss``.
+    """
+    if url.startswith("ws://"):
+        return "http://" + String(String(unsafe_from_utf8=url.as_bytes()[5:]))
+    elif url.startswith("wss://"):
+        return "https://" + String(String(unsafe_from_utf8=url.as_bytes()[6:]))
+    raise WsHandshakeError("URL must start with ws:// or wss://: " + url)
+
+
+def _read_line_tls(
+    mut stream: TlsStream, mut buf: List[UInt8]
+) raises -> String:
+    """Read one ``\\r\\n``-terminated line from a TLS stream.
+
+    Args:
+        stream: Open TLS stream.
+        buf: Scratch buffer (single-byte reads).
+
+    Returns:
+        Line content without the trailing ``\\r\\n``.
+
+    Raises:
+        NetworkError: On I/O error.
+    """
+    var line = String(capacity_bytes=256)
+    var b_buf = List[UInt8](capacity=1)
+    b_buf.append(UInt8(0))
+    while True:
+        var n = stream.read(b_buf.unsafe_ptr(), len(b_buf))
+        if n == 0:
+            break
+        var c = b_buf[0]
+        if c == 13:  # CR
+            continue
+        if c == 10:  # LF
+            break
+        line += chr(Int(c))
+    return line^
+
+
+def _read_line_tcp(
+    mut stream: TcpStream, mut buf: List[UInt8]
+) raises -> String:
+    """Read one ``\\r\\n``-terminated line from a TCP stream.
+
+    Args:
+        stream: Open TCP stream.
+        buf: Scratch buffer (single-byte reads).
+
+    Returns:
+        Line content without the trailing ``\\r\\n``.
+
+    Raises:
+        NetworkError: On I/O error.
+    """
+    var line = String(capacity_bytes=256)
+    var b_buf = List[UInt8](capacity=1)
+    b_buf.append(UInt8(0))
+    while True:
+        var n = stream.read(b_buf.unsafe_ptr(), len(b_buf))
+        if n == 0:
+            break
+        var c = b_buf[0]
+        if c == 13:
+            continue
+        if c == 10:
+            break
+        line += chr(Int(c))
+    return line^
+
+
+def _str_find_local(s: String, sub: String) -> Int:
+    """Return the index of the first ``sub`` in ``s``, or -1."""
+    var n = s.byte_length()
+    var m = sub.byte_length()
+    if m == 0:
+        return 0
+    for i in range(n - m + 1):
+        var ok = True
+        for j in range(m):
+            if (
+                s.unsafe_ptr()[unsafe_offset=i + j]
+                != sub.unsafe_ptr()[unsafe_offset=j]
+            ):
+                ok = False
+                break
+        if ok:
+            return i
+    return -1
+
+
+def _lower_local(s: String) -> String:
+    """Return ASCII-lowercase copy of ``s``."""
+    var out = String(capacity_bytes=s.byte_length())
+    for i in range(s.byte_length()):
+        var c = s.unsafe_ptr()[unsafe_offset=i]
+        if c >= 65 and c <= 90:
+            out += chr(Int(c) + 32)
+        else:
+            out += chr(Int(c))
+    return out^
+
+
+struct _UpgradeResponse(Movable):
+    """What the client needs from the server's ``101`` header fields.
+
+    RFC 6455 sec 4.1 makes the client fail the connection unless the
+    response has ``Upgrade: websocket``, a ``Connection`` field with the
+    ``upgrade`` token and the right ``Sec-WebSocket-Accept``, and names no
+    subprotocol or extension (dodo's request offers none). Only the accept
+    value used to be read.
+    """
+
+    var accept: String
+    """The last ``Sec-WebSocket-Accept`` value (empty if none)."""
+    var upgrade_websocket: Bool
+    """Some ``Upgrade`` value is ``websocket`` (case-insensitive)."""
+    var connection_upgrade: Bool
+    """Some ``Connection`` value has the token ``upgrade``."""
+    var protocol_seen: Bool
+    """A ``Sec-WebSocket-Protocol`` field is present."""
+    var extensions_seen: Bool
+    """A ``Sec-WebSocket-Extensions`` field is present."""
+
+    def __init__(out self):
+        self.accept = String("")
+        self.upgrade_websocket = False
+        self.connection_upgrade = False
+        self.protocol_seen = False
+        self.extensions_seen = False
+
+    def observe(mut self, name: String, value: String):
+        """Record one header field (``name`` lower-cased, both stripped)."""
+        if name == "sec-websocket-accept":
+            self.accept = value
+        elif name == "upgrade":
+            if _lower_local(value) == "websocket":
+                self.upgrade_websocket = True
+        elif name == "connection":
+            for tok in value.split(","):
+                if _lower_local(String(String(tok).strip())) == "upgrade":
+                    self.connection_upgrade = True
+        elif name == "sec-websocket-protocol":
+            self.protocol_seen = True
+        elif name == "sec-websocket-extensions":
+            self.extensions_seen = True
+
+    def verify(self, expected_accept: String) raises:
+        """Raise ``WsHandshakeError`` unless the 101 completes the handshake.
+
+        Raises:
+            WsHandshakeError: On a missing or wrong ``Upgrade``,
+                ``Connection`` or ``Sec-WebSocket-Accept``, or on a
+                subprotocol or extension the request did not offer.
+        """
+        if not self.upgrade_websocket:
+            raise WsHandshakeError(
+                "101 response lacks 'Upgrade: websocket' (RFC 6455 sec 4.1)"
+            )
+        if not self.connection_upgrade:
+            raise WsHandshakeError(
+                "101 response lacks a 'Connection: Upgrade' token (RFC 6455"
+                " sec 4.1)"
+            )
+        if self.accept != expected_accept:
+            raise WsHandshakeError(
+                "Sec-WebSocket-Accept mismatch: got '"
+                + self.accept
+                + "', expected '"
+                + expected_accept
+                + "'"
+            )
+        if self.protocol_seen:
+            raise WsHandshakeError(
+                "101 response selects a subprotocol that was not requested"
+                " (RFC 6455 sec 4.1)"
+            )
+        if self.extensions_seen:
+            raise WsHandshakeError(
+                "101 response names an extension that was not requested"
+                " (RFC 6455 sec 4.1)"
+            )
+
+
+# ── Internal stream union for WebSocket I/O ───────────────────────────────────
+# Mojo doesn't have enum variants with payloads, so we use a tagged struct.
+
+
+struct _WsStream(Movable):
+    """Holds either a TLS or plain TCP stream for WebSocket I/O."""
+
+    var _is_tls: Bool
+    var _tls: TlsStream
+    var _tcp: TcpStream
+
+    def __init__(out self, var tls: TlsStream):
+        self._is_tls = True
+        self._tls = tls^
+        self._tcp = _dummy_tcp_stream()
+
+    def __init__(out self, var tcp: TcpStream) raises:
+        self._is_tls = False
+        self._tls = _dummy_tls_stream()
+        self._tcp = tcp^
+
+    def write_all(self, data: Span[UInt8, _]) raises:
+        """Write all bytes to the underlying stream.
+
+        Args:
+            data: Bytes to transmit.
+
+        Raises:
+            NetworkError: On I/O failure.
+        """
+        if self._is_tls:
+            self._tls.write_all(data)
+        else:
+            self._tcp.write_all(data)
+
+    def read(mut self, buf: Pointer[UInt8, _], size: Int) raises -> Int:
+        """Read up to ``size`` bytes from the underlying stream.
+
+        Args:
+            buf: Destination buffer (at least ``size`` bytes of storage).
+            size: Maximum bytes to read.
+
+        Returns:
+            Bytes written to ``buf``, or 0 on clean EOF.
+
+        Raises:
+            NetworkError: On I/O failure.
+        """
+        if self._is_tls:
+            return self._tls.read(buf, size)
+        else:
+            return self._tcp.read(buf, size)
+
+    def close(mut self):
+        """Close the underlying stream."""
+        if self._is_tls:
+            self._tls.close()
+        else:
+            self._tcp.close()
+
+
+def _dummy_tcp_stream() -> TcpStream:
+    """Return a TCP stream with a sentinel fd (INVALID_FD = -1).
+
+    ``RawSocket.close()`` checks ``fd >= 0`` so this never calls ``close(2)``.
+    Used to populate the inactive branch of ``_WsStream``.
+    """
+    var sock = RawSocket(
+        c_int(INVALID_FD), c_int(AF_INET), c_int(SOCK_STREAM), True
+    )
+    return TcpStream(sock^, SocketAddr(IpAddr.localhost(), 0))
+
+
+def _dummy_tls_stream() raises -> TlsStream:
+    """Return a sentinel TLS stream (for use in the inactive branch).
+
+    With ``_ssl=0``, ``TlsStream.__deinit__`` is a no-op.
+    This is never called on an active ``_WsStream`` of TLS type.
+    Raises only if the OpenSSL FFI wrapper cannot be opened (the
+    ``TlsStream`` now caches its lib handle for the connection).
+    """
+    var tcp = _dummy_tcp_stream()
+    return TlsStream(tcp^, 0, 0)
+
+
+struct WsMessage(Movable):
+    """A high-level WebSocket message (Text or Binary).
+
+    Produced by ``WsClient.recv_message()``. Use ``is_text`` to
+    discriminate between message kinds.
+
+    Fields:
+        is_text: ``True`` for a UTF-8 text message; ``False`` for binary.
+
+    Example:
+        ```mojo
+        var msg = ws.recv_message()
+        if msg.is_text:
+            print(msg.as_text())
+        else:
+            print("binary:", len(msg.as_binary()), "bytes")
+        ```
+    """
+
+    var is_text: Bool
+    var _text: String
+    var _binary: List[UInt8]
+
+    def __init__(out self, text: String):
+        """Initialise a text ``WsMessage``.
+
+        Args:
+            text: The UTF-8 text payload.
+        """
+        self.is_text = True
+        self._text = text
+        self._binary = List[UInt8]()
+
+    def __init__(out self, binary: List[UInt8]):
+        """Initialise a binary ``WsMessage``.
+
+        Args:
+            binary: The raw binary payload.
+        """
+        self.is_text = False
+        self._text = ""
+        self._binary = binary.copy()
+
+    def as_text(self) -> String:
+        """Return the message payload as a UTF-8 string.
+
+        Returns:
+            The text payload when ``is_text`` is ``True``; an empty string
+            otherwise.
+        """
+        return self._text
+
+    def as_binary(self) -> List[UInt8]:
+        """Return the message payload as raw bytes.
+
+        Returns:
+            A copy of the binary payload when ``is_text`` is ``False``;
+            an empty list otherwise.
+        """
+        return self._binary.copy()
+
+
+struct WsClient(Movable):
+    """A WebSocket client connection established via HTTP Upgrade.
+
+    Handles the opening handshake, frame encoding/decoding, masking
+    (client→server frames MUST be masked per RFC 6455 §5.3), and
+    automatic PONG replies to PING frames.
+
+    This type is ``Movable`` but not ``Copyable``. It supports the context
+    manager protocol (``__enter__`` / ``__exit__``) for use with ``with``.
+
+    Fields:
+        _stream: Underlying transport (TLS or TCP).
+        _key: The ``Sec-WebSocket-Key`` used for this connection.
+
+    Example:
+        ```mojo
+        with WsClient.connect("wss://echo.websocket.events") as ws:
+            ws.send_text("hello")
+            var msg = ws.recv_message()
+            print(msg.as_text())
+        ```
+    """
+
+    var _stream: _WsStream
+    var _key: String
+    var max_frame_size: Int
+    """Largest frame payload :meth:`recv` accepts. A server frame that
+    declares more is answered with CLOSE 1009 (MESSAGE_TOO_BIG) and
+    :meth:`recv` raises, before any of the payload is buffered.
+    Defaults to :data:`DEFAULT_MAX_FRAME_BYTES`."""
+    var _prebuf: List[UInt8]
+    """Bytes read off the socket past the last decoded frame. A read can
+    carry more than one frame; ``_recv_one`` starts from these before it
+    reads again."""
+
+    def __init__(out self, var stream: _WsStream, key: String):
+        self._stream = stream^
+        self._key = key
+        self.max_frame_size = DEFAULT_MAX_FRAME_BYTES
+        self._prebuf = List[UInt8]()
+
+    def __deinit__(deinit self):
+        self._stream.close()
+
+    # ── Factory ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def connect(url: String) raises -> WsClient:
+        """Connect to a WebSocket server using default TLS configuration.
+
+        Equivalent to ``WsClient.connect(url, TlsConfig())``.
+
+        Args:
+            url: WebSocket URL (``ws://`` or ``wss://``).
+
+        Returns:
+            A ``WsClient`` with the handshake complete.
+
+        Raises:
+            NetworkError: If the TCP/TLS connection fails.
+            WsHandshakeError: If the server's Upgrade response is invalid.
+        """
+        return WsClient._connect_impl(url, TlsConfig())
+
+    @staticmethod
+    def connect(url: String, config: TlsConfig) raises -> WsClient:
+        """Connect to a WebSocket server with custom TLS configuration.
+
+        For ``wss://`` URLs, wraps the connection in TLS using ``config``.
+
+        Args:
+            url: WebSocket URL (``ws://`` or ``wss://``).
+            config: TLS configuration (only used for ``wss://``).
+
+        Returns:
+            A ``WsClient`` with the handshake complete.
+
+        Raises:
+            NetworkError: If the TCP/TLS connection fails.
+            WsHandshakeError: If the server's Upgrade response is invalid or
+                              ``Sec-WebSocket-Accept`` does not match.
+        """
+        return WsClient._connect_impl(url, config)
+
+    @staticmethod
+    def _connect_impl(url: String, config: TlsConfig) raises -> WsClient:
+        """Internal implementation shared by both ``connect`` overloads.
+
+        For ``wss://`` URLs, advertises ALPN ``["http/1.1"]``
+        explicitly so the unified
+        :class:`dodo.http.HttpServer` (which auto-dispatches
+        HTTP/1.1 vs HTTP/2 based on ALPN selection) negotiates
+        the existing HTTP/1.1 Upgrade dance instead of HTTP/2.
+        WebSocket-over-HTTP/2 (RFC 8441 Extended CONNECT) is
+        wired on the server byte-driver side
+        (:class:`dodo.http2.Http2Connection` advertises
+        ``SETTINGS_ENABLE_CONNECT_PROTOCOL`` when opted in via
+        ``Http2Config.enable_connect_protocol`` and captures
+        the inbound ``:protocol`` pseudo-header on the stream)
+        but the per-stream WS tunnel adapter that bridges
+        DATA frames to :class:`WsConnection` is the deliberate
+        follow-up; until it lands, ``WsClient`` forces the
+        HTTP/1.1 path so existing wss:// users see no
+        regression.
+        """
+        var http_url = _ws_url_to_http(url)
+        var u = Url.parse(http_url)
+        var key = _generate_ws_key()
+        var expected_accept = _compute_accept(key)
+        # Force HTTP/1.1 ALPN on wss:// so the unified server
+        # routes to the Upgrade-based path. (When the WS-over-h2
+        # tunnel adapter lands we'll change this to ["h2",
+        # "http/1.1"] and add a negotiated-h2 branch above the
+        # existing wire.)
+        var tls_cfg = config.copy()
+        if u.is_tls() and len(tls_cfg.alpn) == 0:
+            tls_cfg.alpn = List[String]()
+            tls_cfg.alpn.append("http/1.1")
+
+        # ── 1. Build upgrade request ──────────────────────────────────────────
+        var host_header = u.host
+        if (u.scheme == "http" and u.port != 80) or (
+            u.scheme == "https" and u.port != 443
+        ):
+            host_header = host_header + ":" + String(Int(u.port))
+
+        var req = (
+            "GET "
+            + u.request_target()
+            + " HTTP/1.1\r\n"
+            + "Host: "
+            + host_header
+            + "\r\n"
+            + "Upgrade: websocket\r\n"
+            + "Connection: Upgrade\r\n"
+            + "Sec-WebSocket-Key: "
+            + key
+            + "\r\n"
+            + "Sec-WebSocket-Version: 13\r\n"
+            + "\r\n"
+        )
+
+        # ── 2. Connect and send ───────────────────────────────────────────────
+        var scratch = List[UInt8](capacity=1)
+        scratch.append(UInt8(0))
+
+        if u.is_tls():
+            var tls = TlsStream.connect(u.host, u.port, tls_cfg)
+            var req_bytes = req.as_bytes()
+            tls.write_all(Span[UInt8, _](req_bytes))
+
+            # ── 3. Read response headers ──────────────────────────────────────
+            var status_line = _read_line_tls(tls, scratch)
+            if not status_line.startswith("HTTP/1.1 101"):
+                raise WsHandshakeError(
+                    "Expected 101 Switching Protocols, got: " + status_line
+                )
+
+            var upgrade = _UpgradeResponse()
+            while True:
+                var line = _read_line_tls(tls, scratch)
+                if line.byte_length() == 0:
+                    break
+                var colon = _str_find_local(line, ":")
+                if colon >= 0:
+                    var hk = _lower_local(
+                        String(
+                            String(
+                                String(unsafe_from_utf8=line.as_bytes()[:colon])
+                            ).strip()
+                        )
+                    )
+                    var hv = String(
+                        String(
+                            String(
+                                unsafe_from_utf8=line.as_bytes()[colon + 1 :]
+                            )
+                        ).strip()
+                    )
+                    upgrade.observe(hk, hv)
+
+            # ── 4. Verify the handshake (RFC 6455 sec 4.1) ────────────────────
+            upgrade.verify(expected_accept)
+
+            var ws_stream = _WsStream(tls^)
+            return WsClient(ws_stream^, key)
+        else:
+            var tcp = _connect_with_fallback(u.host, u.port, 5000)
+            var req_bytes = req.as_bytes()
+            tcp.write_all(Span[UInt8, _](req_bytes))
+
+            var status_line = _read_line_tcp(tcp, scratch)
+            if not status_line.startswith("HTTP/1.1 101"):
+                raise WsHandshakeError(
+                    "Expected 101 Switching Protocols, got: " + status_line
+                )
+
+            var upgrade = _UpgradeResponse()
+            while True:
+                var line = _read_line_tcp(tcp, scratch)
+                if line.byte_length() == 0:
+                    break
+                var colon = _str_find_local(line, ":")
+                if colon >= 0:
+                    var hk = _lower_local(
+                        String(
+                            String(
+                                String(unsafe_from_utf8=line.as_bytes()[:colon])
+                            ).strip()
+                        )
+                    )
+                    var hv = String(
+                        String(
+                            String(
+                                unsafe_from_utf8=line.as_bytes()[colon + 1 :]
+                            )
+                        ).strip()
+                    )
+                    upgrade.observe(hk, hv)
+
+            upgrade.verify(expected_accept)
+
+            var ws_stream = _WsStream(tcp^)
+            return WsClient(ws_stream^, key)
+
+    # ── Sending ───────────────────────────────────────────────────────────────
+
+    def send_text(self, msg: String) raises:
+        """Send a UTF-8 text message (client→server, masked).
+
+        Args:
+            msg: The message string. Must be valid UTF-8.
+
+        Raises:
+            NetworkError: On I/O failure.
+        """
+        var frame = WsFrame.text(msg)
+        var wire = frame.encode(mask=True)
+        self._stream.write_all(Span[UInt8, _](wire))
+
+    def send_binary(self, data: List[UInt8]) raises:
+        """Send a binary message (client→server, masked).
+
+        Args:
+            data: The raw binary payload.
+
+        Raises:
+            NetworkError: On I/O failure.
+        """
+        var frame = WsFrame.binary(data)
+        var wire = frame.encode(mask=True)
+        self._stream.write_all(Span[UInt8, _](wire))
+
+    def send_frame(self, frame: WsFrame) raises:
+        """Send an already-constructed frame.
+
+        Args:
+            frame: The frame to send (masked automatically).
+
+        Raises:
+            NetworkError: On I/O failure.
+        """
+        var wire = frame.encode(mask=True)
+        self._stream.write_all(Span[UInt8, _](wire))
+
+    # ── Receiving ─────────────────────────────────────────────────────────────
+
+    def recv(mut self) raises -> WsFrame:
+        """Receive the next data frame, handling PING transparently.
+
+        Automatically replies to PING frames with a PONG and continues
+        reading. CLOSE frames are returned to the caller.
+
+        Returns:
+            The next ``WsFrame`` (TEXT, BINARY, or CLOSE).
+
+        Raises:
+            NetworkError: On I/O failure.
+            WsProtocolError: On protocol violation.
+            Error: On truncated frame data.
+        """
+        while True:
+            var frame = self._recv_one()
+            if frame.opcode == WsOpcode.PING:
+                # RFC 6455 §5.5.3: respond with PONG carrying same payload
+                var pong = WsFrame.pong(frame.payload)
+                var wire = pong.encode(mask=True)
+                self._stream.write_all(Span[UInt8, _](wire))
+                continue
+            return frame^
+
+    def _recv_one(mut self) raises -> WsFrame:
+        """Read raw bytes from the stream and decode one frame.
+
+        Raises:
+            WsProtocolError: If the server sent a masked frame (RFC 6455
+                sec 5.1).
+        """
+        # Read bytes incrementally until we have a full frame, starting
+        # from whatever the previous read carried past its frame.
+        var buf = self._prebuf.copy()
+        self._prebuf.clear()
+        var tmp = List[UInt8](capacity=4096)
+        tmp.resize(4096, 0)
+
+        while True:
+            try:
+                var result = WsFrame.decode_one(
+                    Span[UInt8, _](buf), max_payload=self.max_frame_size
+                )
+                # RFC 6455 sec 5.1: a server MUST NOT mask the frames it
+                # sends, and a client MUST close the connection if it
+                # detects a masked frame.
+                if result.frame.masked:
+                    raise WsProtocolError(
+                        "server sent a masked frame (RFC 6455 sec 5.1)"
+                    )
+                # A server may send several frames in one segment. They
+                # used to die with ``buf``: the second was lost and the
+                # next recv() waited for bytes already consumed.
+                for i in range(result.consumed, len(buf)):
+                    self._prebuf.append(buf[i])
+                return result^.take_frame()
+            except e:
+                var msg = String(e)
+                if (
+                    "need at least" in msg
+                    or "need " in msg
+                    or "truncated" in msg
+                ):
+                    # Read more bytes and retry
+                    var n = self._stream.read(tmp.unsafe_ptr(), len(tmp))
+                    if n == 0:
+                        raise NetworkError(
+                            "WebSocket connection closed unexpectedly"
+                        )
+                    for i in range(n):
+                        buf.append(tmp[i])
+                else:
+                    if WS_TOO_BIG_MARKER in msg:
+                        # RFC 6455 sec 7.4.1: 1009 tells the server why.
+                        # Best effort: the raise below is what matters.
+                        try:
+                            var wire = WsFrame.close(
+                                WsCloseCode.MESSAGE_TOO_BIG
+                            ).encode(mask=True)
+                            self._stream.write_all(Span[UInt8, _](wire))
+                        except:
+                            pass
+                    raise e^
+
+    def _recv_data_frame(mut self) raises -> WsFrame:
+        """Next TEXT, BINARY or CONTINUATION frame.
+
+        PING is answered by :meth:`recv`. PONG is dropped: an unsolicited
+        one is allowed and is not part of any message (RFC 6455 sec 5.5.3).
+
+        Raises:
+            NetworkError: If a CLOSE frame arrives or I/O fails.
+            WsProtocolError: On protocol violation.
+        """
+        while True:
+            var frame = self.recv()
+            if frame.opcode == WsOpcode.CLOSE:
+                raise NetworkError("WebSocket CLOSE received")
+            if frame.opcode == WsOpcode.PONG:
+                continue
+            return frame^
+
+    def recv_message(mut self) raises -> WsMessage:
+        """Receive the next complete message as a ``WsMessage``.
+
+        A higher-level alternative to ``recv()`` that returns a
+        ``WsMessage`` (Text or Binary) instead of a raw ``WsFrame``.
+        A fragmented message (a TEXT or BINARY frame without FIN followed
+        by CONTINUATION frames up to one with FIN, RFC 6455 sec 5.4) is
+        reassembled and returned whole. PING frames are handled
+        transparently (PONG sent automatically), PONG frames are skipped,
+        and either may arrive between fragments. CLOSE frames raise a
+        ``NetworkError``. A text message is checked for valid UTF-8 as a
+        whole, so a code point may be split across fragments. The
+        reassembled payload is bounded by ``max_frame_size``.
+
+        Returns:
+            A ``WsMessage`` with ``is_text=True`` for text frames and
+            ``is_text=False`` for binary frames.
+
+        Raises:
+            NetworkError: If a CLOSE frame is received or I/O fails.
+            WsProtocolError: On protocol violation: a CONTINUATION with no
+                message to continue, a new data frame inside a fragmented
+                message, an unknown data opcode, invalid UTF-8 in a text
+                message, or a message over ``max_frame_size`` (CLOSE 1009
+                is sent first).
+
+        Example:
+            ```mojo
+            var msg = ws.recv_message()
+            if msg.is_text:
+                print(msg.as_text())
+            ```
+        """
+        var first = self._recv_data_frame()
+        var is_text = first.opcode == WsOpcode.TEXT
+        if not is_text and first.opcode != WsOpcode.BINARY:
+            if first.opcode == WsOpcode.CONTINUATION:
+                raise WsProtocolError(
+                    "CONTINUATION frame with no message to continue"
+                    " (RFC 6455 sec 5.4)"
+                )
+            raise WsProtocolError(
+                "unknown data opcode " + String(Int(first.opcode))
+            )
+        var fin = first.fin
+        var payload = first.payload.copy()
+        while not fin:
+            var next = self._recv_data_frame()
+            if next.opcode != WsOpcode.CONTINUATION:
+                raise WsProtocolError(
+                    "new data frame inside a fragmented message"
+                    " (RFC 6455 sec 5.4)"
+                )
+            if len(payload) + len(next.payload) > self.max_frame_size:
+                # RFC 6455 sec 7.4.1: 1009 tells the server why.
+                try:
+                    var wire = WsFrame.close(
+                        WsCloseCode.MESSAGE_TOO_BIG
+                    ).encode(mask=True)
+                    self._stream.write_all(Span[UInt8, _](wire))
+                except:
+                    pass
+                raise WsProtocolError(
+                    WS_TOO_BIG_MARKER
+                    + ": reassembled message exceeds "
+                    + String(self.max_frame_size)
+                    + " bytes"
+                )
+            payload.extend(Span[UInt8, _](next.payload))
+            fin = next.fin
+        if not is_text:
+            return WsMessage(payload)
+        return WsMessage(
+            WsFrame(opcode=WsOpcode.TEXT, payload=payload).text_payload()
+        )
+
+    # ── Context manager ───────────────────────────────────────────────────────
+
+    def __enter__(var self) -> WsClient:
+        """Transfer ownership of ``self`` into the ``with`` block.
+
+        Returns:
+            This ``WsClient`` (moved).
+        """
+        return self^
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def close(mut self):
+        """Send a CLOSE frame and close the underlying transport.
+
+        Idempotent — safe to call multiple times.
+        """
+        try:
+            var close_frame = WsFrame.close()
+            var wire = close_frame.encode(mask=True)
+            self._stream.write_all(Span[UInt8, _](wire))
+        except:
+            pass  # best-effort
+        self._stream.close()

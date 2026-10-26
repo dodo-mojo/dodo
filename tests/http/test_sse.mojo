@@ -1,0 +1,349 @@
+"""Tests for :mod:`dodo.http.sse` — Server-Sent Events.
+
+Coverage:
+
+1. ``SseEvent`` constructors (``data`` / ``named``) populate the
+   fields correctly.
+2. ``format_sse_event`` produces spec-correct wire bytes:
+   - data only.
+   - data with ``\\n`` is split into multiple ``data:`` lines
+     (WHATWG §9.2.4).
+   - id / event-type / retry are emitted only when set, in the
+     order ``id`` → ``event`` → ``retry`` → ``data*`` →
+     terminator.
+3. ``SseChannel`` FIFO semantics: push N, pull N, each pull
+   returns the next event's wire bytes; closing then draining
+   yields ``None``; an open-ended (un-closed) channel with empty
+   buffer yields the heartbeat comment line.
+4. ``SseChannel.next`` short-circuits to ``None`` when cancel
+   is set (matches the reactor's per-stream Cancel propagation).
+5. ``sse_response`` builds a Response with the spec-correct
+   headers (Content-Type, Cache-Control, Connection,
+   X-Accel-Buffering) and the inline SSE bytes.
+6. ``sse_response`` raises on an open-ended channel (caller
+   wanted ``SseStreamingResponse`` instead).
+7. ``SseStreamingResponse.of`` carries a ChunkedBody-wrapped
+   channel that the reactor's streaming path can drive.
+"""
+
+from std.testing import (
+    TestSuite,
+    assert_equal,
+    assert_false,
+    assert_raises,
+    assert_true,
+)
+
+from dodo.http import HttpClient, HttpServer, Request, Response
+from dodo.http.body import drain_body
+from dodo.http.cancel import Cancel, CancelCell, CancelReason
+from dodo.http.sse import (
+    SseChannel,
+    SseEvent,
+    SseStreamingResponse,
+    format_sse_event,
+    sse_response,
+    stream_sse_response,
+)
+from dodo.net import SocketAddr
+from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
+
+
+def _bytes_to_str(b: List[UInt8]) -> String:
+    var out = String(capacity_bytes=len(b) + 1)
+    for i in range(len(b)):
+        out += chr(Int(b[i]))
+    return out^
+
+
+# ── SseEvent constructors ─────────────────────────────────────────────────
+
+
+def test_event_message_constructor() raises:
+    var e = SseEvent.message("hello")
+    assert_equal(e.data, "hello")
+    assert_equal(e.event_type, "")
+    assert_equal(e.id, "")
+    assert_equal(e.retry_ms, -1)
+
+
+def test_event_named_constructor() raises:
+    var e = SseEvent.named("tick", "data-payload")
+    assert_equal(e.event_type, "tick")
+    assert_equal(e.data, "data-payload")
+
+
+# ── format_sse_event wire shape ───────────────────────────────────────────
+
+
+def test_format_data_only() raises:
+    var e = SseEvent.message("hello")
+    var got = _bytes_to_str(format_sse_event(e))
+    assert_equal(got, "data: hello\n\n")
+
+
+def test_format_data_with_newlines_splits_into_multiple_data_lines() raises:
+    """WHATWG §9.2.4: each line of data gets its own ``data:`` prefix."""
+    var e = SseEvent.message("line0\nline1\nline2")
+    var got = _bytes_to_str(format_sse_event(e))
+    assert_equal(got, "data: line0\ndata: line1\ndata: line2\n\n")
+
+
+def test_format_with_id_and_event_type() raises:
+    var e = SseEvent("payload", "myevent", "evt-7", -1)
+    var got = _bytes_to_str(format_sse_event(e))
+    assert_equal(got, "id: evt-7\nevent: myevent\ndata: payload\n\n")
+
+
+def test_format_with_retry() raises:
+    var e = SseEvent("payload", "", "", 5000)
+    var got = _bytes_to_str(format_sse_event(e))
+    assert_equal(got, "retry: 5000\ndata: payload\n\n")
+
+
+def test_format_emits_field_order_id_event_retry_data() raises:
+    """Field order is fixed for spec-conformance; clients tolerate
+    any order, but dodo's order is stable so wire dumps diff
+    cleanly across versions."""
+    var e = SseEvent("payload", "evt", "abc", 1000)
+    var got = _bytes_to_str(format_sse_event(e))
+    assert_equal(got, "id: abc\nevent: evt\nretry: 1000\ndata: payload\n\n")
+
+
+# ── SseChannel FIFO ───────────────────────────────────────────────────────
+
+
+def test_channel_push_then_drain_emits_in_order() raises:
+    var ch = SseChannel()
+    ch.push(SseEvent.message("a"))
+    ch.push(SseEvent.message("b"))
+    ch.push(SseEvent.message("c"))
+    ch.close()
+    var sentinel = Cancel.never()
+    var c0 = ch.next(sentinel).value().copy()
+    assert_equal(_bytes_to_str(c0), "data: a\n\n")
+    var c1 = ch.next(sentinel).value().copy()
+    assert_equal(_bytes_to_str(c1), "data: b\n\n")
+    var c2 = ch.next(sentinel).value().copy()
+    assert_equal(_bytes_to_str(c2), "data: c\n\n")
+    var done = ch.next(sentinel)
+    assert_false(Bool(done))
+
+
+def test_channel_pending_count_decreases_with_each_pull() raises:
+    var ch = SseChannel()
+    ch.push(SseEvent.message("x"))
+    ch.push(SseEvent.message("y"))
+    assert_equal(ch.pending(), 2)
+    var sentinel = Cancel.never()
+    var _u = ch.next(sentinel)
+    assert_equal(ch.pending(), 1)
+
+
+def test_channel_open_emits_heartbeat_when_buffer_empty() raises:
+    """An un-closed channel with no buffered events should keep the
+    connection warm with a comment-line heartbeat."""
+    var ch = SseChannel()
+    var sentinel = Cancel.never()
+    var got = ch.next(sentinel).value().copy()
+    assert_equal(_bytes_to_str(got), ": keep-alive\n\n")
+
+
+def test_channel_idle_heartbeat_is_rate_limited() raises:
+    """Back-to-back idle pulls must not each emit a heartbeat.
+
+    The reactor drains a batch of chunks per writable edge, so an
+    ungated heartbeat would put a batch of them on the wire every edge.
+    The second pull inside the interval yields an empty chunk, which
+    reactors read as "nothing right now"."""
+    var ch = SseChannel()
+    var sentinel = Cancel.never()
+    var first = ch.next(sentinel).value().copy()
+    assert_equal(_bytes_to_str(first), ": keep-alive\n\n")
+    for _ in range(8):
+        var again = ch.next(sentinel)
+        assert_true(again.__bool__(), "idle channel must not signal EOF")
+        assert_equal(len(again.value()), 0)
+    # A pushed event still comes out immediately; the gate is only for
+    # the idle filler.
+    ch.push(SseEvent.message("live"))
+    var evt = ch.next(sentinel).value().copy()
+    assert_equal(_bytes_to_str(evt), "data: live\n\n")
+
+
+def test_channel_cancel_short_circuits_to_none() raises:
+    """Note: cell.handle() returns a Cancel that holds
+    the cell's heap address; the cell must be kept alive past the
+    ch.next(handle) call or Mojo's ASAP destructor frees the
+    underlying Int and the read is UB. Pin via cell.reset() after
+    the assertion to extend the lifetime."""
+    var ch = SseChannel()
+    ch.push(SseEvent.message("never-pulled"))
+    var cell = CancelCell()
+    cell.flip(CancelReason.SHUTDOWN)
+    var handle = cell.handle()
+    var got = ch.next(handle)
+    assert_false(Bool(got))
+    cell.reset()
+
+
+# ── sse_response (synchronous) ────────────────────────────────────────────
+
+
+def test_sse_response_sets_spec_headers() raises:
+    var ch = SseChannel()
+    ch.push(SseEvent.message("hi"))
+    ch.close()
+    var resp = sse_response(ch)
+    assert_equal(resp.status, 200)
+    assert_equal(resp.headers.get("content-type"), "text/event-stream")
+    assert_equal(resp.headers.get("cache-control"), "no-cache")
+    assert_equal(resp.headers.get("connection"), "keep-alive")
+    assert_equal(resp.headers.get("x-accel-buffering"), "no")
+
+
+def test_sse_response_inline_body_carries_event_bytes() raises:
+    var ch = SseChannel()
+    ch.push(SseEvent.message("first"))
+    ch.push(SseEvent.message("second"))
+    ch.close()
+    var resp = sse_response(ch)
+    assert_equal(_bytes_to_str(resp.body), "data: first\n\ndata: second\n\n")
+    assert_equal(resp.headers.get("content-length"), String(len(resp.body)))
+
+
+def test_sse_response_raises_on_open_ended_channel() raises:
+    """Caller forgot to close — would loop forever on heartbeats.
+    Fail loudly with the right next-action."""
+    var ch = SseChannel()
+    ch.push(SseEvent.message("x"))
+    # No ch.close() — channel is open-ended.
+    with assert_raises(contains="open-ended"):
+        var _u = sse_response(ch)
+
+
+# ── SseStreamingResponse ──────────────────────────────────────────────────
+
+
+def test_streaming_response_has_spec_headers() raises:
+    var ch = SseChannel()
+    ch.close()
+    var sr = SseStreamingResponse.of(ch)
+    assert_equal(sr.response.status, 200)
+    assert_equal(sr.response.headers.get("content-type"), "text/event-stream")
+
+
+def test_streaming_response_body_drains_via_chunked_body() raises:
+    """The ChunkedBody[SseChannel] wraps a copy of the channel, so
+    drain_body works the same way as example 24's Counter source."""
+    var ch = SseChannel()
+    ch.push(SseEvent.message("alpha"))
+    ch.push(SseEvent.message("beta"))
+    ch.close()
+    var sr = SseStreamingResponse.of(ch)
+    var drained = drain_body(sr.body, Cancel.never())
+    assert_equal(_bytes_to_str(drained), "data: alpha\n\ndata: beta\n\n")
+
+
+# ── stream_sse_response (K1 Router path) ──────────────────────────────────
+
+
+def test_stream_sse_response_carries_stream_and_headers() raises:
+    var ch = SseChannel()
+    ch.push(SseEvent.message("alpha"))
+    ch.close()
+    var resp = stream_sse_response(ch^)
+    assert_equal(resp.status, 200)
+    assert_equal(resp.headers.get("content-type"), "text/event-stream")
+    assert_equal(resp.headers.get("cache-control"), "no-cache")
+    assert_true(Bool(resp.body_stream))
+
+
+def _sse_stream_handler(req: Request) raises -> Response:
+    var ch = SseChannel()
+    ch.push(SseEvent.message("alpha"))
+    ch.push(SseEvent.message("beta"))
+    ch.close()
+    return stream_sse_response(ch^)
+
+
+def _sse_router_e2e() raises:
+    """A handler returning stream_sse_response streams the SSE records
+    through the reactor; the client reassembles the de-chunked body."""
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = UInt16(srv.local_addr().port)
+    var pid = fork()
+    if pid == 0:
+        try:
+            srv.serve(_sse_stream_handler)
+        except:
+            pass
+        exit()
+    usleep(200000)
+
+    var url = (
+        String("http://127.0.0.1:") + String(Int(port)) + String("/events")
+    )
+    var got_body = String("")
+    var got_ct = String("")
+    try:
+        with HttpClient() as c:
+            var r = c.get(url)
+            got_body = r.text()
+            got_ct = r.headers.get("content-type")
+    except:
+        pass
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    assert_equal(got_body, "data: alpha\n\ndata: beta\n\n")
+    assert_equal(got_ct, "text/event-stream")
+
+
+def test_format_keeps_utf8_intact() raises:
+    var wire = format_sse_event(SseEvent.message(String("héllo 世界")))
+    var s = String(unsafe_from_utf8=Span[UInt8, _](wire))
+    assert_true("data: héllo 世界\n" in s, s)
+
+
+def _wire(ev: SseEvent) -> String:
+    var w = format_sse_event(ev)
+    return String(unsafe_from_utf8=Span[UInt8, _](w))
+
+
+def test_lone_cr_in_data_cannot_inject_a_field() raises:
+    var s = _wire(SseEvent.message(String("hi\revent: admin\rdata: pwned")))
+    assert_equal(
+        s, String("data: hi\ndata: event: admin\ndata: data: pwned\n\n")
+    )
+
+
+def test_crlf_in_data_is_one_line_break() raises:
+    var s = _wire(SseEvent.message(String("a\r\nb")))
+    assert_equal(s, String("data: a\ndata: b\n\n"))
+
+
+def test_newlines_in_id_and_event_are_dropped() raises:
+    var ev = SseEvent(
+        String("x"), String("tick\nevent: admin"), String("7\r\nid: 9"), -1
+    )
+    var s = _wire(ev)
+    assert_true(s.startswith("id: 7id: 9\nevent: tickevent: admin\n"), s)
+    assert_equal(s.count("\n"), 4)
+
+
+def test_channel_releases_sent_events() raises:
+    var ch = SseChannel()
+    var never = Cancel.never()
+    for _ in range(300):
+        ch.push(SseEvent.message(String("x")))
+    for _ in range(300):
+        _ = ch.next(never)
+    assert_equal(len(ch._events), 0)
+    assert_equal(ch.pending(), 0)
+
+
+def main() raises:
+    TestSuite.discover_tests[__functions_in_module()]().run()
+    _sse_router_e2e()
+    print("test_sse.mojo -- SSE Router K1 e2e passed")

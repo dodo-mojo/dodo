@@ -1,0 +1,998 @@
+"""``UringReactor``: io_uring-native event-loop wrapper.
+
+Sits on top of :mod:`dodo.runtime.io_uring_driver` (which owns
+the ``io_uring_setup`` + the three SQ/CQ/SQE-array mmaps, the
+atomic head/tail accessors, and the raw submit/reap surface) and
+adds the **operation-tagged** API that the upcoming uring-backed
+server reactor calls:
+
+* ``arm_listener_multishot(fd, conn_id)`` — submit one
+  ``IORING_OP_ACCEPT`` SQE with ``IORING_ACCEPT_MULTISHOT`` so
+  the kernel keeps re-arming the accept after every completion.
+* ``arm_recv_multishot(fd, buf_ptr, buf_len, conn_id)`` — submit
+  one ``IORING_OP_RECV`` SQE with ``IORING_RECV_MULTISHOT`` so
+  the kernel posts a CQE every time data lands without
+  re-arming. (Caller is responsible for buffer ownership; dodo
+  uses :mod:`dodo.runtime.buffer_pool`.)
+* ``submit_send(fd, buf_ptr, buf_len, conn_id)`` — fire-and-
+  forget ``IORING_OP_SEND``. The CQE confirms the kernel
+  enqueued the bytes; no per-byte loop.
+* ``submit_close(fd, conn_id)`` — graceful close via
+  ``IORING_OP_CLOSE``. Posted with ``IOSQE_CQE_SKIP_SUCCESS`` so
+  the success case doesn't even round-trip a CQE — close-on-
+  success is async fire-and-forget.
+* ``cancel_conn(conn_id)`` — submit an
+  ``IORING_OP_ASYNC_CANCEL`` targeting any in-flight SQE bearing
+  ``conn_id``'s tag. Used by deadline / shutdown paths.
+* ``poll(min_complete, out)`` — call
+  ``io_uring_enter(min_complete=min_complete)`` then drain the
+  CQ into ``out`` as a list of ``UringCompletion`` records.
+* ``wakeup()`` — write 1 to a per-reactor eventfd registered as
+  a poll target on the ring (so ``poll`` returns from
+  ``io_uring_enter`` as soon as any thread calls ``wakeup``).
+
+Operation tagging
+-----------------
+
+Each SQE is tagged with a 64-bit ``user_data`` that the kernel
+returns verbatim on the matching CQE. We pack two fields into
+that 64-bit slot:
+
+    | bits 63..56 | bits 55..0   |
+    | op_kind     | conn_id      |
+
+* ``op_kind`` (8 bits) — one of :data:`URING_OP_ACCEPT`,
+  :data:`URING_OP_RECV`, :data:`URING_OP_SEND`,
+  :data:`URING_OP_CLOSE`, :data:`URING_OP_CANCEL`,
+  :data:`URING_OP_WAKEUP`.
+* ``conn_id`` (56 bits) — caller-defined connection identifier.
+  dodo passes a connection-pool slot index.
+
+Two helpers — :func:`pack_user_data` and :func:`unpack_user_data`
+— round-trip the encoding and are unit-tested in the dedicated
+test module.
+
+Why an operation-tagged surface (not register/poll like epoll)
+--------------------------------------------------------------
+
+io_uring's value proposition is the **opposite** of epoll:
+instead of "tell me when fd is ready" → "do op manually", it's
+"do op for me; tell me when it completed". Flattening that into
+an epoll-style ``register(fd, READ); on poll, recv()`` surface
+re-introduces the syscall-per-event cost epoll has and
+``io_uring`` was built to avoid.
+
+So ``UringReactor`` exposes the io_uring-native submit/reap API
+directly. The two backends (``epoll/kqueue`` ``Reactor`` vs
+``UringReactor``) are selected at the **server** layer by a
+comptime branch — the ``_server_reactor_impl`` state machine
+talks to whichever backend is selected via a thin trait surface.
+
+Concurrency
+-----------
+
+One ``UringReactor`` per worker pthread (matching the existing
+``Reactor`` ownership model). All SQ/CQ ring atomics happen on
+the single owning thread; the only cross-thread hook is
+``wakeup`` which writes 1 byte into the per-reactor eventfd.
+"""
+
+from std.atomic import Atomic, Ordering
+from std.ffi import c_int, c_uint, c_size_t, external_call, get_errno
+from std.memory import Layout, Pointer, alloc, stack_allocation
+from std.os import getenv
+from std.sys.info import CompilationTarget
+
+from dodo.net._libc import (
+    INVALID_FD,
+    EFD_NONBLOCK,
+    EFD_CLOEXEC,
+    _close,
+    _eventfd,
+    DodoRawIO,
+)
+from dodo.net.error import NetworkError
+from dodo.runtime.io_uring import io_uring_register, is_io_uring_available
+from dodo.runtime.io_uring_driver import libc_mmap, libc_munmap
+from dodo.runtime.io_uring_driver import IoUringDriver
+from dodo.runtime.io_uring_sqe import (
+    IORING_ACCEPT_MULTISHOT,
+    IORING_RECV_MULTISHOT,
+    IORING_CQE_F_MORE,
+    IOSQE_CQE_SKIP_SUCCESS,
+    POLLERR,
+    POLLHUP,
+    POLLIN,
+    POLLOUT,
+    POLLRDHUP,
+    IoUringCqe,
+    prep_accept,
+    prep_async_cancel,
+    prep_close,
+    prep_multishot_accept,
+    prep_poll_add,
+    prep_poll_remove,
+    prep_provide_buffers,
+    prep_read,
+    prep_recv,
+    prep_recv_buffer_select,
+    prep_send,
+    IORING_REGISTER_PBUF_RING,
+    IORING_UNREGISTER_PBUF_RING,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Provided-buffer-ring memory helpers live in ``_pbuf_ring.mojo`` (split out
+# for file size); re-exported here so existing call sites resolve unchanged.
+# ──────────────────────────────────────────────────────────────────────────────
+from ._pbuf_ring import (
+    _mmap_anon_rw,
+    _munmap,
+    _pbuf_ring_add,
+    _pbuf_ring_get_tail,
+    _pbuf_ring_set_tail,
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Op-tag encoding + completion record live in ``_uring_optag.mojo`` (split out
+# for file size); re-exported here so existing call sites resolve unchanged.
+# ──────────────────────────────────────────────────────────────────────────────
+from ._uring_optag import (
+    URING_OP_ACCEPT,
+    URING_OP_RECV,
+    URING_OP_SEND,
+    URING_OP_CLOSE,
+    URING_OP_CANCEL,
+    URING_OP_WAKEUP,
+    URING_OP_POLL,
+    URING_OP_POLL_REMOVE,
+    URING_OP_PROVIDE_BUFFERS,
+    pack_user_data,
+    unpack_op,
+    unpack_conn_id,
+    UringCompletion,
+    _cqe_to_completion,
+)
+
+
+# ── UringReactor ─────────────────────────────────────────────────────────────
+
+
+struct UringReactor(Movable):
+    """One io_uring ring + a wakeup eventfd, exposed as the
+    submit/reap surface dodo's per-worker server reactor uses
+    on the io_uring backend.
+
+    Per-worker ownership model: each pthread that runs a server
+    reactor loop owns exactly one ``UringReactor``; the kernel-
+    shared rings are SPSC per direction so no inter-worker
+    synchronisation is needed beyond the ``wakeup`` eventfd
+    write.
+
+    Fields:
+        _driver: The owning ``IoUringDriver`` (closes ring fd +
+            unmaps SQ/CQ/SQE on drop).
+        _wake_fd: Per-reactor eventfd. ``poll`` arms a
+            ``IORING_OP_RECV`` against it (the eventfd's read
+            side is byte-stream-shaped) so the next ``wakeup``
+            from any thread surfaces a ``URING_OP_WAKEUP`` CQE.
+        _wake_buf: Pinned 8-byte buffer the wakeup recv writes
+            into.
+        _io: Cached ``libdodo_tls`` raw-IO handles for the
+            ``write`` syscall used by ``wakeup``.
+        _wake_armed: True after the first ``poll`` arms the
+            wakeup recv; we re-arm lazily after each wakeup CQE.
+    """
+
+    var _driver: IoUringDriver
+    var _wake_fd: c_int
+    # Owning pointer to the 8-byte eventfd recv buffer; pinned for
+    # the reactor's lifetime so the multishot recv arming SQE
+    # stays valid. Stored under ``MutUntrackedOrigin`` to match
+    # the ``prep_recv`` buf-pointer convention used everywhere
+    # in :mod:`dodo.runtime.io_uring_sqe`.
+    var _wake_buf: Pointer[UInt8, MutUntrackedOrigin]
+    var _io: DodoRawIO
+    var _wake_armed: Bool
+    var _cross_thread_wakeup: Bool
+    """If True, ``poll`` lazy-arms the wakeup ``IORING_OP_READ``
+    SQE and ``wakeup()`` writes the eventfd to nudge the
+    poll-loop owner. If False, both paths short-circuit; this
+    eliminates one always-pending SQE on the hot path for
+    single-issuer bufring rings that don't need cross-thread
+    wakeup. The positive name keeps the call-site logic
+    direct (``if self._cross_thread_wakeup`` rather than the
+    earlier ``not _wakeup_disabled`` double negative)."""
+
+    def __init__(
+        out self,
+        entries: Int = 256,
+        setup_flags: UInt32 = UInt32(0),
+        sq_thread_cpu: UInt32 = UInt32(0),
+        sq_thread_idle: UInt32 = UInt32(0),
+        enable_wakeup: Bool = True,
+    ) raises:
+        """Set up the ring + (optionally) the wakeup eventfd.
+
+        Args:
+            entries: SQE count (kernel rounds up to a power of
+                two; default 256 matches the epoll
+                ``max_events`` budget so the per-worker memory
+                footprint is comparable).
+            setup_flags: Bitwise-OR of ``IORING_SETUP_*`` flags
+                forwarded to :class:`IoUringDriver`. Default 0
+                preserves the original interrupt-driven, no-
+                batching behaviour. The bufring dispatch path
+                opts into ``COOP_TASKRUN | TASKRUN_FLAG |
+                SUBMIT_ALL`` and (on kernel >= 6.1)
+                ``SINGLE_ISSUER | DEFER_TASKRUN`` so the kernel
+                batches task work to enter boundaries instead
+                of running it IPI-style mid-syscall.
+            sq_thread_cpu: SQPOLL CPU affinity (CPU id the
+                kernel pins the SQPOLL thread to); ignored
+                unless ``setup_flags`` includes
+                ``IORING_SETUP_SQPOLL``.
+            sq_thread_idle: SQPOLL idle timeout in milliseconds
+                before the kernel parks the SQPOLL thread;
+                ignored unless ``setup_flags`` includes
+                ``IORING_SETUP_SQPOLL``.
+            enable_wakeup: Default True (the historical
+                behaviour). Set False to skip the wakeup
+                eventfd creation + the lazy-arm of the wakeup
+                ``IORING_OP_READ`` SQE in :func:`poll`. This
+                eliminates one always-pending SQE on the hot
+                path AND removes the eventfd file descriptor.
+                Safe to set False when the reactor's owner
+                thread will never call :func:`wakeup` from
+                another thread (which is the case for the
+                bufring dispatch -- each worker owns its own
+                ring + drives it from one pthread, and shutdown
+                is signalled via a heap-allocated flag the
+                worker checks each iteration).
+
+        Raises:
+            Error: On ``io_uring_setup`` failure (see
+                :class:`IoUringDriver`) or ``eventfd`` failure.
+        """
+        comptime if not CompilationTarget.is_linux():
+            raise Error(
+                "UringReactor is a Linux-only feature; this build is not Linux"
+            )
+        self._io = DodoRawIO()
+        self._driver = IoUringDriver(
+            entries,
+            setup_flags=setup_flags,
+            sq_thread_cpu=sq_thread_cpu,
+            sq_thread_idle=sq_thread_idle,
+        )
+        self._cross_thread_wakeup = enable_wakeup
+        if enable_wakeup:
+            # NOTE: deliberately *blocking* eventfd (no EFD_NONBLOCK).
+            # io_uring's IORING_OP_RECV against a non-blocking eventfd
+            # with no pending data immediately posts a -EAGAIN CQE,
+            # which spins ``poll(1, ...)`` into a 100 % CPU loop on
+            # idle. With the blocking flag clear the kernel actually
+            # waits on the eventfd, the CQE only fires when ``wakeup``
+            # writes a token, and ``wakeup()`` itself is safe from any
+            # thread (the write(2) on the eventfd is atomic + small).
+            var efd = _eventfd(c_uint(0), EFD_CLOEXEC)
+            if efd < c_int(0):
+                raise Error(
+                    "UringReactor: eventfd failed: errno="
+                    + String(get_errno().value)
+                )
+            self._wake_fd = efd
+            # 8 bytes is the eventfd read width; we keep the buffer
+            # pinned for the reactor's lifetime so the multishot recv
+            # arming SQE keeps a stable pointer.
+            var raw = alloc(Layout[UInt8](count=8)).unsafe_leak()
+            for i in range(8):
+                raw.unsafe_offset(i).unsafe_write(UInt8(0))
+            self._wake_buf = Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=Int(raw)
+            )
+        else:
+            # No-wakeup mode: skip the eventfd + buffer alloc
+            # entirely. _wake_fd = INVALID_FD and _wake_buf =
+            # NULL match the __deinit__ guards (skip close() /
+            # free() when these are sentinel) so the no-wakeup
+            # mode is fully no-op on shutdown too.
+            self._wake_fd = INVALID_FD
+            # Pointer is non-nullable; C NULL from a runtime 0.
+            var null_addr = 0
+            self._wake_buf = Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=null_addr
+            )
+        self._wake_armed = False
+
+    def __deinit__(deinit self):
+        """Free the wakeup buffer + close the wakeup fd; the
+        ``IoUringDriver`` destructor handles ring teardown."""
+        if Int(self._wake_buf) != 0:
+            self._wake_buf.unsafe_free()
+        if self._wake_fd != INVALID_FD:
+            _ = _close(self._wake_fd)
+
+    # ── Introspection ────────────────────────────────────────────────────────
+
+    def fd(self) -> Int:
+        """Return the underlying io_uring ring fd."""
+        return self._driver.fd()
+
+    def sq_entries(self) -> Int:
+        """Kernel-allocated SQ size."""
+        return self._driver.sq_entries()
+
+    def cq_entries(self) -> Int:
+        """Kernel-allocated CQ size."""
+        return self._driver.cq_entries()
+
+    # ── Submit API ───────────────────────────────────────────────────────────
+
+    def arm_listener_multishot(
+        mut self, listener_fd: Int, conn_id: UInt64 = 0
+    ) raises -> None:
+        """Submit one multishot accept SQE so the kernel posts a
+        CQE for every accepted connection without re-arming.
+
+        The CQE handler should look at ``cqe.has_more`` — when
+        unset, the multishot has terminated (e.g. listener
+        closed) and the caller should re-arm.
+
+        Args:
+            listener_fd: Listener socket fd (must be non-blocking
+                or kernel ≥ 6.0 for blocking-listener support).
+            conn_id: Tag returned in every accept CQE; defaults
+                to 0 when there's only one listener.
+
+        Raises:
+            Error: If the SQ is full (hot-path error; caller
+                should ``poll`` to drain CQEs first).
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.arm_listener_multishot: SQ is full")
+        var ud = pack_user_data(URING_OP_ACCEPT, conn_id)
+        # SOCK_CLOEXEC (0o2000000): accepted fds are close-on-exec, the
+        # same as the accept4 path.
+        prep_multishot_accept(
+            slot, listener_fd, UInt64(0), UInt64(0), UInt32(0o2000000), ud
+        )
+        self._driver.commit_sqe()
+
+    def arm_recv_multishot(
+        mut self,
+        fd: Int,
+        buf: Pointer[UInt8, MutUntrackedOrigin],
+        buf_len: Int,
+        conn_id: UInt64,
+    ) raises -> None:
+        """Submit one recv SQE that re-fires once when data
+        arrives.
+
+        **NOTE on naming**: the original intent was true multishot
+        (``IORING_RECV_MULTISHOT``) but the Linux kernel rejects
+        multishot recv with ``-EINVAL`` unless ``IOSQE_BUFFER_SELECT``
+        is set on the SQE (kernel needs a buffer pool to pick from
+        on each completion -- it can't pre-allocate space for an
+        unbounded stream into a single fixed buffer). This helper
+        targets a single user-owned buffer, so it's effectively
+        one-shot at the kernel level. For TRUE multishot recv,
+        use :func:`arm_recv_buffer_select` with a registered
+        ``IORING_REGISTER_PBUF_RING`` buffer ring.
+
+        Args:
+            fd: Connected socket fd.
+            buf: Receive buffer (caller-owned; dodo uses a
+                BufferHandle from the per-worker pool).
+            buf_len: Buffer capacity in bytes.
+            conn_id: Tag returned in the recv CQE.
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.arm_recv_multishot: SQ is full")
+        var ud = pack_user_data(URING_OP_RECV, conn_id)
+        # No MULTISHOT flag (kernel rejects without
+        # IOSQE_BUFFER_SELECT). recv_flags=0 -> plain oneshot.
+        prep_recv(
+            slot,
+            fd,
+            UInt64(Int(buf)),
+            buf_len,
+            UInt32(0),
+            ud,
+        )
+        self._driver.commit_sqe()
+
+    def arm_provide_buffers(
+        mut self,
+        addr: UInt64,
+        nbytes_per_buf: Int,
+        nbufs: Int,
+        bgid: UInt16,
+        bid: UInt16 = UInt16(0),
+    ) raises -> None:
+        """Submit one ``IORING_OP_PROVIDE_BUFFERS`` SQE that hands
+        the kernel a contiguous run of ``nbufs`` buffers of
+        ``nbytes_per_buf`` bytes each, starting at ``addr`` with
+        ids ``[bid, bid + nbufs)`` in buffer-group ``bgid``.
+
+        After this SQE completes (one CQE tagged
+        ``URING_OP_PROVIDE_BUFFERS`` with ``conn_id = bgid`` and
+        ``res = number of buffers actually accepted``), subsequent
+        ``arm_recv_buffer_select`` calls with the same ``bgid``
+        will have the kernel auto-pick a free buffer for each recv.
+
+        dodo's recv-buffer-ring dispatch loop typically calls this
+        once at startup with N×8 KiB buffers per worker, then
+        re-arms the same buffer id after each recv CQE is processed
+        (one PROVIDE_BUFFERS SQE with ``nbufs=1`` per recv CQE -- a
+        cheap re-fill that amortises into the next ``io_uring_enter``).
+
+        Args:
+            addr: Pointer to the first buffer in the run (typically
+                  the worker's owned heap allocation, or the slot
+                  inside it being re-fed).
+            nbytes_per_buf: Per-buffer size in bytes.
+            nbufs: Number of contiguous buffers (must be > 0).
+            bgid: Buffer-group id; used by the matching recv SQE's
+                ``buf_index`` and reported in the CQE's ``conn_id``.
+            bid: Starting buffer id (default 0).
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.arm_provide_buffers: SQ is full")
+        var ud = pack_user_data(URING_OP_PROVIDE_BUFFERS, UInt64(Int(bgid)))
+        prep_provide_buffers(slot, addr, nbytes_per_buf, nbufs, bgid, bid, ud)
+        self._driver.commit_sqe()
+
+    def register_pbuf_ring(
+        mut self,
+        bgid: UInt16,
+        ring_entries: Int,
+    ) raises -> Int:
+        """Register a kernel-mapped provided-buffer ring of
+        ``ring_entries`` slots in buffer-group ``bgid`` via
+        ``IORING_REGISTER_PBUF_RING`` (kernel 5.19+).
+
+        The 2.7x faster successor to :func:`arm_provide_buffers`
+        per Linux kernel benchmarks. Once registered, the ring is
+        populated by writing ``struct io_uring_buf`` entries and
+        bumping the tail pointer in shared memory -- NO SQE per
+        refill, NO io_uring_enter per refill. The kernel reads
+        the tail with acquire semantics on every recv that
+        selects from this group, so applications can replenish
+        single buffers cheaply.
+
+        Returns the ring memory address. Caller is responsible for
+        :func:`pbuf_ring_add_buffer` + :func:`pbuf_ring_advance` to
+        seed the ring; dodo's bufring dispatch typically does
+        this once with all N buffers at startup, then re-adds one
+        buffer per recv CQE before the next io_uring_enter.
+
+        Args:
+            bgid: Buffer-group id matching subsequent
+                ``arm_recv_buffer_select(... bgid ...)`` calls.
+            ring_entries: Number of slots in the ring. Must be a
+                power of two; max 2^15 (32768).
+
+        Returns:
+            The page-aligned address of the ring memory. Each
+            slot is 16 bytes (``sizeof(struct io_uring_buf)``);
+            total size is ``ring_entries * 16``. The ring
+            outlives this UringReactor by virtue of the kernel
+            holding a reference; dodo frees it explicitly via
+            :func:`unregister_pbuf_ring` on shutdown.
+
+        Raises:
+            Error: If ring_entries is not a power of two, exceeds
+                2^15, or the kernel rejects the registration.
+        """
+        debug_assert[assert_mode="safe"](
+            ring_entries > 0 and (ring_entries & (ring_entries - 1)) == 0,
+            "register_pbuf_ring: ring_entries must be a power of two; got ",
+            ring_entries,
+        )
+        debug_assert[assert_mode="safe"](
+            ring_entries <= (1 << 15),
+            "register_pbuf_ring: ring_entries must be <= 2^15; got ",
+            ring_entries,
+        )
+        # Allocate ring memory page-aligned via mmap. Each entry
+        # is 16 bytes (struct io_uring_buf {addr, len, bid, resv}).
+        var size = ring_entries * 16
+        var ring_addr = _mmap_anon_rw(size)
+        if ring_addr == 0:
+            raise Error("register_pbuf_ring: mmap failed")
+        # Build the io_uring_buf_reg struct on the stack:
+        # u64 ring_addr; u32 ring_entries; u16 bgid; u16 pad;
+        # u64 resv[3];  --> 40 bytes total.
+        var reg = stack_allocation[40, UInt8]()
+        for i in range(40):
+            reg.unsafe_offset(i).unsafe_write(UInt8(0))
+        # ring_addr (offset 0, u64 LE)
+        var ra = UInt64(ring_addr)
+        for i in range(8):
+            reg.unsafe_offset(i).unsafe_write(
+                UInt8(Int((ra >> UInt64(8 * i)) & 0xFF))
+            )
+        # ring_entries (offset 8, u32 LE)
+        var re = UInt32(ring_entries)
+        for i in range(4):
+            reg.unsafe_offset(8 + i).unsafe_write(
+                UInt8(Int((re >> UInt32(8 * i)) & 0xFF))
+            )
+        # bgid (offset 12, u16 LE)
+        reg.unsafe_offset(12).unsafe_write(UInt8(Int(bgid) & 0xFF))
+        reg.unsafe_offset(13).unsafe_write(UInt8((Int(bgid) >> 8) & 0xFF))
+        # pad (offset 14-15) and resv[3] (offset 16-39) all zero.
+        var rc = io_uring_register(
+            Int(self._driver.fd()),
+            IORING_REGISTER_PBUF_RING,
+            Int(reg),
+            1,
+        )
+        if rc < 0:
+            _munmap(ring_addr, size)
+            raise Error(
+                "register_pbuf_ring: io_uring_register failed; rc=" + String(rc)
+            )
+        return ring_addr
+
+    def unregister_pbuf_ring(
+        mut self,
+        bgid: UInt16,
+        ring_addr: Int,
+        ring_entries: Int,
+    ) raises -> None:
+        """Drop a ring previously registered via
+        :func:`register_pbuf_ring`. Kernel side cleans up its
+        reference; userspace side ``munmap``s the ring memory."""
+        var reg = stack_allocation[40, UInt8]()
+        for i in range(40):
+            reg.unsafe_offset(i).unsafe_write(UInt8(0))
+        # Just bgid is needed for unregister.
+        reg.unsafe_offset(12).unsafe_write(UInt8(Int(bgid) & 0xFF))
+        reg.unsafe_offset(13).unsafe_write(UInt8((Int(bgid) >> 8) & 0xFF))
+        _ = io_uring_register(
+            Int(self._driver.fd()),
+            IORING_UNREGISTER_PBUF_RING,
+            Int(reg),
+            1,
+        )
+        _munmap(ring_addr, ring_entries * 16)
+
+    def arm_recv_buffer_select(
+        mut self,
+        fd: Int,
+        bgid: UInt16,
+        conn_id: UInt64,
+        multishot: Bool = True,
+    ) raises -> None:
+        """Submit one ``IORING_OP_RECV`` SQE with
+        ``IOSQE_BUFFER_SELECT`` set; the kernel picks a buffer from
+        the ``bgid`` pool at recv time.
+
+        This is the production HTTP server recv shape every Rust
+        io_uring HTTP server uses. Combined with ``multishot=True``
+        (default), one SQE per accepted connection drives an
+        unbounded stream of recv CQEs; each CQE points at a fresh
+        kernel-picked buffer (id in the high 16 bits of
+        ``UringCompletion.flags``, decoded via
+        :func:`IoUringCqe.buffer_id`). No per-conn buffer ownership,
+        no per-CQE re-arm, no recv syscall round-trip.
+
+        Args:
+            fd: Connected socket fd.
+            bgid: Buffer-group id matching a prior
+                ``arm_provide_buffers`` call.
+            conn_id: Tag returned in every recv CQE; identifies the
+                connection this recv belongs to.
+            multishot: When True (default), set
+                ``IORING_RECV_MULTISHOT`` so the kernel keeps the
+                recv armed across CQEs. Only valid in combination
+                with ``IOSQE_BUFFER_SELECT`` (which this helper
+                always sets), since multishot recv requires a
+                buffer-group source.
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.arm_recv_buffer_select: SQ is full")
+        var ud = pack_user_data(URING_OP_RECV, conn_id)
+        var recv_flags: UInt32 = 0
+        if multishot:
+            recv_flags |= IORING_RECV_MULTISHOT
+        prep_recv_buffer_select(slot, fd, bgid, recv_flags, ud)
+        self._driver.commit_sqe()
+
+    def submit_send(
+        mut self,
+        fd: Int,
+        buf: Pointer[UInt8, _],
+        buf_len: Int,
+        conn_id: UInt64,
+    ) raises -> None:
+        """Submit one ``IORING_OP_SEND`` SQE.
+
+        Args:
+            fd: Connected socket fd.
+            buf: Send buffer; caller must keep it alive until
+                the matching CQE is reaped.
+            buf_len: Bytes to send.
+            conn_id: Tag returned in the send CQE.
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.submit_send: SQ is full")
+        var ud = pack_user_data(URING_OP_SEND, conn_id)
+        # MSG_NOSIGNAL = 0x4000 prevents SIGPIPE on closed peers.
+        prep_send(slot, fd, UInt64(Int(buf)), buf_len, UInt32(0x4000), ud)
+        self._driver.commit_sqe()
+
+    def submit_close(mut self, fd: Int, conn_id: UInt64) raises -> None:
+        """Submit one ``IORING_OP_CLOSE`` SQE.
+
+        Uses ``IOSQE_CQE_SKIP_SUCCESS`` so the kernel only posts
+        a CQE on failure — the typical close path is async
+        fire-and-forget.
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.submit_close: SQ is full")
+        var ud = pack_user_data(URING_OP_CLOSE, conn_id)
+        prep_close(slot, fd, ud)
+        # Set IOSQE_CQE_SKIP_SUCCESS in the flags byte at offset 1.
+        # The IoUringSqe wrapper exposes set_flags but we're
+        # writing a raw slot here; use the helper directly.
+        # Offset 1 is _SQE_OFF_FLAGS; we OR in the skip-success bit.
+        var flag_byte = slot.unsafe_offset(1).unsafe_load()
+        slot.unsafe_offset(1).unsafe_write(
+            flag_byte | UInt8(Int(IOSQE_CQE_SKIP_SUCCESS))
+        )
+        self._driver.commit_sqe()
+
+    def arm_poll_readable_multishot(
+        mut self,
+        fd: Int,
+        conn_id: UInt64,
+        poll_mask: UInt32 = POLLIN | POLLRDHUP,
+    ) raises -> None:
+        """Submit a multishot ``IORING_OP_POLL_ADD`` against ``fd``.
+
+        Kernel posts a CQE every time the fd's readiness matches
+        any bit in ``poll_mask``, without re-arming. This is the
+        io_uring analog of ``epoll_ctl(EPOLL_CTL_ADD, fd, EPOLLIN
+        | EPOLLET)`` and is the substrate the upcoming server-loop
+        dispatch swap (B0 wire-in) uses to replace ``epoll_wait``
+        on the io_uring backend.
+
+        The CQE is tagged ``URING_OP_POLL`` so the dispatch loop
+        can route it to the same code path that handles
+        ``EVENT_READABLE`` on the epoll backend; the existing
+        ``ConnHandle.on_readable`` then runs its own ``recv``
+        syscall. The buffer-ring path (``IORING_OP_RECV`` +
+        ``IORING_RECV_MULTISHOT`` against a registered
+        ``IORING_REGISTER_PBUF_RING``) is a separate dispatch
+        loop opt-in via ``DODO_BUFRING_HANDLER=1``.
+
+        Args:
+            fd: Connected socket fd. ``debug_assert`` checks
+                ``fd >= 0``.
+            conn_id: Caller-defined connection slot id (e.g. the
+                fd itself when 1:1 with a ConnHandle).
+            poll_mask: Defaults to ``POLLIN | POLLRDHUP`` so
+                peer-closed connections surface alongside data-
+                available ones; pass ``POLLOUT`` for write-side
+                readiness or any combination of the ``POLL*``
+                constants.
+
+        Raises:
+            Error: If the SQ is full (hot-path; caller should
+                drain CQEs first).
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.arm_poll_readable_multishot: SQ is full")
+        var ud = pack_user_data(URING_OP_POLL, conn_id)
+        prep_poll_add(slot, fd, poll_mask, ud, True)
+        self._driver.commit_sqe()
+
+    def cancel_poll(mut self, conn_id: UInt64) raises -> None:
+        """Submit ``IORING_OP_POLL_REMOVE`` cancelling the
+        multishot poll registered for ``conn_id``.
+
+        After the kernel processes the remove SQE, two CQEs
+        arrive: one tagged ``URING_OP_POLL_REMOVE`` (this SQE's
+        own completion, ``res = 0`` on success or ``-ENOENT`` if
+        nothing matched), and one final tagged ``URING_OP_POLL``
+        without ``IORING_CQE_F_MORE`` for the cancelled poll
+        itself.
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.cancel_poll: SQ is full")
+        var target = pack_user_data(URING_OP_POLL, conn_id)
+        var ud = pack_user_data(URING_OP_POLL_REMOVE, conn_id)
+        prep_poll_remove(slot, target, ud)
+        self._driver.commit_sqe()
+
+    def cancel_conn(mut self, conn_id: UInt64) raises -> None:
+        """Submit an ``IORING_OP_ASYNC_CANCEL`` for any in-flight
+        op tagged with ``conn_id`` (the kernel cancels the
+        first match).
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor.cancel_conn: SQ is full")
+        # The cancel SQE itself uses URING_OP_CANCEL as its
+        # op_kind. The recv it's targeting is conn_id with
+        # URING_OP_RECV — we cancel by matching the recv's
+        # full user_data tag.
+        var target = pack_user_data(URING_OP_RECV, conn_id)
+        var ud = pack_user_data(URING_OP_CANCEL, conn_id)
+        prep_async_cancel(slot, target, ud)
+        self._driver.commit_sqe()
+
+    # ── Reap API ─────────────────────────────────────────────────────────────
+
+    def poll(
+        mut self,
+        min_complete: Int,
+        mut out: List[UringCompletion],
+        max_completions: Int = 64,
+        timeout_ms: Int = -1,
+    ) raises -> Int:
+        """Submit any pending SQEs, drain ready CQEs, then
+        optionally block for more.
+
+        Peek-then-block dispatch (matches the ``tokio-uring`` /
+        ``monoio`` pattern). Three phases per call:
+
+        1. **Submit**: flush any pending SQEs to the kernel
+           via ``io_uring_enter(submit, 0, GETEVENTS)`` -- this
+           does NOT block, but does collect any CQEs the kernel
+           has already posted asynchronously (e.g. multishot
+           recv completions that fired between the prior poll
+           and this one). On kernels with DEFER_TASKRUN
+           (negotiated by the bufring setup-flag probe), this
+           call also runs deferred task work which can produce
+           the CQEs we then drain in step 2.
+
+        2. **Drain**: pull every ready CQE out of the CQ into
+           ``out``, up to ``max_completions``. No syscall in
+           this phase -- pure userspace ring head/tail
+           manipulation. This is where multishot recv CQEs
+           land in batches under sustained load; an always-block
+           design would only pull one at a time because
+           ``submit_and_wait(1)`` returns as soon as one CQE is
+           ready.
+
+        3. **Block (only if needed)**: if we drained fewer than
+           ``min_complete`` CQEs, call ``submit_and_wait(...)``
+           with the remaining count to actually block. The
+           common case under sustained load is that step 2
+           returned plenty of CQEs and step 3 is skipped
+           entirely.
+
+        Returns the number of completions appended to ``out``.
+
+        Args:
+            min_complete: 0 = non-blocking poll; positive =
+                block until at least this many CQEs are ready
+                across the drain + optional block phases.
+            out: Output list (cleared on entry).
+            max_completions: Per-poll budget so one slow op
+                doesn't starve the reactor (matches epoll's
+                ``max_events``).
+            timeout_ms: Longest the blocking phase may wait. Negative
+                (the default) waits for ``min_complete`` completions
+                however long they take; non-negative bounds the wait and
+                returns whatever arrived, so a loop can re-read its stop
+                flag (a ring with no wakeup channel needs this).
+        """
+        out.clear()
+        # Lazy-arm the wakeup read on first poll so the eventfd
+        # surfaces wakeups via the same drain loop. Skipped entirely
+        # when ``enable_wakeup=False`` was passed at construction
+        # (single-issuer bufring rings opt out -- they don't need
+        # cross-thread wakeup). If the SQ is full the arm fails; it
+        # is retried after phase 1 has flushed the SQ (RT-03).
+        self._try_arm_wakeup()
+
+        # Phase 1: non-blocking submit + collect already-ready
+        # CQEs. submit_and_wait(0) flushes the SQ tail to the
+        # kernel; on COOP_TASKRUN/DEFER_TASKRUN kernels it also
+        # runs deferred task work, which often produces the CQEs
+        # we drain in phase 2.
+        var rc0 = self._driver.submit_and_wait(0)
+        if rc0 < 0 and rc0 != -4:  # -EINTR
+            raise Error(
+                "UringReactor.poll: io_uring_enter(0) failed; rc=" + String(rc0)
+            )
+
+        # Phase 1 emptied the SQ: retry a failed arm now so phase 3 never
+        # blocks with no read on the eventfd (RT-03).
+        self._try_arm_wakeup()
+
+        # Phase 2: drain everything ready into ``out``. No
+        # syscall. Tracks both the surfaced count (``n``) and
+        # the raw consumed count (``raw``, includes filtered-out
+        # wakeup CQEs). The wakeup-absorbed bit informs the
+        # block decision below: a wakeup that arrived between
+        # phases 1 and 2 means the caller has been signalled to
+        # wake up, so phase 3 must skip the block to honour the
+        # wakeup contract even though no CQE surfaces.
+        var raw_consumed: Int = 0
+        var n = self._drain_into_tracking(out, max_completions, raw_consumed)
+
+        # Phase 3: only block if the caller asked for >= 1 CQE
+        # AND we haven't satisfied that request yet AND no
+        # wakeup-CQE absorbed (a wakeup signals "release any
+        # blocked poll" -- honoured here by skipping the block).
+        # ``need`` is the residual; submit_and_wait(need) blocks
+        # until at least ``need`` more CQEs land.
+        var need = min_complete - n
+        if need > 0 and n < max_completions and raw_consumed == 0:
+            var rc1: Int
+            if timeout_ms >= 0:
+                rc1 = self._driver.submit_and_wait_timeout(need, timeout_ms)
+            else:
+                rc1 = self._driver.submit_and_wait(need)
+            # -EINTR: signal; -ETIME: the bounded wait ran out.
+            if rc1 < 0 and rc1 != -4 and rc1 != -62:
+                raise Error(
+                    "UringReactor.poll: io_uring_enter("
+                    + String(need)
+                    + ") failed; rc="
+                    + String(rc1)
+                )
+            n += self._drain_into(out, max_completions - n)
+
+        return n
+
+    def _drain_into(
+        mut self,
+        mut out: List[UringCompletion],
+        max_completions: Int,
+    ) raises -> Int:
+        """Drain every available CQE into ``out``, up to
+        ``max_completions``. Filters out wakeup CQEs (re-arms
+        the lazy wakeup flag instead). Returns the number
+        appended to ``out``.
+
+        Pure userspace -- no syscall. Thin wrapper over
+        :func:`_drain_into_tracking` that discards the
+        raw-consumed count.
+        """
+        var raw: Int = 0
+        return self._drain_into_tracking(out, max_completions, raw)
+
+    def _drain_into_tracking(
+        mut self,
+        mut out: List[UringCompletion],
+        max_completions: Int,
+        mut raw_consumed: Int,
+    ) raises -> Int:
+        """Like :func:`_drain_into` but also writes the raw
+        consumed count into ``raw_consumed`` (which includes
+        wakeup CQEs that were absorbed without surfacing).
+
+        :func:`poll`'s peek-then-block dispatch uses the raw
+        count to decide whether to block in the third phase: a
+        wakeup CQE that arrived between phase 1 (submit) and
+        phase 2 (drain) means the caller has been signalled to
+        wake up, even if no surfaced CQE accompanies it -- so
+        phase 3 must skip the block to honour the wakeup
+        contract.
+
+        Returns the number of CQEs appended to ``out`` (the
+        surfaced count); the raw consumed count is written
+        through ``raw_consumed``.
+        """
+        var n = 0
+        raw_consumed = 0
+        while raw_consumed < max_completions:
+            var maybe = self._driver.reap_cqe()
+            if not Bool(maybe):
+                break
+            var cqe = maybe.value()
+            var comp = _cqe_to_completion(cqe)
+            raw_consumed += 1
+            # Wakeup CQEs get re-armed lazily and not surfaced.
+            if comp.op == URING_OP_WAKEUP:
+                self._wake_armed = False
+                continue
+            out.append(comp)
+            n += 1
+        return n
+
+    def wakeup(self) raises -> None:
+        """Cross-thread wakeup: write 1 to the eventfd. Safe from
+        any thread.
+
+        The next ``poll`` will return because the multishot recv
+        on the eventfd posts a CQE.
+
+        No-op when the reactor was constructed with
+        ``enable_wakeup=False`` -- single-issuer bufring rings
+        opt out because they don't need cross-thread signalling.
+        """
+        if not self._cross_thread_wakeup:
+            return
+        var one = stack_allocation[8, UInt8]()
+        one.unsafe_offset(0).unsafe_write(UInt8(1))
+        for k in range(1, 8):
+            one.unsafe_offset(k).unsafe_write(UInt8(0))
+        _ = self._io.write(self._wake_fd, one, c_size_t(8))
+
+    # ── Private helpers ──────────────────────────────────────────────────────
+
+    def _try_arm_wakeup(mut self):
+        """Arm the wakeup read when cross-thread wakeup is enabled and
+        no read is in flight. A failure (SQ full) is swallowed and
+        leaves ``_wake_armed`` False so the caller retries; ``poll``
+        retries after phase 1 has freed the SQ, before it may block.
+        """
+        if self._cross_thread_wakeup and (not self._wake_armed):
+            try:
+                self._arm_wakeup_recv()
+                self._wake_armed = True
+            except _e:
+                pass
+
+    def _arm_wakeup_recv(mut self) raises -> None:
+        """Submit a read SQE on the wakeup eventfd so the next
+        ``wakeup`` write posts a CQE.
+
+        We use ``IORING_OP_READ`` instead of ``IORING_OP_RECV``
+        because eventfd is an anon-inode file, not a socket;
+        ``IORING_OP_RECV`` returns ``-ENOTSOCK`` immediately on
+        an eventfd which would busy-loop ``poll(min_complete=1)``.
+        """
+        var slot = self._driver.next_sqe()
+        if Int(slot) == 0:
+            raise Error("UringReactor._arm_wakeup_recv: SQ is full")
+        var ud = pack_user_data(URING_OP_WAKEUP, UInt64(0))
+        prep_read(
+            slot,
+            Int(self._wake_fd),
+            UInt64(Int(self._wake_buf)),
+            8,
+            UInt64(0),
+            ud,
+        )
+        self._driver.commit_sqe()
+
+
+# ── Comptime backend selector ────────────────────────────────────────────────
+
+
+@always_inline
+def use_uring_backend() -> Bool:
+    """Comptime+runtime predicate: True iff the host kernel
+    exposes io_uring **and** the build target is Linux.
+
+    The dodo server's reactor branch consults this once at
+    startup to decide whether to construct a ``UringReactor``
+    (io_uring path) or fall back to the existing ``Reactor``
+    (epoll path on Linux without io_uring, kqueue on macOS).
+
+    The decision is per-process: a long-running server picks
+    one backend at boot and never switches. The choice can be
+    forced off via the ``DODO_DISABLE_IO_URING=1`` environment
+    variable for A/B benchmarking; dodo's default is "use
+    io_uring when available".
+    """
+    comptime if not CompilationTarget.is_linux():
+        return False
+    # Respect the documented A/B-bench escape hatch. We treat any
+    # non-empty value other than "0" / "false" / "no" as "disable"
+    # so contributors can ``DODO_DISABLE_IO_URING=1`` (the
+    # documented form) without having to remember the exact spelling.
+    var disabled = getenv("DODO_DISABLE_IO_URING")
+    if disabled.byte_length() > 0:
+        var d = disabled
+        if not (d == "0" or d == "false" or d == "FALSE" or d == "no"):
+            return False
+    return is_io_uring_available()

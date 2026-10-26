@@ -1,0 +1,10 @@
+{
+  "name": "2.7.1_pong_empty_payload",
+  "spec": "RFC 6455 §5.5.3 (Pong control frame; zero-length payload)",
+  "input_hex": "8a 00",
+  "expect": "accept",
+  "expect_reason": "FIN=1 OP=PONG (0xA) len=0 -- unsolicited empty pong is permitted",
+  "expected_opcode": 10,
+  "expected_fin": true,
+  "expected_payload_hex": ""
+}

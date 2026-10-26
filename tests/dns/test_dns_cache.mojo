@@ -1,0 +1,122 @@
+"""Unit tests for the TTL DNS cache.
+
+Verifies the additive :class:`dodo.dns.DnsCache` over the sync resolver:
+within the TTL a repeated lookup is served from memory (the resolver
+syscall counter does not advance); a zero TTL re-resolves every time;
+``invalidate`` / ``clear`` drop entries. Uses ``localhost`` so the test
+never depends on external DNS.
+"""
+
+from std.testing import assert_equal, assert_true
+
+from dodo.dns import DnsCache
+
+
+def test_within_ttl_no_second_syscall() raises:
+    var cache = DnsCache(ttl_ms=60_000)
+    var a = cache.resolve("localhost")
+    var b = cache.resolve("localhost")
+    assert_true(len(a) > 0, "first resolve empty")
+    assert_true(len(b) > 0, "second resolve empty")
+    assert_equal(cache.resolve_count(), 1)  # second served from cache
+    assert_equal(cache.hit_count(), 1)
+
+
+def test_zero_ttl_always_resolves() raises:
+    var cache = DnsCache(ttl_ms=0)
+    _ = cache.resolve("localhost")
+    _ = cache.resolve("localhost")
+    assert_equal(cache.resolve_count(), 2)
+    assert_equal(cache.hit_count(), 0)
+
+
+def test_distinct_hosts_each_resolve() raises:
+    var cache = DnsCache(ttl_ms=60_000)
+    _ = cache.resolve("localhost")
+    _ = cache.resolve("127.0.0.1")
+    assert_equal(cache.resolve_count(), 2)
+    assert_equal(cache.size(), 2)
+
+
+def test_invalidate_forces_resolve() raises:
+    var cache = DnsCache(ttl_ms=60_000)
+    _ = cache.resolve("localhost")
+    cache.invalidate("localhost")
+    _ = cache.resolve("localhost")
+    assert_equal(cache.resolve_count(), 2)
+
+
+def test_clear_drops_all() raises:
+    var cache = DnsCache(ttl_ms=60_000)
+    _ = cache.resolve("localhost")
+    cache.clear()
+    assert_equal(cache.size(), 0)
+    _ = cache.resolve("localhost")
+    assert_equal(cache.resolve_count(), 2)
+
+
+def test_names_match_case_insensitively() raises:
+    var c = DnsCache(ttl_ms=60_000)
+    _ = c.resolve("localhost")
+    _ = c.resolve("LocalHost.")
+    assert_equal(c.resolve_count(), 1)
+    assert_equal(c.hit_count(), 1)
+
+
+def test_cache_is_bounded() raises:
+    """Every distinct name used to add an entry for good."""
+    var c = DnsCache(ttl_ms=60_000, max_entries=2)
+    _ = c.resolve("127.0.0.1")
+    _ = c.resolve("127.0.0.2")
+    _ = c.resolve("127.0.0.3")
+    assert_equal(c.size(), 2)
+
+
+def test_int_max_ttl_means_cache_forever() raises:
+    """NET-03: ``now + ttl_ms`` wrapped negative for ``ttl_ms = Int.MAX``,
+    so every entry was born expired and nothing was ever served."""
+    var c = DnsCache(ttl_ms=Int.MAX)
+    _ = c.resolve("localhost")
+    _ = c.resolve("localhost")
+    assert_equal(c.resolve_count(), 1)
+    assert_equal(c.hit_count(), 1)
+
+
+def test_ttl_that_overflows_the_expiry_still_caches() raises:
+    """NET-03: any TTL with ``now + ttl > Int.MAX`` must saturate rather
+    than wrap (the monotonic clock is far above 1 ms)."""
+    var c = DnsCache(ttl_ms=Int.MAX - 1)
+    _ = c.resolve("localhost")
+    _ = c.resolve("localhost")
+    assert_equal(c.resolve_count(), 1)
+    assert_equal(c.hit_count(), 1)
+
+
+def test_saturated_expiries_are_still_evicted() raises:
+    """NET-03: with saturated expiries (all equal to ``Int.MAX``) the
+    eviction scan must still pick a victim, or the cache outgrows
+    ``max_entries``."""
+    var c = DnsCache(ttl_ms=Int.MAX, max_entries=2)
+    _ = c.resolve("127.0.0.1")
+    _ = c.resolve("127.0.0.2")
+    _ = c.resolve("127.0.0.3")
+    _ = c.resolve("127.0.0.4")
+    assert_equal(c.size(), 2)
+    # The newest entry survives and is served from cache.
+    var before = c.resolve_count()
+    _ = c.resolve("127.0.0.4")
+    assert_equal(c.resolve_count(), before)
+
+
+def main() raises:
+    test_within_ttl_no_second_syscall()
+    test_zero_ttl_always_resolves()
+    test_distinct_hosts_each_resolve()
+    test_invalidate_forces_resolve()
+    test_clear_drops_all()
+    test_names_match_case_insensitively()
+    test_cache_is_bounded()
+    test_int_max_ttl_means_cache_forever()
+    test_ttl_that_overflows_the_expiry_still_caches()
+    test_saturated_expiries_are_still_evicted()
+    print("test_dns_cache: 10 passed")

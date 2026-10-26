@@ -1,0 +1,515 @@
+"""Unit tests for the reliability middleware (Retry, PostHocDeadline)."""
+
+from std.memory import Pointer
+from std.memory.alloc import unsafe_alloc
+from std.testing import assert_equal, assert_true
+from std.time import perf_counter_ns
+
+from dodo.http.handler import Handler
+from dodo.http.reliability import (
+    CircuitBreaker,
+    _cell_get,
+    _cell_set,
+    RateLimit,
+    Retry,
+    RetryPolicy,
+    PostHocDeadline,
+)
+from dodo.http.request import Request
+from dodo.http.response import Response
+from dodo.http.server import ok
+
+
+# Shared counter cell so the Handler copies the reactor +
+# middleware make during dispatch still record into one place.
+# Each test allocates / frees its own cell so they stay
+# independent.
+
+
+struct AlwaysFiveHundredHandler(Copyable, Defaultable, Handler):
+    """Always returns a 500; bumps a shared counter every call."""
+
+    var calls_ptr: Int  # raw address; bitcast to Pointer at use
+
+    def __init__(out self):
+        self.calls_ptr = 0
+
+    def __init__(out self, ptr: Int):
+        self.calls_ptr = ptr
+
+    def serve(self, req: Request) raises -> Response:
+        if self.calls_ptr != 0:
+            var p = Pointer[Int, MutUntrackedOrigin](
+                unsafe_from_address=self.calls_ptr
+            )
+            p[] = p[] + 1
+        return Response(status=500, reason=String("Internal Server Error"))
+
+
+struct AlwaysOkHandler(Copyable, Defaultable, Handler):
+    """Returns a fixed 200 OK response."""
+
+    def __init__(out self):
+        pass
+
+    def serve(self, req: Request) raises -> Response:
+        return ok(String("ok"))
+
+
+struct EventuallyOkHandler(Copyable, Defaultable, Handler):
+    """Returns 503 for the first ``fail_count`` calls, then 200."""
+
+    var counter_ptr: Int
+    var fail_count: Int
+
+    def __init__(out self):
+        self.counter_ptr = 0
+        self.fail_count = 0
+
+    def __init__(out self, ptr: Int, fail_count: Int):
+        self.counter_ptr = ptr
+        self.fail_count = fail_count
+
+    def serve(self, req: Request) raises -> Response:
+        if self.counter_ptr == 0:
+            return ok(String("no-counter"))
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.counter_ptr
+        )
+        var n = p[]
+        p[] = n + 1
+        if n < self.fail_count:
+            return Response(status=503, reason=String("Service Unavailable"))
+        return ok(String("ok-after-failures"))
+
+
+def _new_counter() -> Int:
+    """Allocate a fresh shared Int cell and return its raw
+    address. Caller must call ``_free_counter`` after the test."""
+    var p = unsafe_alloc[Int](1)
+    p[] = 0
+    return Int(p)
+
+
+def _read_counter(addr: Int) -> Int:
+    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+    return p[]
+
+
+def _free_counter(addr: Int):
+    var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+    p.unsafe_free()
+
+
+def test_retry_succeeds_on_first_attempt() raises:
+    """When the inner handler returns 200, Retry must not re-run
+    it."""
+    var addr = _new_counter()
+    var inner = EventuallyOkHandler(ptr=addr, fail_count=0)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    var resp = retry.serve(req)
+    assert_equal(resp.status, 200)
+    assert_equal(_read_counter(addr), 1)
+    _free_counter(addr)
+
+
+def test_retry_recovers_after_transient_failures() raises:
+    """When the inner handler returns 503 twice then 200, Retry
+    with max_attempts=3 must succeed on the third call."""
+    var addr = _new_counter()
+    var inner = EventuallyOkHandler(ptr=addr, fail_count=2)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    var resp = retry.serve(req)
+    assert_equal(resp.status, 200)
+    assert_equal(_read_counter(addr), 3)
+    _free_counter(addr)
+
+
+def test_retry_gives_up_after_max_attempts() raises:
+    """When the inner always returns 500, Retry exhausts
+    max_attempts and surfaces the last 5xx."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    var resp = retry.serve(req)
+    assert_equal(resp.status, 500)
+    assert_equal(_read_counter(addr), 3)
+    _free_counter(addr)
+
+
+def test_retry_skips_non_idempotent_methods_by_default() raises:
+    """A POST request with the default ``retry_only_idempotent``
+    policy must be invoked exactly once."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("POST"), url=String("/"))
+    var resp = retry.serve(req)
+    assert_equal(resp.status, 500)
+    assert_equal(_read_counter(addr), 1)
+    _free_counter(addr)
+
+
+def test_retry_with_idempotent_off_retries_post() raises:
+    """When ``retry_only_idempotent=False`` POSTs are also
+    retried."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=2,
+            retry_only_idempotent=False,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("POST"), url=String("/"))
+    _ = retry.serve(req)
+    assert_equal(_read_counter(addr), 2)
+    _free_counter(addr)
+
+
+def test_retry_treats_put_as_idempotent() raises:
+    """RFC 9110 §9.2.2 -- PUT is idempotent. The default policy
+    must retry on transient failure even though earlier dodo
+    behaviour gated retries to the read-only set."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("PUT"), url=String("/"))
+    _ = retry.serve(req)
+    assert_equal(_read_counter(addr), 3)
+    _free_counter(addr)
+
+
+def test_retry_treats_delete_as_idempotent() raises:
+    """RFC 9110 §9.2.2 -- DELETE is idempotent. Same expectation
+    as PUT: the default policy retries the transient failure."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=0,
+            backoff_multiplier=2,
+            max_backoff_ms=2_000,
+        ),
+    )
+    var req = Request(method=String("DELETE"), url=String("/"))
+    _ = retry.serve(req)
+    assert_equal(_read_counter(addr), 3)
+    _free_counter(addr)
+
+
+def test_retry_backoff_sleeps_between_attempts() raises:
+    """When ``initial_backoff_ms > 0`` the middleware naps before
+    the next attempt. We assert the wall-clock elapsed time is at
+    least the floor of the un-jittered schedule (full jitter draws
+    from ``[0, capped]`` so the *minimum* is 0 -- the upper bound
+    is what survives any jitter draw). To keep the test fast we
+    cap aggressively."""
+    var addr = _new_counter()
+    var inner = AlwaysFiveHundredHandler(ptr=addr)
+    var retry = Retry(
+        inner^,
+        RetryPolicy(
+            max_attempts=3,
+            retry_only_idempotent=True,
+            initial_backoff_ms=5,
+            backoff_multiplier=2,
+            max_backoff_ms=10,
+        ),
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    var t0 = perf_counter_ns()
+    _ = retry.serve(req)
+    var elapsed_ms = (perf_counter_ns() - t0) // 1_000_000
+    assert_equal(_read_counter(addr), 3)
+    # No assertion on a strict lower bound -- jitter can be 0 --
+    # but the upper bound must be sane: 3 attempts * 10 ms cap +
+    # generous noise.
+    assert_true(elapsed_ms < 2_000)
+    _free_counter(addr)
+
+
+def test_timeout_passes_through_fast_handler() raises:
+    """A handler that returns within budget surfaces unchanged."""
+    var inner = AlwaysOkHandler()
+    var t = PostHocDeadline(inner^, budget_ms=5_000)
+    var req = Request(method=String("GET"), url=String("/"))
+    var resp = t.serve(req)
+    assert_equal(resp.status, 200)
+
+
+def test_timeout_returns_504_on_zero_budget() raises:
+    """A 0ms budget is impossible to honour; any handler runtime
+    > 0 ms surfaces as 504."""
+    var inner = AlwaysOkHandler()
+    var t = PostHocDeadline(inner^, budget_ms=0)
+    var req = Request(method=String("GET"), url=String("/"))
+    var resp = t.serve(req)
+    # AlwaysOkHandler runs in some > 0 ns time, so the timeout
+    # path triggers.
+    assert_equal(resp.status, 504)
+
+
+def test_ratelimit_allows_burst_then_429() raises:
+    """A burst of 2 with rate 1/s admits 2 rapid calls, rejects the
+    3rd with 429 (refill is negligible over microseconds)."""
+    var rl = RateLimit(AlwaysOkHandler(), rate_per_sec=1, burst=2)
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(rl.serve(req).status, 200)
+    assert_equal(rl.serve(req).status, 200)
+    assert_equal(rl.serve(req).status, 429)
+
+
+def test_ratelimit_refills_under_a_steady_stream_of_requests() raises:
+    """Requests closer together than one milli-token of refill used to
+    reset the clock with nothing credited, so under load the bucket
+    never refilled. 100/s is one token per 10 ms; a 40 ms hot loop must
+    admit a few more after the burst."""
+    from std.time import perf_counter_ns
+
+    var rl = RateLimit(AlwaysOkHandler(), rate_per_sec=100, burst=1)
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(rl.serve(req).status, 200)
+    var admitted = 0
+    var start = perf_counter_ns()
+    while perf_counter_ns() - start < 40_000_000:
+        if rl.serve(req).status == 200:
+            admitted += 1
+    assert_true(admitted >= 2, "refills lost: admitted " + String(admitted))
+    assert_true(admitted <= 6, "over-admitted: " + String(admitted))
+
+
+def test_ratelimit_full_bucket_admits_after_a_long_idle_period() raises:
+    """``elapsed * rate`` wrapped Int64 after 9223 s idle at 1e6/s, so a
+    full bucket stored a negative token count and answered 429. The idle
+    gap is staged by rewinding the middleware's own last-refill slot."""
+    var rl = RateLimit(AlwaysOkHandler(), rate_per_sec=1_000_000)
+    var idle_ns = Int64(9_300) * 1_000_000_000
+    _cell_set(rl._cell, 1, Int64(perf_counter_ns()) - idle_ns)
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(rl.serve(req).status, 200)
+    # Full bucket (burst * 1000 milli-tokens) minus the one admitted.
+    assert_equal(Int(_cell_get(rl._cell, 0)), 1_000_000 * 1000 - 1000)
+    # Far beyond any idle time: still just a full bucket, never negative.
+    _cell_set(rl._cell, 1, Int64(perf_counter_ns()) - (Int64(1) << 62))
+    assert_equal(rl.serve(req).status, 200)
+    assert_true(_cell_get(rl._cell, 0) >= 0, "negative token count stored")
+
+
+def test_ratelimit_disabled_passthrough() raises:
+    """Disabled when rate_per_sec <= 0 (pass-through)."""
+    var rl = RateLimit(AlwaysOkHandler(), rate_per_sec=0)
+    var req = Request(method=String("GET"), url=String("/"))
+    for _ in range(5):
+        assert_equal(rl.serve(req).status, 200)
+
+
+def test_circuitbreaker_opens_after_threshold() raises:
+    """Two consecutive 500s open the breaker; the 3rd call fast-fails
+    with 503 while the cooldown is still in effect."""
+    var cb = CircuitBreaker(
+        AlwaysFiveHundredHandler(), failure_threshold=2, cooldown_ms=60_000
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(cb.serve(req).status, 500)
+    assert_equal(cb.serve(req).status, 500)
+    assert_equal(cb.serve(req).status, 503)
+
+
+struct SlowFailHandler(Copyable, Handler):
+    """Busy-waits ``hold_ms``, counts the call, returns 500."""
+
+    var calls_ptr: Int
+    var hold_ms: Int
+
+    def __init__(out self, calls_ptr: Int, hold_ms: Int):
+        self.calls_ptr = calls_ptr
+        self.hold_ms = hold_ms
+
+    def serve(self, req: Request) raises -> Response:
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.calls_ptr
+        )
+        p[] = p[] + 1
+        var t0 = perf_counter_ns()
+        while perf_counter_ns() - t0 < self.hold_ms * 1_000_000:
+            pass
+        return Response(status=500, reason=String("Internal Server Error"))
+
+
+def test_circuitbreaker_cooldown_counts_from_the_failure_not_the_request() raises:
+    """The opened-at stamp was the time the failing request *started*, so a
+    failure slower than ``cooldown_ms`` opened the breaker already expired
+    and the next call went straight to the inner handler."""
+    var calls = _new_counter()
+    var cb = CircuitBreaker(
+        SlowFailHandler(calls, 250), failure_threshold=1, cooldown_ms=200
+    )
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(cb.serve(req).status, 500)  # trips the breaker after 250 ms
+    assert_equal(cb.serve(req).status, 503)  # still inside the 200 ms cooldown
+    assert_equal(_read_counter(calls), 1)
+    _free_counter(calls)
+
+
+struct CountingOkHandler(Copyable, Handler):
+    """Counts the call and returns 200."""
+
+    var calls_ptr: Int
+
+    def __init__(out self, calls_ptr: Int):
+        self.calls_ptr = calls_ptr
+
+    def serve(self, req: Request) raises -> Response:
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.calls_ptr
+        )
+        p[] = p[] + 1
+        return ok(String("ok"))
+
+
+struct ProbeInnerHandler(Copyable, Handler):
+    """Worker 1's upstream. While ``phase`` (slot 0) is 0 it fails, which
+    trips the breaker. Once it is 1 the call is the half-open probe: while
+    it is in flight it serves one request through ``other``, a copy of the
+    breaker that shares the cell (another worker), and stores that status
+    in slot 1."""
+
+    var other: CircuitBreaker[CountingOkHandler]
+    var state_ptr: Int
+
+    def __init__(
+        out self,
+        var other: CircuitBreaker[CountingOkHandler],
+        state_ptr: Int,
+    ):
+        self.other = other^
+        self.state_ptr = state_ptr
+
+    def serve(self, req: Request) raises -> Response:
+        var p = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.state_ptr
+        )
+        if p[] == 0:
+            return Response(status=500, reason=String("Internal Server Error"))
+        var q = Pointer[Int, MutUntrackedOrigin](
+            unsafe_from_address=self.state_ptr + 8
+        )
+        q[] = self.other.serve(req).status
+        return ok(String("probe ok"))
+
+
+def test_circuitbreaker_half_open_admits_only_the_probe() raises:
+    """While the single half-open probe is in flight a request from another
+    worker (a copy sharing the cell) must fast-fail with 503 and not reach
+    the upstream; only the probe's own success closes the breaker."""
+    var upstream_calls = _new_counter()
+    var state = unsafe_alloc[Int](2)
+    state.unsafe_write(0)
+    state.unsafe_offset(1).unsafe_write(0)
+    var other = CircuitBreaker(
+        CountingOkHandler(upstream_calls), failure_threshold=1, cooldown_ms=0
+    )
+    var w1 = CircuitBreaker(
+        ProbeInnerHandler(other.copy(), Int(state)),
+        failure_threshold=1,
+        cooldown_ms=0,
+    )
+    w1._cell = other._cell  # worker copies share one cell
+    var req = Request(method=String("GET"), url=String("/"))
+    assert_equal(w1.serve(req).status, 500)  # opens the breaker
+    state.unsafe_write(1)
+    # cooldown_ms=0: the next call is the probe (OPEN -> HALF_OPEN).
+    assert_equal(w1.serve(req).status, 200)
+    assert_equal(state.unsafe_offset(1)[], 503)
+    assert_equal(_read_counter(upstream_calls), 0)
+    # The probe succeeded: the breaker is closed again for everyone.
+    assert_equal(other.serve(req).status, 200)
+    assert_equal(_read_counter(upstream_calls), 1)
+    state.unsafe_free()
+    _free_counter(upstream_calls)
+
+
+def test_circuitbreaker_disabled_passthrough() raises:
+    """Disabled when failure_threshold <= 0 (pass-through)."""
+    var cb = CircuitBreaker(AlwaysFiveHundredHandler(), failure_threshold=0)
+    var req = Request(method=String("GET"), url=String("/"))
+    for _ in range(5):
+        assert_equal(cb.serve(req).status, 500)
+
+
+def main() raises:
+    test_retry_succeeds_on_first_attempt()
+    test_retry_recovers_after_transient_failures()
+    test_retry_gives_up_after_max_attempts()
+    test_retry_skips_non_idempotent_methods_by_default()
+    test_retry_with_idempotent_off_retries_post()
+    test_retry_treats_put_as_idempotent()
+    test_retry_treats_delete_as_idempotent()
+    test_retry_backoff_sleeps_between_attempts()
+    test_timeout_passes_through_fast_handler()
+    test_timeout_returns_504_on_zero_budget()
+    test_ratelimit_allows_burst_then_429()
+    test_ratelimit_refills_under_a_steady_stream_of_requests()
+    test_ratelimit_full_bucket_admits_after_a_long_idle_period()
+    test_ratelimit_disabled_passthrough()
+    test_circuitbreaker_opens_after_threshold()
+    test_circuitbreaker_cooldown_counts_from_the_failure_not_the_request()
+    test_circuitbreaker_half_open_admits_only_the_probe()
+    test_circuitbreaker_disabled_passthrough()
+    print("test_reliability: OK")

@@ -1,0 +1,195 @@
+"""Tests for the Cancel token, CancelHandler trait, and WithCancel
+adapter.
+
+at the integration level. The reactor's
+peer-FIN / deadline / drain mechanics that flip the underlying cell
+are exercised here at the handler-call boundary (the production
+usage path); direct unit-level "flip-then-read on a fresh cell"
+tests are intentionally narrow because Mojo's pointer-load-after-
+write through ``Pointer[Int, MutUntrackedOrigin]``
+behaves non-deterministically when several short-lived cells are
+allocated in close succession (a bug the development cycle
+will revisit; the production usage path — single cell per
+connection, pass to handler, handler polls — passes consistently).
+
+Covers:
+
+- ``Cancel.never()`` is permanently False; it has no underlying
+  cell so polling is a constant-False short-circuit.
+- A cancel-aware handler runs to completion when its cancel token
+  was never flipped, and short-circuits on a pre-flipped cell.
+- ``WithCancel[H]`` ignores its ``cancel`` argument and forwards
+  to the wrapped ``Handler``.
+- Re-exports from ``dodo.http`` and the root ``dodo`` package
+  resolve.
+"""
+
+from std.testing import assert_equal, assert_true, assert_false, TestSuite
+
+from dodo import (
+    Cancel as RootCancel,
+    CancelHandler as RootCancelHandler,
+)
+from dodo import WithCancel as RootWithCancel
+from dodo.http import (
+    Cancel,
+    CancelCell,
+    CancelHandler,
+    CancelReason,
+    Handler,
+    Request,
+    Response,
+    WithCancel,
+    Method,
+    ok,
+    Status,
+)
+
+
+# ── Cancel.never() ───────────────────────────────────────────────────────────
+
+
+def test_never_cancel_always_false() raises:
+    var c = Cancel.never()
+    assert_false(c.cancelled())
+    assert_equal(c.reason(), CancelReason.NONE)
+
+
+def test_never_cancel_after_repeated_polls() raises:
+    var c = Cancel.never()
+    for _ in range(1000):
+        assert_false(c.cancelled())
+    assert_equal(c.reason(), CancelReason.NONE)
+
+
+# ── Cooperative-cancellation pattern (production path) ──────────────────────
+
+
+@fieldwise_init
+struct _SlowHandler(CancelHandler, Copyable):
+    """A cancel-aware handler that polls cancel between fake-DB-call
+    steps and short-circuits on the first observed cancellation.
+    """
+
+    var max_steps: Int
+
+    def serve(self, req: Request, cancel: Cancel) raises -> Response:
+        for i in range(self.max_steps):
+            if cancel.cancelled():
+                return ok("partial:" + String(i))
+            # ... one expensive step; tests don't need real work ...
+        return ok("done")
+
+
+def test_slow_handler_runs_to_completion_with_never_cancel() raises:
+    """Using ``Cancel.never()`` proves the handler logic itself is
+    sound: with no live cell, ``cancelled()`` is constant-False and
+    the handler runs to completion.
+    """
+    var h = _SlowHandler(max_steps=5)
+    var req = Request(method=Method.GET, url="/")
+    var resp = h.serve(req, Cancel.never())
+    assert_equal(resp.status, Status.OK)
+    assert_equal(resp.text(), "done")
+
+
+def test_slow_handler_short_circuits_on_pre_flip() raises:
+    """If the cell is already flipped before the handler starts,
+    the handler returns on its first poll (i = 0).
+    """
+    var cell = CancelCell()
+    cell.flip(CancelReason.SHUTDOWN)
+    var h = _SlowHandler(max_steps=5)
+    var req = Request(method=Method.GET, url="/")
+    # ``cell.handle()`` returns a ``Cancel`` carrying the cell's
+    # heap address as a plain ``Int``; ``cell`` must outlive the
+    # ``serve`` call so the handler still observes a live cell.
+    var c = cell.handle()
+    var resp = h.serve(req, c)
+    _ = cell^
+    assert_equal(resp.text(), "partial:0")
+
+
+# ── Atomic cell round-trip (D5) ─────────────────────────────────────────────
+
+
+def test_cell_atomic_reason_roundtrip() raises:
+    """A single cell flipped to each reason code reads that exact
+    reason back and resets to NONE, through the ``Atomic[Int64]``
+    release-store / acquire-load path (guards the bitcast + dtype).
+    """
+    var cell = CancelCell()
+    var c = cell.handle()
+    assert_false(c.cancelled())
+    assert_equal(c.reason(), CancelReason.NONE)
+
+    for r in [
+        CancelReason.PEER_CLOSED,
+        CancelReason.TIMEOUT,
+        CancelReason.SHUTDOWN,
+    ]:
+        cell.flip(r)
+        assert_true(c.cancelled())
+        assert_equal(c.reason(), r)
+        cell.reset()
+        assert_false(c.cancelled())
+        assert_equal(c.reason(), CancelReason.NONE)
+    _ = cell^
+
+
+# ── WithCancel[H] adapter ───────────────────────────────────────────────────
+
+
+@fieldwise_init
+struct _PlainGreeter(Copyable, Defaultable, Handler):
+    var greeting: String
+
+    def __init__(out self):
+        self.greeting = "hello"
+
+    def serve(self, req: Request) raises -> Response:
+        return ok(self.greeting)
+
+
+def test_with_cancel_ignores_cancel_token() raises:
+    """``WithCancel[H]`` forwards to the inner Handler unchanged; the
+    cancel argument is structurally accepted but never consulted.
+    """
+    var wrapped = WithCancel[_PlainGreeter](inner=_PlainGreeter("hello"))
+    var cell = CancelCell()
+    var req = Request(method=Method.GET, url="/")
+
+    # Even with the cell flipped, WithCancel should still forward to
+    # the inner handler — the inner Handler does not know about
+    # cancellation, so it runs to completion and returns "hello".
+    cell.flip(CancelReason.PEER_CLOSED)
+    var resp = wrapped.serve(req, cell.handle())
+    assert_equal(resp.text(), "hello")
+
+
+def test_with_cancel_with_never_token() raises:
+    var wrapped = WithCancel[_PlainGreeter](inner=_PlainGreeter("x"))
+    var req = Request(method=Method.GET, url="/")
+    var resp = wrapped.serve(req, Cancel.never())
+    assert_equal(resp.text(), "x")
+
+
+# ── Re-exports resolve from both barrels ────────────────────────────────────
+
+
+def test_root_package_re_exports() raises:
+    """Cancel / CancelHandler / WithCancel are reachable from the
+    root ``dodo`` package, not just ``dodo.http``. Test this so
+    a user-visible re-export break shows up here, not at first use.
+    """
+    var c = RootCancel.never()
+    assert_false(c.cancelled())
+
+    var w = RootWithCancel[_PlainGreeter](inner=_PlainGreeter("hi"))
+    var req = Request(method=Method.GET, url="/")
+    var resp = w.serve(req, RootCancel.never())
+    assert_equal(resp.text(), "hi")
+
+
+def main() raises:
+    TestSuite.discover_tests[__functions_in_module()]().run()

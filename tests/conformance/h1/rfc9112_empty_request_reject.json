@@ -1,0 +1,8 @@
+{
+  "name": "empty_request",
+  "spec": "RFC 9112 §3 (request line is required)",
+  "input_hex": "0d 0a 0d 0a",
+  "expect": "reject",
+  "expect_reason": "leading blank lines with no request line",
+  "leniency": {}
+}

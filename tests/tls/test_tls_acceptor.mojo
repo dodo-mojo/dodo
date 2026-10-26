@@ -1,0 +1,524 @@
+"""Tests for the server-side TLS acceptor scaffolding.
+
+Covers the API-surface portion landing in this commit:
+``TlsServerConfig`` value semantics, ``TlsInfo`` defaults,
+``TlsAcceptor`` construction + reload-as-no-op,
+``TlsServerError`` / ``TlsServerNotImplemented`` formatting.
+
+The reactor-side handshake state machine (non-blocking
+``SSL_accept`` driven by edge-triggered readable / writable
+events) lands in the follow-up; tests for the
+end-to-end TLS round-trip (``TlsAcceptor.serve(handler)`` ->
+``curl --cacert``) move with it.
+
+Re-exports from ``dodo.tls`` and the root ``dodo`` package
+resolve.
+"""
+
+from std.testing import (
+    assert_equal,
+    assert_true,
+    assert_false,
+    assert_raises,
+    TestSuite,
+)
+
+from dodo.tls import (
+    TlsAcceptor,
+    TlsServerConfig,
+    TlsInfo,
+    TlsServerError,
+    TlsServerNotImplemented,
+    TLS_PROTOCOL_TLS12,
+    TLS_PROTOCOL_TLS13,
+)
+from dodo.net import SocketAddr
+from dodo.tcp import TcpListener, TcpStream
+from dodo.runtime._libc_time import monotonic_now_ms
+from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
+
+
+# ── TlsServerConfig ────────────────────────────────────────────────────────
+
+
+def test_config_minimal() raises:
+    var cfg = TlsServerConfig(
+        cert_file="/etc/cert.pem", key_file="/etc/key.pem"
+    )
+    assert_equal(cfg.cert_file, "/etc/cert.pem")
+    assert_equal(cfg.key_file, "/etc/key.pem")
+    assert_equal(len(cfg.alpn), 0)
+    assert_false(cfg.require_client_cert)
+    assert_equal(cfg.client_ca_bundle, "")
+    assert_equal(cfg.min_protocol, TLS_PROTOCOL_TLS12)
+
+
+def test_config_with_alpn_and_mtls() raises:
+    var alpn = List[String]()
+    alpn.append("h2")
+    alpn.append("http/1.1")
+    var cfg = TlsServerConfig(
+        cert_file="/c.pem",
+        key_file="/k.pem",
+        alpn=alpn^,
+        require_client_cert=True,
+        client_ca_bundle="/etc/ca.pem",
+        min_protocol=TLS_PROTOCOL_TLS13,
+    )
+    assert_equal(len(cfg.alpn), 2)
+    assert_equal(cfg.alpn[0], "h2")
+    assert_equal(cfg.alpn[1], "http/1.1")
+    assert_true(cfg.require_client_cert)
+    assert_equal(cfg.client_ca_bundle, "/etc/ca.pem")
+    assert_equal(cfg.min_protocol, TLS_PROTOCOL_TLS13)
+
+
+def test_protocol_constants_distinct() raises:
+    assert_true(TLS_PROTOCOL_TLS12 != TLS_PROTOCOL_TLS13)
+    # Sanity: TLS 1.2 < TLS 1.3 numerically (matches OpenSSL).
+    assert_true(TLS_PROTOCOL_TLS12 < TLS_PROTOCOL_TLS13)
+
+
+# ── Handshake deadline (D4) ────────────────────────────────────────────────
+
+
+def test_config_handshake_timeout_default_and_custom() raises:
+    """``handshake_timeout_ms`` defaults to 10 s and is configurable."""
+    var cfg = TlsServerConfig(cert_file="/c.pem", key_file="/k.pem")
+    assert_equal(cfg.handshake_timeout_ms, 10_000)
+    var cfg2 = TlsServerConfig(
+        cert_file="/c.pem", key_file="/k.pem", handshake_timeout_ms=250
+    )
+    assert_equal(cfg2.handshake_timeout_ms, 250)
+
+
+# ── TlsConfig (client-side) ALPN field ───────────────────────────────────
+
+
+def test_client_tls_config_default_alpn_empty() raises:
+    """Default :class:`dodo.tls.TlsConfig` does not advertise any
+    ALPN protocol. Verifies the new ``alpn`` field added for
+    client-side ALPN (``dodo.http.HttpClient`` uses this to
+    advertise ``h2`` on the ClientHello)."""
+    from dodo.tls import TlsConfig
+
+    var cfg = TlsConfig()
+    assert_equal(len(cfg.alpn), 0)
+
+
+def test_client_tls_config_alpn_round_trip() raises:
+    """A non-empty ``alpn`` list is preserved by
+    :class:`dodo.tls.TlsConfig` construction and survives
+    ``copy()``."""
+    from dodo.tls import TlsConfig
+
+    var protos = List[String]()
+    protos.append(String("h2"))
+    protos.append(String("http/1.1"))
+    var cfg = TlsConfig(alpn=protos^)
+    assert_equal(len(cfg.alpn), 2)
+    assert_equal(cfg.alpn[0], "h2")
+    assert_equal(cfg.alpn[1], "http/1.1")
+    var clone = cfg.copy()
+    assert_equal(len(clone.alpn), 2)
+    assert_equal(clone.alpn[0], "h2")
+    assert_equal(clone.alpn[1], "http/1.1")
+
+
+def test_client_tls_config_alpn_oversized_id_rejected_at_handshake() raises:
+    """A protocol id > 255 bytes will be rejected when
+    :meth:`dodo.tls.TlsStream.connect` builds the wire-format
+    blob; the rejection lives in the connect path (not the
+    config constructor) so the failure carries the OpenSSL
+    error context. We only verify the config holds the bad
+    value here -- the connect-time rejection is exercised by
+    the integration tests."""
+    from dodo.tls import TlsConfig
+
+    var protos = List[String]()
+    var huge = String("x")
+    for _ in range(300):
+        huge += "x"
+    protos.append(huge^)
+    var cfg = TlsConfig(alpn=protos^)
+    assert_equal(len(cfg.alpn), 1)
+    assert_true(cfg.alpn[0].byte_length() > 255)
+
+
+# ── mTLS validation ────────────────────────────────────────────
+
+
+def test_mtls_requires_ca_bundle() raises:
+    """``require_client_cert=True`` without a ``client_ca_bundle``
+    raises at construction time. mTLS without trust anchors is
+    meaningless — the verify callback would have nothing to
+    check against. Failing at construction time closes that
+    misconfiguration foot-gun.
+    """
+    with assert_raises():
+        _ = TlsServerConfig(
+            cert_file="/c.pem",
+            key_file="/k.pem",
+            require_client_cert=True,
+            # client_ca_bundle defaults to empty string.
+        )
+
+
+def test_mtls_requires_ca_bundle_explicit_empty() raises:
+    """Explicit empty string for ``client_ca_bundle`` is also a
+    misconfiguration."""
+    with assert_raises():
+        _ = TlsServerConfig(
+            cert_file="/c.pem",
+            key_file="/k.pem",
+            require_client_cert=True,
+            client_ca_bundle="",
+        )
+
+
+def test_mtls_with_ca_bundle_succeeds() raises:
+    var cfg = TlsServerConfig(
+        cert_file="/c.pem",
+        key_file="/k.pem",
+        require_client_cert=True,
+        client_ca_bundle="/etc/ca.pem",
+    )
+    assert_true(cfg.require_client_cert)
+    assert_equal(cfg.client_ca_bundle, "/etc/ca.pem")
+
+
+def test_mtls_off_ignores_ca_bundle() raises:
+    """``require_client_cert=False`` is allowed regardless of
+    whether a client CA bundle was provided — the bundle is
+    just unused."""
+    var cfg1 = TlsServerConfig(cert_file="/c.pem", key_file="/k.pem")
+    assert_false(cfg1.require_client_cert)
+
+    var cfg2 = TlsServerConfig(
+        cert_file="/c.pem",
+        key_file="/k.pem",
+        require_client_cert=False,
+        client_ca_bundle="/etc/ca.pem",
+    )
+    assert_false(cfg2.require_client_cert)
+
+
+# ── TlsInfo ────────────────────────────────────────────────────────────────
+
+
+def test_tls_info_default_empty() raises:
+    var info = TlsInfo()
+    assert_equal(info.protocol, "")
+    assert_equal(info.cipher, "")
+    assert_equal(info.sni_host, "")
+    assert_equal(info.alpn_protocol, "")
+    assert_equal(info.client_cert_subject, "")
+
+
+def test_tls_info_with_values() raises:
+    var info = TlsInfo(
+        protocol="TLSv1.3",
+        cipher="TLS_AES_128_GCM_SHA256",
+        sni_host="example.com",
+        alpn_protocol="h2",
+        client_cert_subject="CN=alice",
+    )
+    assert_equal(info.protocol, "TLSv1.3")
+    assert_equal(info.cipher, "TLS_AES_128_GCM_SHA256")
+    assert_equal(info.sni_host, "example.com")
+    assert_equal(info.alpn_protocol, "h2")
+    assert_equal(info.client_cert_subject, "CN=alice")
+
+
+# ── TlsAcceptor ────────────────────────────────────────────────────────────
+
+
+comptime _CERT: String = "build/test-certs/server.pem"
+comptime _KEY: String = "build/test-certs/server.key"
+
+
+def test_acceptor_construct() raises:
+    """TlsAcceptor now actually loads the cert / key + sets
+    up the SSL_CTX. Construction succeeds with a real cert pair
+    (the bench-tls-setup self-signed cert)."""
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    var acc = TlsAcceptor(cfg^)
+    assert_equal(acc.config.cert_file, _CERT)
+    assert_equal(acc.config.key_file, _KEY)
+
+
+def test_acceptor_construct_raises_on_missing_cert() raises:
+    """Construction fails fast if the cert path is bad —
+    deployments learn at server-start that they have a bad
+    cert, not at the first inbound handshake."""
+    var cfg = TlsServerConfig(cert_file="/nonexistent/cert.pem", key_file=_KEY)
+    with assert_raises():
+        _ = TlsAcceptor(cfg^)
+
+
+def test_acceptor_reload_swaps_cert() raises:
+    """``reload()`` re-reads the cert + key files. Calling it
+    repeatedly is safe — SIGHUP / inotify / cron triggers fire
+    regardless of whether the file actually changed."""
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    var acc = TlsAcceptor(cfg^)
+    acc.reload()
+
+
+def test_acceptor_reload_repeated_safe() raises:
+    """Cert-rotation deployments call ``reload`` on every
+    event regardless of whether the file changed."""
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    var acc = TlsAcceptor(cfg^)
+    for _ in range(10):
+        acc.reload()
+
+
+def test_acceptor_info_placeholder_returns_empty() raises:
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    var acc = TlsAcceptor(cfg^)
+    var info = acc.info_placeholder()
+    assert_equal(info.protocol, "")
+
+
+def test_acceptor_with_alpn_succeeds() raises:
+    """Constructor wires the ALPN list through to the FFI."""
+    var alpn = List[String]()
+    alpn.append("h2")
+    alpn.append("http/1.1")
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY, alpn=alpn^)
+    var acc = TlsAcceptor(cfg^)
+    assert_equal(len(acc.config.alpn), 2)
+
+
+def test_acceptor_with_mtls_succeeds() raises:
+    """``require_client_cert=True`` + a real CA bundle wires
+    through to the FFI's verify-peer callback."""
+    var cfg = TlsServerConfig(
+        cert_file=_CERT,
+        key_file=_KEY,
+        require_client_cert=True,
+        client_ca_bundle=_CERT,  # self-signed: cert is its own CA
+    )
+    var acc = TlsAcceptor(cfg^)
+    assert_true(acc.config.require_client_cert)
+
+
+def test_handshake_deadline_fires_on_silent_client() raises:
+    """A client that opens a TCP connection but never sends a
+    ClientHello is aborted at ``handshake_timeout_ms`` instead of
+    holding the worker. Drives a real ``handshake_fd`` on a blocking
+    accepted fd: ``handshake_fd`` sets ``SO_RCVTIMEO`` so the blocking
+    ``SSL_accept`` read unblocks and the monotonic deadline fires.
+    """
+    var lis = TcpListener.bind(SocketAddr.localhost(0))
+    var port = lis.local_addr().port
+    var pid = fork()
+    if pid == 0:
+        # Child: connect, then idle without sending any bytes.
+        try:
+            var c = TcpStream.connect(SocketAddr.localhost(port))
+            usleep(1_000_000)
+            _ = c^
+        except:
+            pass
+        exit()
+
+    var stream = lis.accept()
+    var cfg = TlsServerConfig(
+        cert_file=_CERT, key_file=_KEY, handshake_timeout_ms=300
+    )
+    var acc = TlsAcceptor(cfg^)
+    var start = monotonic_now_ms()
+    var raised = False
+    try:
+        _ = acc.handshake_fd(Int(stream._socket.fd))
+    except:
+        raised = True
+    var elapsed = monotonic_now_ms() - start
+
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+
+    # The safety property: a client that never completes the handshake
+    # frees the worker in bounded time (via the deadline / socket
+    # timeout / fatal) rather than pinning it indefinitely. The exact
+    # abort path is OpenSSL/socket-mode dependent; what matters for the
+    # DoS bound is that handshake_fd returns and does not hang.
+    assert_true(raised, "silent-client handshake must not succeed")
+    assert_true(
+        elapsed < 5000,
+        "handshake must abort in bounded time, elapsed=" + String(elapsed),
+    )
+
+
+# ── Errors ─────────────────────────────────────────────────────────────────
+
+
+def test_tls_server_error_writes_message_and_code() raises:
+    var e = TlsServerError("handshake failed", code=42)
+    assert_equal(e.message, "handshake failed")
+    assert_equal(e.code, 42)
+    assert_equal(String(e), "TlsServerError(handshake failed code=42)")
+
+
+def test_tls_server_not_implemented_default_message() raises:
+    var e = TlsServerNotImplemented()
+    assert_true(e.message.find("blocking handshake_fd path") >= 0)
+
+
+# ── FFI path NUL-termination hardening (follow-up to the SNI fix) ──────────
+#
+# Cert / key / CA paths reach OpenSSL through the same String -> char*
+# FFI hand-off that corrupted the SNI host: a path materialized from a
+# byte-slice (the idiom Url.parse and the config builders use) is not
+# NUL-terminated under unsafe_ptr, so the C-side file open reads past it.
+# These drive the loaders with slice-derived paths and assert the load
+# still succeeds, guarding the as_c_string_span hardening in
+# dodo/tls/_server_ffi.mojo and dodo/tls/stream.mojo.
+
+
+def _slice_derived(path: String) -> String:
+    """Return ``path`` as a String materialized from a byte-slice of a
+    larger backing buffer -- the non-NUL-terminated shape (matching
+    ``Url.parse(...).host``) that the FFI loaders must NUL-terminate
+    before handing the pointer to OpenSSL."""
+    var backing = path + "/sentinel-not-part-of-the-path"
+    return String(unsafe_from_utf8=backing.as_bytes()[: path.byte_length()])
+
+
+def test_acceptor_construct_slice_derived_paths() raises:
+    """``_do_ssl_ctx_new_server`` (cert + key load) succeeds when the
+    paths are slice-derived (non-NUL-terminated) rather than literals."""
+    var cfg = TlsServerConfig(
+        cert_file=_slice_derived(_CERT), key_file=_slice_derived(_KEY)
+    )
+    var acc = TlsAcceptor(cfg^)
+    assert_equal(acc.config.cert_file, _CERT)
+    assert_equal(acc.config.key_file, _KEY)
+
+
+def test_acceptor_reload_slice_derived_paths() raises:
+    """``_do_ssl_ctx_reload`` re-reads slice-derived paths without
+    corruption."""
+    var cfg = TlsServerConfig(
+        cert_file=_slice_derived(_CERT), key_file=_slice_derived(_KEY)
+    )
+    var acc = TlsAcceptor(cfg^)
+    acc.reload()
+
+
+def test_acceptor_mtls_slice_derived_ca() raises:
+    """``_do_ssl_ctx_set_verify_client_cert`` (mTLS CA load) succeeds with
+    a slice-derived CA path."""
+    var cfg = TlsServerConfig(
+        cert_file=_slice_derived(_CERT),
+        key_file=_slice_derived(_KEY),
+        require_client_cert=True,
+        client_ca_bundle=_slice_derived(_CERT),  # self-signed: its own CA
+    )
+    var acc = TlsAcceptor(cfg^)
+    assert_true(acc.config.require_client_cert)
+
+
+def test_slice_derived_missing_cert_still_raises() raises:
+    """Negative control: NUL-terminating the path must not mask a
+    genuinely missing file -- a bad slice-derived path still fails fast
+    at construction."""
+    var cfg = TlsServerConfig(
+        cert_file=_slice_derived("/nonexistent/dodo-test/cert.pem"),
+        key_file=_slice_derived(_KEY),
+    )
+    with assert_raises():
+        _ = TlsAcceptor(cfg^)
+
+
+def _sigpipe_handler_word() raises -> Int:
+    """First word of ``struct sigaction`` for SIGPIPE: the handler, on
+    both Linux and macOS. ``SIG_DFL`` is 0, ``SIG_IGN`` is 1."""
+    from std.ffi import c_int, external_call
+    from std.memory import stack_allocation
+
+    var buf = stack_allocation[256, UInt8]()
+    for i in range(256):
+        buf.unsafe_offset(i).unsafe_write(UInt8(0))
+    var null_addr = 0
+    var none = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=null_addr)
+    if external_call["sigaction", c_int](c_int(13), none, buf) != c_int(0):
+        raise Error("sigaction failed")
+    return Int(buf.unsafe_bitcast[Int64]()[])
+
+
+def test_tls_setup_stops_sigpipe_from_killing_the_process() raises:
+    """OpenSSL's socket BIO writes without MSG_NOSIGNAL, so writing to a
+    peer that had gone raised SIGPIPE, whose default action ends the
+    process. Setting up TLS now ignores SIGPIPE when nobody has claimed
+    it; the write fails with EPIPE instead."""
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    _ = TlsAcceptor(cfg^)
+    assert_equal(_sigpipe_handler_word(), 1)
+
+
+def test_failed_reload_keeps_the_serving_pair() raises:
+    """Reload installed the chain and the key on the live context before
+    checking them. A key that did not match failed the reload, but the
+    context was left with the new key and no usable certificate."""
+    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
+    var acc = TlsAcceptor(cfg^)
+    assert_true(acc._ctx.key_matches())
+    var raised = False
+    try:
+        acc._ctx.reload(_CERT, "tests/tls/fixtures/second-cert/key.pem")
+    except:
+        raised = True
+    assert_true(raised, "a mismatched key reloaded")
+    assert_true(acc._ctx.key_matches(), "failed reload broke the context")
+    acc.reload()  # the good pair still reloads
+    assert_true(acc._ctx.key_matches())
+
+
+def _sni_seen_for(connect_host: String) raises -> String:
+    """Handshake a forked client that dials ``connect_host`` and return
+    the SNI this side received."""
+    from dodo.tls import TlsConfig, TlsStream
+    from dodo.tls._server_ffi import server_ssl_free
+
+    var lis = TcpListener.bind(SocketAddr.localhost(0))
+    var port = lis.local_addr().port
+    var pid = fork()
+    if pid == 0:
+        try:
+            var c = TlsStream.connect(connect_host, port, TlsConfig.insecure())
+            c.close()
+        except:
+            pass
+        exit()
+    var stream = lis.accept()
+    var cfg = TlsServerConfig(
+        cert_file="tests/certs/server.crt", key_file="tests/certs/server.key"
+    )
+    var acc = TlsAcceptor(cfg^)
+    var sni = String("?")
+    try:
+        var r = acc.handshake_fd(Int(stream._socket.fd))
+        sni = r[1].sni_host.copy()
+        server_ssl_free(acc._ctx, r[0])
+    except:
+        pass
+    # Held to here: the fd is only borrowed by the handshake, and the
+    # stream would otherwise close it straight after its last use.
+    _ = stream^
+    _ = kill(pid, SIGKILL)
+    waitpid(pid)
+    return sni^
+
+
+def test_client_sends_no_sni_for_an_ip_literal() raises:
+    """RFC 6066 sec 3: a literal IP address is not permitted in SNI. The
+    client sent one whenever it dialled an IP."""
+    assert_equal(_sni_seen_for("localhost"), "localhost")
+    assert_equal(_sni_seen_for("127.0.0.1"), "")
+
+
+def main() raises:
+    TestSuite.discover_tests[__functions_in_module()]().run()

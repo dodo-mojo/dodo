@@ -1,0 +1,10 @@
+{
+  "name": "5.1.2_continuation_final_frame",
+  "spec": "RFC 6455 §5.4 (Fragmentation; continuation opcode 0x0, FIN=1 final)",
+  "input_hex": "80 02 67 65",
+  "expect": "accept",
+  "expect_reason": "FIN=1 OP=CONTINUATION (0x0) len=2 payload='ge' -- final fragment of a fragmented message",
+  "expected_opcode": 0,
+  "expected_fin": true,
+  "expected_payload_hex": "67 65"
+}

@@ -1,0 +1,1432 @@
+"""Per-connection state machine for HTTP/2 inside the reactor.
+
+Symmetric counterpart to :class:`dodo.http._server_reactor_impl.ConnHandle`
+for HTTP/2: owns one accepted ``TcpStream``, drives a
+:class:`dodo.http2.server.Http2Connection` over non-blocking
+``recv`` / ``send`` syscalls, dispatches every completed stream's
+request through the user's :class:`dodo.http.Handler`, and queues
+the response frames back through the same socket. The state-machine
+shape (``on_readable`` / ``on_writable`` returning a
+:class:`StepResult`) is byte-for-byte identical to the HTTP/1.1
+``ConnHandle`` so the unified
+:class:`dodo.http.server.HttpServer` reactor loop dispatches both
+connection types via a single ``StepResult`` translator
+(``_apply_step``).
+
+State transitions (mirror ConnHandle):
+
+::
+
+    STATE_READING  -- response queued -->  STATE_WRITING
+    STATE_WRITING  -- write_buf flushed --> STATE_READING (h2 multiplexes)
+    STATE_READING  / STATE_WRITING -- peer FIN / error --> STATE_CLOSING
+
+Unlike HTTP/1.1, h2 connections are persistent and multiplex many
+streams concurrently: ``on_readable`` may dispatch multiple
+``handler.serve(req)`` calls per event (one per ``stream id``
+that finished within the inbound bytes) and the connection stays
+open after the response flushes. Only an explicit ``GOAWAY`` or a
+peer FIN moves to ``STATE_CLOSING``.
+
+The constructor pre-loads the H2 server's initial SETTINGS frame
+into ``write_buf`` so the very first ``on_writable`` after the
+client preface arrives flushes both the SETTINGS and the
+SETTINGS-ACK in one syscall.
+"""
+
+from std.builtin.debug_assert import debug_assert
+from std.collections import Dict, Optional
+from std.ffi import c_int, c_size_t, ErrNo, get_errno
+from std.memory import Pointer, stack_allocation
+from std.memory.alloc import unsafe_alloc
+
+from dodo.errors import map_handler_error, log_handler_error
+from dodo.http.cancel import Cancel, CancelCell, CancelReason
+from dodo.http.handler import CancelHandler, Handler
+from dodo.http.headers import HeaderMap
+from dodo.http.request import Request
+from dodo.http.response import Response
+from dodo.http.response_stream import (
+    ChunkSourceBox,
+    STREAM_BATCH_BYTES,
+    STREAM_BATCH_CHUNKS,
+)
+from dodo.http.server import ServerConfig
+from dodo.http2.server import Http2Connection, Http2Config
+from dodo.net import IpAddr, SocketAddr
+from dodo.net._libc import _recv, _send, MSG_NOSIGNAL
+from dodo.runtime import Pool
+from dodo.tcp import TcpStream
+from dodo.tls._server_ffi import SSL_IO_WANT_READ, SSL_IO_WANT_WRITE
+from dodo.ws.server_h2 import WsH2Hooks, WsOverH2ServerStream
+from dodo.ws.frame import WsFrame
+
+from ._reactor.tls_transport import TlsTransport
+
+from ._server_reactor_impl import (
+    StepResult,
+    STATE_READING,
+    STATE_WRITING,
+    STATE_CLOSING,
+)
+
+
+# ── Http2ConnHandle ────────────────────────────────────────────────────────────
+
+
+struct H2StreamOut(Deinitable, Movable):
+    """Per-stream outbound state for one in-flight streaming response.
+
+    HTTP/2 multiplexes: several handlers can each return a streaming
+    ``Response`` concurrently on the same connection. Each active
+    streaming stream owns one of these — its chunk source, the unsent
+    tail of the current chunk (when a send window ran out mid-chunk),
+    and the trailers to emit at end-of-stream.
+
+    Heap-boxed via ``Pool[H2StreamOut]`` and referenced by address from
+    :attr:`Http2ConnHandle._stream_out` (a ``Dict[Int, Int]`` keyed on
+    stream id): ``ChunkSourceBox`` is move-only and cannot be stored
+    directly as a ``Dict`` value (``Dict`` requires ``Copyable``
+    values), so we box it and store the address, mirroring the
+    :attr:`Http2ConnHandle.stream_cells` cancel-cell pattern.
+    """
+
+    var src: ChunkSourceBox
+    """Chunk source, pulled a bounded batch per writable edge and
+    window-framed into DATA frames."""
+
+    var pending: List[UInt8]
+    """Unsent tail of the current chunk when the send window ran out
+    mid-chunk; flushed first on the next pump."""
+
+    var ppos: Int
+    """Read cursor into :attr:`pending`."""
+
+    var tk: List[String]
+    """Lowercased trailer field names to emit at end-of-stream."""
+
+    var tv: List[String]
+    """Trailer field values paired with :attr:`tk`."""
+
+    def __init__(
+        out self,
+        var src: ChunkSourceBox,
+        var tk: List[String],
+        var tv: List[String],
+    ):
+        self.src = src^
+        self.pending = List[UInt8]()
+        self.ppos = 0
+        self.tk = tk^
+        self.tv = tv^
+
+
+# Long because these are all methods of one struct, and Mojo structs
+# can't span files.
+struct Http2ConnHandle(Movable):
+    """State + buffers for a single reactor-managed HTTP/2 connection.
+
+    Owns an accepted ``TcpStream`` (closes the fd on destruction)
+    and an :class:`Http2Connection` driver (the same byte-level
+    feed/drain machine the standalone server uses, just driven
+    from the reactor instead of a blocking socket loop).
+    """
+
+    var _stream: TcpStream
+    """Underlying TCP stream; this struct is the sole owner."""
+
+    var peer: SocketAddr
+    """Kernel-reported peer address captured at accept time. Threaded
+    into every parsed :class:`dodo.http.Request` so handlers can
+    read ``req.peer`` regardless of the wire protocol."""
+
+    var cancel_cell: CancelCell
+    """Per-connection cancel cell. Used by the
+    :meth:`on_readable_cancel` dispatch path as the *fallback*
+    cell when a stream-specific cell is not available (e.g. when
+    a stream completes and is dispatched in the same feed batch
+    where the per-stream cell hasn't been allocated yet). The
+    flagging-on-FIN / GOAWAY / drain logic also flips this cell so
+    handlers polling a borrowed :class:`Cancel` observe the
+    connection-level signal."""
+
+    var stream_cells: Dict[Int, Int]
+    """Per-stream cancel cells (RFC 9113 §5.1) keyed on stream id.
+
+    The value is the heap address of a single ``Int`` (the same
+    layout :class:`dodo.http.cancel.CancelCell` owns) so we can
+    re-materialise a :class:`dodo.http.Cancel` handle on demand
+    without having to make ``CancelCell`` :trait:`Copyable` (it
+    isn't -- it owns a heap-allocated ``Int`` whose lifetime is
+    tied to the cell). The address is allocated when a stream is
+    first dispatched to a :trait:`dodo.http.CancelHandler` and
+    freed (``unsafe_deinit_pointee`` + ``free``) once
+    :meth:`emit_response` queues that stream's response.
+
+    Flipped on inbound RST_STREAM(stream_id) so a handler in
+    flight observes the peer cancel via ``cancel.cancelled()``.
+    The connection-level cell (:attr:`cancel_cell`) covers events
+    that aren't keyed on a single stream id (peer FIN, GOAWAY,
+    server drain)."""
+
+    var state: Int
+    """One of :data:`STATE_READING` / :data:`STATE_WRITING` /
+    :data:`STATE_CLOSING`. Same constants the HTTP/1.1
+    ``ConnHandle`` uses."""
+
+    var h2: Http2Connection
+    """The byte-level HTTP/2 driver. The connection preface +
+    initial SETTINGS the *client* sent get pushed into this via
+    :meth:`feed`; queued outbound bytes get pulled via
+    :meth:`drain` and shovelled into ``write_buf`` for the
+    reactor's ``send`` syscall."""
+
+    var write_buf: List[UInt8]
+    """Outbound bytes ready to be sent (response HEADERS/DATA
+    frames + auto-acks like SETTINGS_ACK / PING_ACK /
+    WINDOW_UPDATE). Populated by ``on_readable`` after each
+    feed/dispatch round."""
+
+    var write_pos: Int
+    """Number of bytes of :attr:`write_buf` already sent."""
+
+    var should_close: Bool
+    """True once we've decided this connection must close after the
+    last queued bytes flush (peer GOAWAY received, or graceful
+    shutdown)."""
+
+    var idle_timer_id: UInt64
+    """ID of the currently-armed idle timer, 0 if none. The
+    reactor loop manages the actual TimerWheel entry."""
+
+    var last_interest: Int
+    """Last reactor interest bits for this conn. Used to skip
+    redundant ``reactor.modify`` syscalls when the wanted
+    interest hasn't actually changed since the previous event."""
+
+    # ── Streaming response state (K1 on h2) ────────────────────────────
+    # HTTP/2 multiplexes: N handlers can each return a streaming Response
+    # concurrently on one connection. Each active streaming stream is
+    # boxed in _stream_out keyed on its stream id and pumped fairly (one
+    # bounded batch per stream per writable edge) subject to the shared
+    # connection send window + per-stream window (see _stream_pump).
+
+    var _stream_out: Dict[Int, Int]
+    """Active concurrent streaming responses keyed on stream id.
+
+    The value is the heap address of a boxed :class:`H2StreamOut`
+    (allocated via ``Pool[H2StreamOut]``) — ``ChunkSourceBox`` is
+    move-only so it can't be a ``Dict`` value directly, exactly like the
+    :attr:`stream_cells` cancel-cell addresses. Entries are added by
+    :meth:`_begin_stream`, drained by :meth:`_stream_pump`, and freed +
+    removed when the source reaches end-of-stream (or in :meth:`__deinit__`
+    if the connection tears down mid-stream)."""
+
+    # ── WebSocket-over-HTTP/2 sidecar (RFC 8441) ───────────────────────────
+    var _ws_hooks: Optional[WsH2Hooks]
+    """Non-owning boxed sidecar handler + thunks; ``None`` when the server
+    was started without a WS-over-h2 handler. Set once at construction."""
+
+    var _ws_tunnels: Dict[Int, WsOverH2ServerStream]
+    """Per-connection accepted WS tunnels keyed on stream id. Each carries
+    its own inbound decode buffer."""
+
+    # ── TLS termination (h2 over TLS) ──────────────────────────────────────
+    var tls: Optional[TlsTransport]
+    """``SSL*`` for an ALPN-negotiated ``h2`` connection, moved in from
+    the ``TlsConnHandle`` that ran the handshake; ``None`` for h2c.
+    When set, the frame reader and the write pump go through
+    ``SSL_read`` / ``SSL_write``."""
+
+    var tls_cross_interest: Bool
+    """``SSL_read`` wanted writability, or ``SSL_write`` wanted
+    readability (renegotiation / KeyUpdate). The step arms both
+    interests; the reactor re-enters the other drive path."""
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def __init__(
+        out self,
+        var stream: TcpStream,
+        var config: Http2Config,
+        var ws_hooks: Optional[WsH2Hooks] = None,
+    ) raises:
+        """Construct an Http2ConnHandle that owns ``stream``.
+
+        Args:
+            stream: Accepted ``TcpStream`` (non-blocking mode must
+                already be set by the caller). Ownership transfers
+                into the handle.
+            config: HTTP/2 SETTINGS the server advertises to the
+                peer. Validated by ``Http2Connection.with_config``.
+            ws_hooks: Optional non-owning WS-over-h2 sidecar handler
+                (RFC 8441). ``None`` disables the WS carrier path.
+        """
+        # Snapshot the peer address before moving the stream.
+        self.peer = stream.peer_addr()
+        self._stream = stream^
+        self.cancel_cell = CancelCell()
+        self.stream_cells = Dict[Int, Int]()
+        self.state = STATE_READING
+        self.h2 = Http2Connection.with_config(config^)
+        self.write_buf = List[UInt8]()
+        self.write_pos = 0
+        self.should_close = False
+        self.idle_timer_id = UInt64(0)
+        self.last_interest = 1  # INTEREST_READ
+        self._stream_out = Dict[Int, Int]()
+        self._ws_hooks = ws_hooks^
+        self._ws_tunnels = Dict[Int, WsOverH2ServerStream]()
+        self.tls = Optional[TlsTransport]()
+        self.tls_cross_interest = False
+
+    def __init__(
+        out self,
+        var stream: TcpStream,
+        var config: Http2Config,
+        req: Request,
+        var settings_payload: List[UInt8],
+        var ws_hooks: Optional[WsH2Hooks] = None,
+    ) raises:
+        """Construct an Http2ConnHandle from a successful h2c-via-Upgrade
+        switch (RFC 7540 §3.2).
+
+        The h1 side has already written ``101 Switching Protocols``
+        to the wire and migrated this fd's conn-dict entry from
+        ``KIND_H1`` to ``KIND_H2``. This constructor seeds the
+        :class:`Http2Connection` driver so that:
+
+        * The original h1 request becomes stream id 1, half-closed
+          from the client side, ready for handler dispatch on the
+          first :meth:`on_readable` event after the client preface
+          arrives.
+        * The ``HTTP2-Settings`` header value (base64url-decoded
+          and passed in as ``settings_payload``) is applied to the
+          connection state.
+        * The server's initial SETTINGS frame is pre-loaded into
+          ``write_buf`` (the server connection preface).
+
+        After this constructor returns, the reactor flips the fd to
+        ``INTEREST_WRITE`` so the SETTINGS-preface flushes; on the
+        next readable event the client preface
+        (``PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n`` + a SETTINGS
+        frame) arrives and is processed normally by
+        :meth:`Http2Connection.feed`.
+
+        Args:
+            stream: Accepted ``TcpStream`` whose fd carried the h1
+                request that triggered the upgrade. Ownership
+                transfers into the handle.
+            config: HTTP/2 SETTINGS the server advertises to the
+                peer.
+            req: The original h1 request (becomes stream 1).
+            settings_payload: Raw bytes of the ``HTTP2-Settings``
+                header value (base64url-decoded). Format identical
+                to a SETTINGS frame body.
+            ws_hooks: Optional non-owning WS-over-h2 sidecar handler
+                (RFC 8441). ``None`` disables the WS carrier path.
+        """
+        self.peer = stream.peer_addr()
+        self._stream = stream^
+        self.cancel_cell = CancelCell()
+        self.stream_cells = Dict[Int, Int]()
+        self.state = STATE_WRITING  # server preface is queued; flush first
+        self.h2 = Http2Connection.from_h2c_upgrade(
+            config^, req, settings_payload
+        )
+        # Drain the Http2Connection's outbox (which now contains the
+        # server's initial SETTINGS frame) into our write_buf so the
+        # reactor's send loop can flush it via the same code path
+        # that handles regular response frames.
+        self.write_buf = self.h2.drain()
+        self.write_pos = 0
+        self.should_close = False
+        self.idle_timer_id = UInt64(0)
+        self.last_interest = 2  # INTEREST_WRITE
+        self._stream_out = Dict[Int, Int]()
+        self._ws_hooks = ws_hooks^
+        self._ws_tunnels = Dict[Int, WsOverH2ServerStream]()
+        self.tls = Optional[TlsTransport]()
+        self.tls_cross_interest = False
+
+    def attach_tls(mut self, var transport: TlsTransport):
+        """Adopt the ``SSL*`` of a connection whose ALPN selected ``h2``."""
+        self.tls = Optional[TlsTransport](transport^)
+
+    @always_inline
+    def is_tls(self) -> Bool:
+        """True when this connection is TLS-terminated."""
+        return Bool(self.tls)
+
+    @always_inline
+    def fd(self) -> c_int:
+        """Return the underlying fd (fast accessor)."""
+        return self._stream._socket.fd
+
+    def _tls_fill_inbound(mut self, mut inbound: List[UInt8]) raises -> Int:
+        """Pull plaintext frames into ``inbound`` through ``SSL_read``.
+
+        Returns ``TLS_FILL_DRAINED`` when the record layer needs more
+        ciphertext (the normal EAGAIN-equivalent stop),
+        ``TLS_FILL_CROSS`` when the session needs socket writability
+        first, or ``TLS_FILL_CLOSED`` on ``close_notify`` / fatal --
+        which callers treat exactly like a cleartext peer FIN.
+        """
+        while True:
+            var got = self.tls.value().recv(inbound, 8192)
+            if got > 0:
+                continue
+            if got == SSL_IO_WANT_READ:
+                return TLS_FILL_DRAINED
+            if got == SSL_IO_WANT_WRITE:
+                self.tls_cross_interest = True
+                return TLS_FILL_CROSS
+            return TLS_FILL_CLOSED
+
+    def _take_outbox(mut self):
+        """Queue the driver's outbound bytes behind ``write_buf``.
+
+        When nothing is pending the two buffers trade places instead, so
+        a response body is not copied a second time; otherwise the bytes
+        are appended. Neither keeps more than ``_RETAINED_BYTES`` of
+        capacity for the next round.
+        """
+        if self.write_pos >= len(self.write_buf):
+            self.write_buf.clear()
+            self.write_pos = 0
+            swap(self.write_buf, self.h2.outbox)
+        else:
+            self.write_buf.extend(Span(self.h2.outbox))
+            self.h2.outbox.clear()
+        _reset_retained(self.h2.outbox)
+
+    def _flush_write_buf_tls(mut self) raises -> Optional[StepResult]:
+        """TLS twin of the ``on_writable`` send loop; see the h1
+        ``ConnHandle._flush_write_buf_tls`` for the contract."""
+        while self.write_pos < len(self.write_buf):
+            var n = self.tls.value().send(
+                Span[UInt8, _](self.write_buf), self.write_pos
+            )
+            if n > 0:
+                self.write_pos += n
+                continue
+            if n == SSL_IO_WANT_WRITE:
+                break
+            if n == SSL_IO_WANT_READ:
+                self.tls_cross_interest = True
+                return Optional[StepResult](
+                    StepResult(want_read=True, want_write=True)
+                )
+            self.should_close = True
+            return Optional[StepResult](
+                StepResult(want_read=False, want_write=False, done=True)
+            )
+        return Optional[StepResult]()
+
+    # ── Pre-buffered preface bytes (for the unified server's peek path)
+
+    def push_initial_bytes(mut self, bytes: Span[UInt8, _]) raises:
+        """Replay bytes already read from the socket into the H2 driver.
+
+        The unified :class:`dodo.http.server.HttpServer` peeks the
+        first 24 bytes on a fresh connection to detect the H2
+        preface (``"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n"``).
+        Once we decide it's HTTP/2 those bytes have already been
+        consumed from the socket; this helper feeds them into the
+        H2 driver before the reactor's first ``on_readable`` call
+        so the connection preface is recognised and the server's
+        initial SETTINGS frame is pre-queued in ``write_buf``.
+        """
+        self.h2.feed(bytes)
+        self._take_outbox()
+
+    # ── Event handlers ────────────────────────────────────────────────────────
+
+    def on_readable[
+        H: Handler
+    ](mut self, ref handler: H, config: ServerConfig) raises -> StepResult:
+        """Drive the state machine on a readable event.
+
+        Drains the socket non-blockingly, feeds bytes into the H2
+        driver, dispatches every newly-completed stream's request
+        through ``handler.serve`` and queues the encoded response
+        frames into ``write_buf``. Returns a :class:`StepResult`
+        that flips the reactor to ``INTEREST_WRITE`` if there's
+        outbound data ready, or stays on ``INTEREST_READ`` to wait
+        for more frames.
+        """
+        if self.state != STATE_READING:
+            return StepResult(
+                want_read=False, want_write=self.state == STATE_WRITING
+            )
+        # FFI precondition: the recv loop assumes a real fd. If it
+        # underflows we'd silently swallow EBADF on every iteration
+        # and burn a CPU; the assert documents the contract.
+        debug_assert[assert_mode="safe"](
+            Int(self.fd()) >= 0,
+            "Http2ConnHandle.on_readable: fd must be non-negative; got ",
+            Int(self.fd()),
+        )
+        var chunk = stack_allocation[8192, UInt8]()
+        var inbound = List[UInt8]()
+        if self.tls:
+            var fill = self._tls_fill_inbound(inbound)
+            if fill == TLS_FILL_CROSS:
+                return StepResult(want_read=True, want_write=True)
+            if fill == TLS_FILL_CLOSED:
+                self.should_close = True
+                return StepResult(
+                    want_read=False,
+                    want_write=len(self.write_buf) > self.write_pos,
+                    done=len(self.write_buf) == self.write_pos,
+                )
+        else:
+            while True:
+                var got = _recv(self.fd(), chunk, c_size_t(8192), c_int(0))
+                if got > 0:
+                    var got_int = Int(got)
+                    debug_assert[assert_mode="safe"](
+                        got_int <= 8192,
+                        "Http2ConnHandle._recv: returned > buf size; got ",
+                        got_int,
+                    )
+                    for i in range(got_int):
+                        inbound.append(chunk[unsafe_offset=i])
+                    # Bound one event's read. A peer that keeps the socket
+                    # full was read until EAGAIN into one list; the
+                    # level-triggered reactor raises another event for the
+                    # rest, after other fds have had their turn.
+                    if len(inbound) >= 1024 * 1024:
+                        break
+                elif got == 0:
+                    # Peer FIN observed mid-connection. Mark closed
+                    # so the reactor unregisters the fd after any
+                    # remaining write_buf flushes.
+                    self.should_close = True
+                    return StepResult(
+                        want_read=False,
+                        want_write=len(self.write_buf) > self.write_pos,
+                        done=len(self.write_buf) == self.write_pos,
+                    )
+                else:
+                    var e = get_errno()
+                    if e == ErrNo.EINTR:
+                        continue
+                    if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                        break
+                    # Hard read error -- close.
+                    self.should_close = True
+                    return StepResult(
+                        want_read=False, want_write=False, done=True
+                    )
+        # Push everything we just read into the h2 driver. ``feed``
+        # auto-handles the connection preface (24 bytes) the first
+        # time it's called and queues a SETTINGS_ACK / PING_ACK /
+        # WINDOW_UPDATE / SETTINGS reply via the same outbox we
+        # drain below.
+        if len(inbound) > 0:
+            self.h2.feed(Span[UInt8, _](inbound))
+        # WebSocket-over-h2 sidecar (RFC 8441): accept Extended CONNECT
+        # tunnels and pump client frames BEFORE the request dispatch so the
+        # 200-OK HEADERS + any server frames ride out on this event.
+        if self._ws_hooks:
+            self._ws_dispatch()
+        # Dispatch any newly-completed streams.
+        var ids = self.h2.take_completed_streams()
+        for i in range(len(ids)):
+            var sid = ids[i]
+            # An active streaming response's stream stays open (not
+            # CLOSED) until its source drains, so take_completed_streams
+            # keeps returning it; skip re-dispatch for any stream that is
+            # already streaming.
+            if sid in self._stream_out:
+                continue
+            # WS tunnels are driven by _ws_dispatch, not the request path;
+            # never dispatch a WS stream (even if it END_STREAM's).
+            if sid in self._ws_tunnels:
+                continue
+            var req = self.h2.take_request(sid)
+            req.peer = self.peer
+            var expose_errors = req.expose_errors
+            var request_id = req.headers.get("x-request-id")
+            var resp: Response
+            try:
+                resp = handler.serve(req).lower()
+            except e:
+                log_handler_error(request_id, String(e))
+                var mapped = map_handler_error(String(e), expose_errors)
+                resp = Response(status=mapped.status, reason=mapped.reason)
+            try:
+                if resp.body_stream:
+                    self._begin_stream(sid, resp^)
+                else:
+                    self._emit_buffered(sid, resp^)
+            except:
+                # If response framing fails (shouldn't happen),
+                # tear the connection down rather than silently
+                # losing the stream.
+                self.should_close = True
+        # Feed may have carried WINDOW_UPDATEs that unblock active
+        # streaming responses; pump before draining so the fresh frames
+        # ride out on this event.
+        if len(self._stream_out) > 0:
+            try:
+                self._stream_pump()
+            except:
+                self.should_close = True
+        # Everything the driver wants to send.
+        self._take_outbox()
+        if self.h2.conn.goaway_received:
+            self.should_close = True
+        if self.h2.conn.goaway_sent:
+            # RFC 9113 sec 5.4.1: a connection error is GOAWAY *and*
+            # then close. The frame is already in write_buf, so the
+            # reactor flushes it before this takes effect.
+            self.should_close = True
+        # Decide reactor interest: write if there are bytes to
+        # flush, otherwise stay on read for the next frame.
+        var has_outbound = len(self.write_buf) > self.write_pos
+        if has_outbound:
+            self.state = STATE_WRITING
+            return StepResult(
+                want_read=False,
+                want_write=True,
+                idle_timeout_ms=config.write_timeout_ms,
+            )
+        return StepResult(
+            want_read=True,
+            want_write=False,
+            idle_timeout_ms=config.idle_timeout_ms,
+        )
+
+    # ── WebSocket-over-HTTP/2 sidecar dispatch (RFC 8441) ────────────────────
+
+    def _ws_dispatch(mut self) raises:
+        """Accept new WS tunnels and pump one edge's worth of client frames.
+
+        Runs only when a :class:`WsH2Hooks` sidecar is registered. Newly
+        arrived Extended CONNECT streams are accepted (200 HEADERS, no
+        END_STREAM) and ``on_open`` is fired; every live tunnel then decodes
+        all currently-buffered client frames (``on_message`` per frame) and
+        is torn down (``on_close`` + drop) once its carrier sees a CLOSE or
+        the peer resets/ends the stream. Carriers are copied out of the map,
+        mutated, and copied back (WS-over-h2 is not the hot path).
+        """
+        var hooks = self._ws_hooks.value().copy()
+        var newly = self.h2.take_extended_connect_streams()
+        for i in range(len(newly)):
+            var sid = newly[i]
+            self.h2.accept_ws_over_h2(sid)
+            var carrier = WsOverH2ServerStream(sid)
+            hooks.open_thunk(hooks.addr, carrier, self.h2)
+            self._ws_tunnels[sid] = carrier^
+        var sids = List[Int]()
+        for kv in self._ws_tunnels.items():
+            sids.append(kv.key)
+        for i in range(len(sids)):
+            var sid = sids[i]
+            var carrier = self._ws_tunnels[sid].copy()
+            while True:
+                var f: Optional[WsFrame]
+                try:
+                    f = carrier.try_pull_frame(self.h2)
+                except:
+                    # A bad frame on one tunnel (oversized, unmasked)
+                    # ends that tunnel; the carrier has queued its CLOSE.
+                    # Letting it raise took down every other stream on
+                    # the connection with it.
+                    carrier.closed = True
+                    break
+                if not f:
+                    break
+                hooks.msg_thunk(hooks.addr, carrier, self.h2, f.take())
+                if carrier.is_closed():
+                    break
+            if carrier.is_closed() or not self.h2.stream_is_open(sid):
+                hooks.close_thunk(hooks.addr, carrier, self.h2)
+                _ = self._ws_tunnels.pop(sid)
+            else:
+                self._ws_tunnels[sid] = carrier^
+
+    # ── Streaming response (K1 on h2) ────────────────────────────────────────
+
+    def _begin_stream(mut self, sid: Int, var resp: Response) raises:
+        """Adopt ``resp`` as a concurrent streaming response on ``sid``.
+
+        Takes its chunk source, queues the leading HEADERS + captures
+        trailers metadata into a boxed :class:`H2StreamOut`, and records
+        ``sid`` as active. The body chunks are pumped by the
+        post-dispatch / on_writable pump. Any number of streams can be
+        active at once (bounded only by the peer's MAX_CONCURRENT_STREAMS
+        and the connection/stream send windows).
+        """
+        var src = resp.body_stream.take()
+        # Capture trailers before the response is moved into the driver;
+        # end_stream_response lowercases the field names at emit time.
+        var tk = List[String]()
+        var tv = List[String]()
+        for i in range(len(resp.trailers._keys)):
+            tk.append(resp.trailers._keys[i].copy())
+            tv.append(resp.trailers._values[i].copy())
+        self.h2.begin_stream_response(sid, resp^)
+        var addr = Pool[H2StreamOut].alloc_move(H2StreamOut(src^, tk^, tv^))
+        self._stream_out[sid] = addr
+
+    def _emit_buffered(mut self, sid: Int, var resp: Response) raises:
+        """Queue a fully-buffered response (no streaming source).
+
+        Streaming responses now route through :meth:`_begin_stream`
+        regardless of how many other streams are already active, so this
+        path only ever handles the ordinary buffered ``Response``.
+        """
+        self.h2.emit_response(sid, resp^)
+
+    def _stream_pump(mut self) raises:
+        """Fairly advance every active streaming response by one batch.
+
+        For each active stream (in a stable snapshot order) flushes any
+        stashed remainder first (window permitting), then drains up to
+        one ``STREAM_BATCH_CHUNKS`` / ``STREAM_BATCH_BYTES`` batch from
+        the source (mirroring the H1 refill), window-frames it, and
+        stashes any unsent tail. On end-of-stream it queues the trailers
+        / END_STREAM and frees the stream's box. All framing is bounded
+        by the shared connection send window and each stream's own window
+        inside ``queue_stream_data``, so a stream whose window is
+        exhausted simply makes no progress this pump and is retried on
+        the next WINDOW_UPDATE.
+        """
+        if len(self._stream_out) == 0:
+            return
+        var sids = List[Int]()
+        for entry in self._stream_out.items():
+            sids.append(entry.key)
+        var cancel = self.cancel_cell.handle()
+        for i in range(len(sids)):
+            self._pump_one(sids[i], cancel)
+
+    def _pump_one(mut self, sid: Int, cancel: Cancel) raises:
+        """Advance a single streaming response ``sid`` by one batch.
+
+        Flushes the stashed remainder (if any), then drains up to
+        ``STREAM_BATCH_CHUNKS`` / ``STREAM_BATCH_BYTES`` of fresh chunks
+        into the connection's out buffer so a response of N small chunks
+        does not cost N pumps. Stops early on end-of-stream (frees the
+        stream's box), on an exhausted send window (stashes the tail), or
+        on an empty chunk, which means the source has nothing right now
+        and must not be re-polled in a tight loop.
+        """
+        if sid not in self._stream_out:
+            return
+        if not self.h2._stream_still_sendable(sid):
+            # Reset by the peer: stop pulling the source and free it,
+            # rather than framing into a dead stream until its window
+            # runs out and then holding the source forever.
+            self._clear_stream(sid)
+            return
+        var addr = self._stream_out[sid]
+        var st = Pool[H2StreamOut].get_ptr(addr)
+        if st[].ppos < len(st[].pending):
+            # Only what the window will take — see `queue_parked_body`, which
+            # the buffered path uses for the same reason: re-copying the whole
+            # stash on every pump, and a pump is what a WINDOW_UPDATE
+            # triggers, is quadratic in the response.
+            var n = self.h2.queue_parked_body(
+                sid, Span(st[].pending), st[].ppos
+            )
+            st[].ppos += n
+            if st[].ppos < len(st[].pending):
+                return  # window exhausted; wait for WINDOW_UPDATE
+            st[].pending = List[UInt8]()
+            st[].ppos = 0
+        var framed = 0
+        var queued = 0
+        while framed < STREAM_BATCH_CHUNKS and queued < STREAM_BATCH_BYTES:
+            var nxt = st[].src.next(cancel)
+            if not nxt:
+                self.h2.end_stream_response(sid, st[].tk, st[].tv)
+                self._clear_stream(sid)
+                return
+            var clen = len(nxt.value())
+            if clen == 0:
+                return  # source idle; retry on the next pump
+            var n = self.h2.queue_stream_data(sid, Span[UInt8, _](nxt.value()))
+            framed += 1
+            queued += n
+            if n < clen:
+                # Window exhausted mid-chunk: stash the tail and stop.
+                # The tail is stashed once per chunk, so this is linear —
+                # but it is the same bytes, and a byte at a time is a byte at
+                # a time.
+                var tail = List[UInt8]()
+                tail.extend(Span(nxt.value())[n:clen])
+                st[].pending = tail^
+                st[].ppos = 0
+                return
+
+    def _clear_stream(mut self, sid: Int) raises:
+        """Free + remove the boxed streaming state for ``sid`` once its
+        response has fully drained. No-op if ``sid`` isn't active."""
+        if sid not in self._stream_out:
+            return
+        var addr = self._stream_out.pop(sid)
+        if addr != 0:
+            Pool[H2StreamOut].free(addr)
+
+    # ── Per-stream Cancel propagation ────────────────────────────────────────
+
+    def __deinit__(deinit self):
+        """Free any per-stream cell heap addresses that outlived
+        their dispatch (e.g. because the connection was torn down
+        before the handler returned), plus any streaming-response boxes
+        for streams still in flight when the connection is destroyed.
+        """
+        for entry in self.stream_cells.items():
+            var addr = entry.value
+            if addr != 0:
+                var p = Pointer[Int, MutUntrackedOrigin](
+                    unsafe_from_address=addr
+                )
+                p.unsafe_deinit_pointee()
+                p.unsafe_free()
+        for entry in self._stream_out.items():
+            var addr = entry.value
+            if addr != 0:
+                Pool[H2StreamOut].free(addr)
+
+    def _alloc_stream_cell(mut self, sid: Int) raises -> Int:
+        """Allocate a fresh cancel cell for ``sid`` (initialised to
+        :data:`CancelReason.NONE`) and return its heap address. If a
+        cell already exists for ``sid`` the existing address is
+        returned so the same handler dispatch keeps observing the
+        same cell.
+        """
+        if sid in self.stream_cells:
+            return self.stream_cells[sid]
+        var p = unsafe_alloc[Int](1)
+        p.unsafe_write(CancelReason.NONE)
+        var addr = Int(p)
+        self.stream_cells[sid] = addr
+        return addr
+
+    def _free_stream_cell(mut self, sid: Int) raises -> None:
+        """Destroy + free the cell bound to ``sid``, removing it
+        from the dict. No-op if the cell has already been freed."""
+        if sid not in self.stream_cells:
+            return
+        var addr = self.stream_cells.pop(sid)
+        if addr != 0:
+            var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+            p.unsafe_deinit_pointee()
+            p.unsafe_free()
+
+    def _flip_all_stream_cells(mut self, reason: Int) raises -> None:
+        """Flip every live per-stream cell + the connection-level cell.
+
+        Used on connection-scoped events (peer FIN, GOAWAY, server
+        drain) where every in-flight handler should observe the
+        cancel. Idempotent: flipping an already-flipped cell is a
+        no-op so a re-entrant call doesn't reset the reason.
+        """
+        self.cancel_cell.flip(reason)
+        for entry in self.stream_cells.items():
+            var addr = entry.value
+            if addr != 0:
+                var p = Pointer[Int, MutUntrackedOrigin](
+                    unsafe_from_address=addr
+                )
+                p[] = reason
+
+    def _flip_stream_cell(mut self, sid: Int, reason: Int) raises -> None:
+        """Flip the cell bound to ``sid`` if one has been allocated.
+
+        Stream-scoped events (RST_STREAM) flip only the matching
+        cell; sibling streams keep running. If the cell hasn't been
+        allocated yet (the stream is queued for dispatch but the
+        handler hasn't started), allocate it on the fly so the
+        flip is observed when the dispatcher later checks the cell
+        before invoking the handler.
+        """
+        if sid not in self.stream_cells:
+            _ = self._alloc_stream_cell(sid)
+        var addr = self.stream_cells[sid]
+        if addr != 0:
+            var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+            p[] = reason
+
+    def _stream_cell_cancelled(imm self, sid: Int) raises -> Bool:
+        """Return ``True`` if the cell bound to ``sid`` has been
+        flipped to a non-zero reason. False (and stream not
+        cancelled) if no cell is allocated for ``sid``.
+        """
+        if sid not in self.stream_cells:
+            return False
+        var addr = self.stream_cells[sid]
+        if addr == 0:
+            return False
+        var p = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)
+        return p[] != CancelReason.NONE
+
+    def on_readable_cancel[
+        H: CancelHandler
+    ](mut self, ref handler: H, config: ServerConfig) raises -> StepResult:
+        """Cancel-aware mirror of :meth:`on_readable`.
+
+        Drives the same feed-then-dispatch loop, but each
+        completed-stream dispatch invokes
+        ``handler.serve(req, cancel)`` with a per-stream
+        :class:`dodo.http.Cancel` cell. The cell is flipped if any
+        of the following apply *before* dispatch starts:
+
+        * The peer sent RST_STREAM for the stream (flipped via
+          :meth:`Http2Connection.take_reset_streams`, reason
+          :data:`CancelReason.PEER_CLOSED`);
+        * The peer sent GOAWAY (flips every live cell, reason
+          :data:`CancelReason.PEER_CLOSED`);
+        * The peer FIN'd the socket (``recv == 0``, reason
+          :data:`CancelReason.PEER_CLOSED`).
+
+        Streams whose state is already CLOSED (peer already
+        RST'd before we got to dispatch them) are SKIPPED: the
+        per-stream cell is freed and no handler runs for them.
+        Sibling streams keep flowing through the same connection
+        with their own cells, isolated from the cancelled peer.
+        """
+        if self.state != STATE_READING:
+            return StepResult(
+                want_read=False, want_write=self.state == STATE_WRITING
+            )
+        debug_assert[assert_mode="safe"](
+            Int(self.fd()) >= 0,
+            "Http2ConnHandle.on_readable_cancel: fd must be non-negative; got ",
+            Int(self.fd()),
+        )
+        var chunk = stack_allocation[8192, UInt8]()
+        var inbound = List[UInt8]()
+        if self.tls:
+            var fill = self._tls_fill_inbound(inbound)
+            if fill == TLS_FILL_CROSS:
+                return StepResult(want_read=True, want_write=True)
+            if fill == TLS_FILL_CLOSED:
+                self._flip_all_stream_cells(CancelReason.PEER_CLOSED)
+                self.should_close = True
+                return StepResult(
+                    want_read=False,
+                    want_write=len(self.write_buf) > self.write_pos,
+                    done=len(self.write_buf) == self.write_pos,
+                )
+        else:
+            while True:
+                var got = _recv(self.fd(), chunk, c_size_t(8192), c_int(0))
+                if got > 0:
+                    var got_int = Int(got)
+                    for i in range(got_int):
+                        inbound.append(chunk[unsafe_offset=i])
+                    # Bound one event's read. A peer that keeps the socket
+                    # full was read until EAGAIN into one list; the
+                    # level-triggered reactor raises another event for the
+                    # rest, after other fds have had their turn.
+                    if len(inbound) >= 1024 * 1024:
+                        break
+                elif got == 0:
+                    # Peer FIN -- flip every live cell so in-flight
+                    # handlers short-circuit cooperatively.
+                    self._flip_all_stream_cells(CancelReason.PEER_CLOSED)
+                    self.should_close = True
+                    return StepResult(
+                        want_read=False,
+                        want_write=len(self.write_buf) > self.write_pos,
+                        done=len(self.write_buf) == self.write_pos,
+                    )
+                else:
+                    var e = get_errno()
+                    if e == ErrNo.EINTR:
+                        continue
+                    if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                        break
+                    self._flip_all_stream_cells(CancelReason.PEER_CLOSED)
+                    self.should_close = True
+                    return StepResult(
+                        want_read=False, want_write=False, done=True
+                    )
+        if len(inbound) > 0:
+            self.h2.feed(Span[UInt8, _](inbound))
+        # RST_STREAM -> per-stream cell flip. Drain the list so
+        # idempotent-on-double-feed semantics hold.
+        var resets = self.h2.take_reset_streams()
+        for i in range(len(resets)):
+            self._flip_stream_cell(resets[i], CancelReason.PEER_CLOSED)
+        # GOAWAY -> connection-level cell + every live cell.
+        if self.h2.goaway_received_flag():
+            self._flip_all_stream_cells(CancelReason.PEER_CLOSED)
+            self.should_close = True
+        var ids = self.h2.take_completed_streams()
+        for i in range(len(ids)):
+            var sid = ids[i]
+            # An active streaming response keeps its stream open until
+            # drained; skip re-dispatch (see :meth:`on_readable`).
+            if sid in self._stream_out:
+                continue
+            var addr = self._alloc_stream_cell(sid)
+            # If the peer already RST'd this stream before we got
+            # here (or the connection-level shutdown flipped every
+            # cell), skip dispatch entirely. The handler isn't
+            # invoked, no response is queued, the stream stays
+            # in CLOSED state on the wire.
+            if self._stream_cell_cancelled(sid):
+                self._free_stream_cell(sid)
+                continue
+            var req = self.h2.take_request(sid)
+            req.peer = self.peer
+            var cancel = Cancel(addr)
+            var expose_errors = req.expose_errors
+            var request_id = req.headers.get("x-request-id")
+            var resp: Response
+            try:
+                resp = handler.serve(req, cancel)
+            except e:
+                log_handler_error(request_id, String(e))
+                var mapped = map_handler_error(String(e), expose_errors)
+                resp = Response(status=mapped.status, reason=mapped.reason)
+            try:
+                if resp.body_stream:
+                    self._begin_stream(sid, resp^)
+                else:
+                    self._emit_buffered(sid, resp^)
+            except:
+                self.should_close = True
+            self._free_stream_cell(sid)
+        if len(self._stream_out) > 0:
+            try:
+                self._stream_pump()
+            except:
+                self.should_close = True
+        self._take_outbox()
+        if self.h2.conn.goaway_received:
+            self.should_close = True
+        if self.h2.conn.goaway_sent:
+            # As in on_readable: a connection error is GOAWAY and then
+            # close. This path lacked the check, so on a CancelHandler
+            # server the RST-flood and CONTINUATION-flood GOAWAYs were
+            # sent and the connection kept going.
+            self.should_close = True
+        var has_outbound = len(self.write_buf) > self.write_pos
+        if has_outbound:
+            self.state = STATE_WRITING
+            return StepResult(
+                want_read=False,
+                want_write=True,
+                idle_timeout_ms=config.write_timeout_ms,
+            )
+        return StepResult(
+            want_read=True,
+            want_write=False,
+            idle_timeout_ms=config.idle_timeout_ms,
+        )
+
+    def signal_drain(mut self) raises -> None:
+        """Flip every live cell with :data:`CancelReason.SHUTDOWN`.
+
+        Called by the reactor when ``HttpServer.drain(timeout_ms)``
+        has been triggered: in-flight h2 handlers observe the
+        cancel and may short-circuit cooperatively. The connection
+        is also marked for close so the reactor unregisters the fd
+        once outbound buffers flush.
+        """
+        self._flip_all_stream_cells(CancelReason.SHUTDOWN)
+        self.should_close = True
+
+    def on_writable(mut self, config: ServerConfig) raises -> StepResult:
+        """Drive the state machine on a writable event.
+
+        Pumps as much of :attr:`write_buf` as the kernel accepts.
+        When the buffer is fully flushed, transitions back to
+        ``STATE_READING`` (HTTP/2 multiplexes -- the connection
+        stays open across many request/response pairs) unless
+        :attr:`should_close` is set, in which case the connection
+        is finished.
+        """
+        if self.state != STATE_WRITING:
+            return StepResult(
+                want_read=self.state == STATE_READING, want_write=False
+            )
+        debug_assert[assert_mode="safe"](
+            Int(self.fd()) >= 0,
+            "Http2ConnHandle.on_writable: fd must be non-negative; got ",
+            Int(self.fd()),
+        )
+        debug_assert[assert_mode="safe"](
+            self.write_pos >= 0 and self.write_pos <= len(self.write_buf),
+            "Http2ConnHandle.on_writable: write_pos out of range; got ",
+            self.write_pos,
+        )
+        if self.tls:
+            var tls_step = self._flush_write_buf_tls()
+            if tls_step:
+                return tls_step.value()
+        else:
+            while self.write_pos < len(self.write_buf):
+                var remaining = len(self.write_buf) - self.write_pos
+                var ptr = self.write_buf.unsafe_ptr().unsafe_offset(
+                    self.write_pos
+                )
+                debug_assert[assert_mode="safe"](
+                    remaining > 0 and Int(ptr) != 0,
+                    (
+                        "Http2ConnHandle._send: buf must be non-NULL when"
+                        " remaining > 0"
+                    ),
+                )
+                var n = _send(
+                    self.fd(), ptr, c_size_t(remaining), c_int(MSG_NOSIGNAL)
+                )
+                if n > 0:
+                    self.write_pos += Int(n)
+                else:
+                    var e = get_errno()
+                    if e == ErrNo.EINTR:
+                        continue
+                    if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                        break
+                    self.should_close = True
+                    return StepResult(
+                        want_read=False, want_write=False, done=True
+                    )
+        if self.write_pos < len(self.write_buf):
+            # Partial write -- come back when the kernel has more
+            # space. Re-arm the write idle timer so a slow client
+            # doesn't keep us pinned indefinitely.
+            return StepResult(
+                want_read=False,
+                want_write=True,
+                idle_timeout_ms=config.write_timeout_ms,
+            )
+        # write_buf fully drained; reset for the next response.
+        _reset_retained(self.write_buf)
+        self.write_pos = 0
+        # Streaming responses (K1 on h2): refill from every active chunk
+        # source, window permitting, and stay in STATE_WRITING to flush.
+        # When the pump queues nothing but streams are still active the
+        # send windows are exhausted -- fall through to STATE_READING to
+        # await the peer's WINDOW_UPDATE (a readable event).
+        if len(self._stream_out) > 0:
+            try:
+                self._stream_pump()
+            except:
+                self.should_close = True
+                return StepResult(want_read=False, want_write=False, done=True)
+            self._take_outbox()
+            if len(self.write_buf) > self.write_pos:
+                self.state = STATE_WRITING
+                return StepResult(
+                    want_read=False,
+                    want_write=True,
+                    idle_timeout_ms=config.write_timeout_ms,
+                )
+        if self.should_close:
+            return StepResult(want_read=False, want_write=False, done=True)
+        # h2 stays open across many requests; back to reading.
+        self.state = STATE_READING
+        return StepResult(
+            want_read=True,
+            want_write=False,
+            idle_timeout_ms=config.idle_timeout_ms,
+        )
+
+
+# ── Pool helpers (mirror _server_reactor_impl.mojo's ConnHandle pool) ────
+
+
+def _h2_conn_alloc_addr(
+    var stream: TcpStream,
+    var config: Http2Config,
+    var ws_hooks: Optional[WsH2Hooks] = None,
+) raises -> Int:
+    """Heap-allocate an :class:`Http2ConnHandle` and return its address.
+
+    Routes through ``Pool[Http2ConnHandle]`` so all unsafe-pointer
+    plumbing stays in :mod:`dodo.runtime.pool`. Symmetric with
+    :func:`dodo.http._server_reactor_impl._conn_alloc_addr`.
+    """
+    var addr = Pool[Http2ConnHandle].alloc_move(
+        Http2ConnHandle(stream^, config^, ws_hooks^)
+    )
+    debug_assert[assert_mode="safe"](
+        addr != 0,
+        "_h2_conn_alloc_addr: Pool returned 0",
+    )
+    return addr
+
+
+def _h2_conn_alloc_addr_from_h2c_upgrade(
+    var stream: TcpStream,
+    var config: Http2Config,
+    req: Request,
+    var settings_payload: List[UInt8],
+    var ws_hooks: Optional[WsH2Hooks] = None,
+) raises -> Int:
+    """Heap-allocate an :class:`Http2ConnHandle` pre-seeded for an h2c-via-Upgrade
+    migration (see :meth:`Http2ConnHandle.__init__` h2c-flavoured overload).
+    """
+    var addr = Pool[Http2ConnHandle].alloc_move(
+        Http2ConnHandle(stream^, config^, req, settings_payload^, ws_hooks^)
+    )
+    debug_assert[assert_mode="safe"](
+        addr != 0,
+        "_h2_conn_alloc_addr_from_h2c_upgrade: Pool returned 0",
+    )
+    return addr
+
+
+def _h2_conn_free_addr(addr: Int):
+    """Destroy + free an :class:`Http2ConnHandle` previously allocated
+    via :func:`_h2_conn_alloc_addr`."""
+    debug_assert[assert_mode="safe"](
+        addr != 0,
+        "_h2_conn_free_addr: addr must be non-zero (double-free?)",
+    )
+    Pool[Http2ConnHandle].free(addr)
+
+
+def _h2_conn_ptr_from_int(
+    addr: Int,
+) -> Pointer[Http2ConnHandle, MutUntrackedOrigin]:
+    """Reverse of :func:`_h2_conn_alloc_addr`: typed pointer from an Int."""
+    debug_assert[assert_mode="safe"](
+        addr != 0,
+        "_h2_conn_ptr_from_int: cannot reconstruct from null addr",
+    )
+    return Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=addr
+    ).unsafe_bitcast[Http2ConnHandle]()
+
+
+# ── Protocol-detection (preface peek) ──────────────────────────────────────
+
+
+comptime _RETAINED_BYTES: Int = 64 * 1024
+"""Largest buffer capacity a connection keeps between responses: one
+large response must not pin its size for the connection's lifetime."""
+
+
+def _reset_retained(mut buf: List[UInt8]):
+    """Empty ``buf``, keeping its allocation only up to ``_RETAINED_BYTES``."""
+    if buf.capacity() > _RETAINED_BYTES:
+        buf = List[UInt8]()
+    else:
+        buf.clear()
+
+
+comptime _H2_PREFACE_BYTES_LEN: Int = 24
+"""Length in bytes of the RFC 9113 §3.4 ``PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n``
+client connection preface."""
+
+
+comptime TLS_FILL_DRAINED: Int = 0
+"""``_tls_fill_inbound``: record layer wants more ciphertext (EAGAIN)."""
+comptime TLS_FILL_CROSS: Int = 1
+"""``_tls_fill_inbound``: session needs socket writability first."""
+comptime TLS_FILL_CLOSED: Int = 2
+"""``_tls_fill_inbound``: ``close_notify`` or fatal -- treat as peer FIN."""
+
+
+comptime PROTO_NEED_MORE: Int = 0
+"""Decision sentinel: PendingConnHandle hasn't seen enough bytes yet."""
+
+comptime PROTO_HTTP1: Int = 1
+"""Decision sentinel: the first bytes don't match the H2 preface
+prefix; this connection is HTTP/1.1 (or h2c via Upgrade, which the
+HTTP/1.1 ConnHandle handles via the existing
+``detect_h2c_upgrade`` helper)."""
+
+comptime PROTO_HTTP2: Int = 2
+"""Decision sentinel: the first 24 bytes match the H2 preface
+exactly; this connection is HTTP/2 via prior knowledge."""
+
+
+def _h2_preface_byte(i: Int) -> UInt8:
+    """Return the i-th byte of the H2 client connection preface
+    (``"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n"``)."""
+    var s = String("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    return s.unsafe_ptr()[unsafe_offset=i]
+
+
+struct PendingConnHandle(Movable):
+    """Per-connection state for an accepted socket whose protocol has
+    not yet been determined.
+
+    Buffers up to 24 bytes from the socket non-blockingly until it
+    can decide whether the peer is speaking HTTP/1.1 (any byte
+    sequence that doesn't prefix-match the H2 preface) or HTTP/2
+    via prior knowledge (full 24-byte preface match per RFC 9113
+    §3.4). The buffered bytes are NEVER discarded -- they're
+    handed to the chosen :class:`dodo.http._server_reactor_impl.ConnHandle`
+    or :class:`Http2ConnHandle` via the move-out helper so the
+    chosen state machine sees a contiguous byte stream.
+
+    The ``on_readable`` step returns one of :data:`PROTO_NEED_MORE`,
+    :data:`PROTO_HTTP1`, or :data:`PROTO_HTTP2`. The unified
+    reactor loop swaps the dict entry for the chosen handle on
+    decision and continues driving the new handle on the next
+    event.
+    """
+
+    var _stream: TcpStream
+    """Underlying TCP stream; this struct owns the fd until the
+    decision is taken via :meth:`take_stream_and_buf`."""
+
+    var peer: SocketAddr
+    """Peer address snapshotted at accept time, threaded onto the
+    chosen :class:`ConnHandle` / :class:`Http2ConnHandle` so handlers
+    keep their existing ``req.peer`` semantics."""
+
+    var preface_buf: List[UInt8]
+    """Bytes read so far while waiting for a protocol decision.
+    Maximum :data:`_H2_PREFACE_BYTES_LEN` long."""
+
+    var idle_timer_id: UInt64
+    """ID of the currently-armed idle timer, 0 if none."""
+
+    var last_interest: Int
+    """Last reactor interest bits for this conn."""
+
+    def __init__(out self, var stream: TcpStream) raises:
+        self.peer = stream.peer_addr()
+        self._stream = stream^
+        self.preface_buf = List[UInt8](capacity=_H2_PREFACE_BYTES_LEN)
+        self.idle_timer_id = UInt64(0)
+        self.last_interest = 1  # INTEREST_READ
+
+    @always_inline
+    def fd(self) -> c_int:
+        """Return the underlying fd (fast accessor)."""
+        return self._stream._socket.fd
+
+    def on_readable(mut self) raises -> Int:
+        """Pull more bytes off the socket and return one of
+        :data:`PROTO_NEED_MORE` / :data:`PROTO_HTTP1` / :data:`PROTO_HTTP2`.
+
+        Reads non-blockingly. The buffer keeps EVERY byte read
+        (not just the preface-prefix ones) so :meth:`take_stream_and_buf`
+        hands the whole prefix to the chosen per-conn handle --
+        otherwise an HTTP/1.1 request whose first byte fails the
+        preface check would have its remaining bytes (already
+        delivered by ``recv`` in the same syscall) dropped on the
+        floor and the parser would see a truncated request line.
+        """
+        # FFI precondition: the preface peek requires a real fd.
+        debug_assert[assert_mode="safe"](
+            Int(self.fd()) >= 0,
+            "PendingConnHandle.on_readable: fd must be non-negative; got ",
+            Int(self.fd()),
+        )
+        # Invariant: preface_buf never exceeds _H2_PREFACE_BYTES_LEN
+        # because we cap ``want`` and the loop exits at equality.
+        debug_assert[assert_mode="safe"](
+            len(self.preface_buf) <= _H2_PREFACE_BYTES_LEN,
+            "PendingConnHandle: preface_buf overflow; got ",
+            len(self.preface_buf),
+        )
+        # Read up to 24 bytes total. We always store ALL bytes
+        # ``recv`` returns; the preface-prefix check only decides
+        # WHETHER to keep reading (preface match) or stop early
+        # (mismatch -> HTTP/1.1). The chosen per-conn handle
+        # consumes the same bytes via :meth:`take_stream_and_buf`.
+        var chunk = stack_allocation[_H2_PREFACE_BYTES_LEN, UInt8]()
+        var decision_known: Bool = False
+        var decision: Int = PROTO_HTTP1
+        while len(self.preface_buf) < _H2_PREFACE_BYTES_LEN:
+            var want = _H2_PREFACE_BYTES_LEN - len(self.preface_buf)
+            debug_assert[assert_mode="safe"](
+                want > 0 and want <= _H2_PREFACE_BYTES_LEN,
+                "PendingConnHandle: want out of range; got ",
+                want,
+            )
+            var got = _recv(self.fd(), chunk, c_size_t(want), c_int(0))
+            if got > 0:
+                var got_int = Int(got)
+                debug_assert[assert_mode="safe"](
+                    got_int <= want,
+                    "PendingConnHandle._recv: returned > want; got ",
+                    got_int,
+                )
+                for i in range(got_int):
+                    var b = chunk[unsafe_offset=i]
+                    var pos = len(self.preface_buf)
+                    debug_assert[assert_mode="safe"](
+                        pos >= 0 and pos < _H2_PREFACE_BYTES_LEN,
+                        "PendingConnHandle: preface_byte index OOR; got ",
+                        pos,
+                    )
+                    self.preface_buf.append(b)
+                    if (not decision_known) and b != _h2_preface_byte(pos):
+                        decision_known = True
+                        decision = PROTO_HTTP1
+                if decision_known:
+                    return decision
+            elif got == 0:
+                # Peer FIN before we could decide; treat as h1
+                # so the existing graceful-close path tears it
+                # down.
+                return PROTO_HTTP1
+            else:
+                var e = get_errno()
+                if e == ErrNo.EINTR:
+                    continue
+                if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                    if decision_known:
+                        return decision
+                    return PROTO_NEED_MORE
+                # Hard error -> treat as h1 so cleanup runs.
+                return PROTO_HTTP1
+        # All 24 bytes accumulated and none triggered an early
+        # mismatch -> the prefix matches the preface exactly ->
+        # this is HTTP/2.
+        return PROTO_HTTP2
+
+    def take_stream_and_buf(
+        mut self,
+    ) -> List[UInt8]:
+        """Move the buffered preface bytes out of the handle.
+
+        The :attr:`_stream` is moved separately by the caller via a
+        regular field move (`var s = handle._stream^`) since Mojo
+        tuple returns are clunky for non-Movable mixes. The caller
+        is responsible for freeing the empty handle via
+        :func:`_pending_conn_free_addr` after taking ownership of
+        both fields.
+        """
+        var out = self.preface_buf^
+        self.preface_buf = List[UInt8]()
+        return out^
+
+
+def _pending_conn_alloc_addr(var stream: TcpStream) raises -> Int:
+    """Heap-allocate a :class:`PendingConnHandle` and return its address."""
+    var addr = Pool[PendingConnHandle].alloc_move(PendingConnHandle(stream^))
+    debug_assert[assert_mode="safe"](
+        addr != 0,
+        "_pending_conn_alloc_addr: Pool returned 0",
+    )
+    return addr
+
+
+def _pending_conn_free_addr(addr: Int):
+    """Destroy + free a :class:`PendingConnHandle`."""
+    debug_assert[assert_mode="safe"](
+        addr != 0,
+        "_pending_conn_free_addr: addr must be non-zero (double-free?)",
+    )
+    Pool[PendingConnHandle].free(addr)
+
+
+def _pending_conn_ptr_from_int(
+    addr: Int,
+) -> Pointer[PendingConnHandle, MutUntrackedOrigin]:
+    """Reverse of :func:`_pending_conn_alloc_addr`."""
+    debug_assert[assert_mode="safe"](
+        addr != 0,
+        "_pending_conn_ptr_from_int: cannot reconstruct from null addr",
+    )
+    return Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=addr
+    ).unsafe_bitcast[PendingConnHandle]()

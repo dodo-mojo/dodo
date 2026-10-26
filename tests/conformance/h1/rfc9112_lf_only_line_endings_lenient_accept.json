@@ -1,0 +1,11 @@
+{
+  "name": "lf_only_line_endings_lenient",
+  "spec": "RFC 9112 §2.2 with _ExperimentalH1LeniencyConfig.allow_lf_only_line_endings",
+  "input_hex": "47 45 54 20 2f 20 48 54 54 50 2f 31 2e 31 0a 48 6f 73 74 3a 20 65 78 61 6d 70 6c 65 2e 63 6f 6d 0a 0a",
+  "expect": "accept",
+  "expect_reason": "leniency flag accepts bare LF line terminators",
+  "leniency": {"allow_lf_only_line_endings": true},
+  "expected_method": "GET",
+  "expected_uri": "/",
+  "expected_version": "HTTP/1.1"
+}

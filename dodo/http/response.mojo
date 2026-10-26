@@ -1,0 +1,446 @@
+"""HTTP response type."""
+
+from std.collections import Optional
+
+from json import loads, Value
+from .body import Body, ChunkSource, InlineBody
+from .cancel import Cancel
+from .headers import HeaderMap
+from .cookie import Cookie, CookieJar, parse_set_cookie_header
+from .error import HttpError
+from .proto.utf8 import utf8_lossy_string
+from .response_stream import ChunkSourceBox
+
+
+struct Status:
+    """Common HTTP status code constants (RFC 7231 §6)."""
+
+    comptime OK: Int = 200
+    comptime CREATED: Int = 201
+    comptime ACCEPTED: Int = 202
+    comptime NO_CONTENT: Int = 204
+
+    comptime MOVED_PERMANENTLY: Int = 301
+    comptime FOUND: Int = 302
+    comptime NOT_MODIFIED: Int = 304
+    comptime TEMPORARY_REDIRECT: Int = 307
+    comptime PERMANENT_REDIRECT: Int = 308
+
+    comptime BAD_REQUEST: Int = 400
+    comptime UNAUTHORIZED: Int = 401
+    comptime FORBIDDEN: Int = 403
+    comptime NOT_FOUND: Int = 404
+    comptime METHOD_NOT_ALLOWED: Int = 405
+    comptime REQUEST_TIMEOUT: Int = 408
+    comptime CONTENT_TOO_LARGE: Int = 413
+    comptime URI_TOO_LONG: Int = 414
+    comptime HEADER_FIELDS_TOO_LARGE: Int = 431
+
+    comptime INTERNAL_SERVER_ERROR: Int = 500
+    comptime BAD_GATEWAY: Int = 502
+    comptime SERVICE_UNAVAILABLE: Int = 503
+    comptime GATEWAY_TIMEOUT: Int = 504
+
+
+struct ResponseImpl[B: Body = InlineBody](Movable):
+    """An HTTP/1.1 response, parameterised by its authoring body type ``B``.
+
+    ``B`` is a *phantom* type parameter: it records the ``Body`` impl a
+    handler authored the response with (for the typed ``Handler.BodyType``
+    UX) but does not change the runtime layout. The body is always carried
+    by the erased carrier fields ``body`` (buffered bytes) or
+    ``body_stream`` (a boxed streaming source), which is the single
+    representation every wire driver consumes. Because a bare
+    defaulted struct name is not itself concrete, the ergonomic
+    public spelling is the ``comptime Response =
+    ResponseImpl[InlineBody]`` alias below; all existing call sites keep
+    working unchanged through it. Typed authoring builds
+    ``ResponseImpl[SomeBody]`` and calls :meth:`lower` at the wire
+    boundary to obtain the erased ``Response``.
+
+    Fields:
+        status: HTTP status code (see ``Status.*`` constants).
+        reason: Status reason phrase (e.g. ``"OK"``).
+        headers: Response headers (owned ``HeaderMap``).
+        body: Response body bytes.
+        version: HTTP version string (default ``"HTTP/1.1"``).
+        trailers: Response trailer fields (RFC 7230 §4.1.2). Empty
+            for non-chunked responses; populated by the client when
+            decoding a chunked response that carries trailer fields
+            after the final chunk. Server-side trailer emission
+            uses :class:`StreamingResponse[B].trailers` instead --
+            buffered :class:`Response` always frames with
+            ``Content-Length`` so it never carries trailers
+            outbound.
+
+    This type is ``Movable`` (owns headers and body) but not ``Copyable``.
+
+    Example:
+        ```mojo
+        var resp = client.get("http://example.com")
+        if resp.ok():
+            print(resp.text())
+        # Trailers (gRPC-style status, etc) are populated when the
+        # peer sent ``Transfer-Encoding: chunked`` with trailing
+        # fields after the zero chunk:
+        var grpc_status = resp.trailers.get("grpc-status")
+        ```
+    """
+
+    var status: Int
+    var reason: String
+    var headers: HeaderMap
+    var body: List[UInt8]
+    var version: String
+    var trailers: HeaderMap
+    var body_stream: Optional[ChunkSourceBox]
+    """Optional streaming body source (K1). ``None`` for the ordinary
+    buffered response (the ``body`` field carries the bytes); ``Some``
+    when a handler returns a streaming response, in which case the
+    reactor emits ``Transfer-Encoding: chunked`` headers and pulls this
+    source a bounded batch of chunks at a time per writable edge instead
+    of sending ``body``. Move-only, so ``Response`` stays move-only."""
+
+    def __init__(
+        out self,
+        status: Int,
+        var reason: String = "",
+        var body: List[UInt8] = List[UInt8](),
+        var version: String = "HTTP/1.1",
+    ):
+        self.status = status
+        self.reason = reason^
+        self.headers = HeaderMap()
+        self.body = body^
+        self.version = version^
+        self.trailers = HeaderMap()
+        self.body_stream = Optional[ChunkSourceBox]()
+
+    def reset(mut self, status: Int = 200, var reason: String = ""):
+        """Recycle this ``Response`` in place for the next request on
+        a keep-alive connection.
+
+        Clears the body and header maps without releasing their
+        backing capacity — the next response can refill the same
+        ``List[UInt8]`` body and the same ``HeaderMap`` arrays
+        without re-allocating, as long as the new payload fits
+        in the prior capacity.
+
+        The version is left at ``"HTTP/1.1"``; callers that need a
+        non-default version can set ``self.version`` directly.
+
+        Args:
+            status: New status code (default 200).
+            reason: New reason phrase (default empty —
+                    ``_status_reason`` will fill from the status
+                    code at serialise time).
+        """
+        self.status = status
+        self.reason = reason^
+        self.body.clear()
+        # Drop any attached streaming source so a recycled Response
+        # never carries a stale chunk source into the next request.
+        self.body_stream = Optional[ChunkSourceBox]()
+        # ``HeaderMap`` does not currently expose a public
+        # ``clear()`` so we drop in-place by length-truncate.
+        # The backing ``List[String]`` storage retains capacity
+        # (``List.clear`` is O(n) destructors + zero capacity
+        # change in the Mojo stdlib).
+        self.headers._keys.clear()
+        self.headers._values.clear()
+        self.trailers._keys.clear()
+        self.trailers._values.clear()
+
+    def ok(self) -> Bool:
+        """Return True if the status code is 2xx.
+
+        Returns:
+            True when ``200 <= status < 300``.
+        """
+        return self.status >= 200 and self.status < 300
+
+    def is_redirect(self) -> Bool:
+        """Return True if the status code is a redirect (3xx).
+
+        Returns:
+            True when ``300 <= status < 400``.
+        """
+        return self.status >= 300 and self.status < 400
+
+    def text(self) -> String:
+        """Decode the body as a UTF-8 string.
+
+        Interprets the body bytes as UTF-8. Invalid UTF-8 sequences are
+        replaced with the Unicode replacement character (best-effort).
+
+        Returns:
+            The body decoded as a ``String``.
+        """
+        if len(self.body) == 0:
+            return ""
+        return utf8_lossy_string(Span[UInt8, _](self.body))
+
+    def json(self) raises -> Value:
+        """Parse the body as JSON and return a ``json.Value``.
+
+        Uses the pure-Mojo backend from
+        `json <https://github.com/ehsanmok/json>`_.
+
+        Returns:
+            A ``Value`` representing the parsed JSON document.
+
+        Raises:
+            Error: If the response body is not valid JSON.
+
+        Example:
+            ```mojo
+            var resp = client.get("https://httpbin.org/json")
+            var data = resp.json()
+            print(data["slideshow"]["title"].string_value())
+            ```
+        """
+        return loads[target="cpu-simdjson"](self.text())
+
+    def raise_for_status(self) raises:
+        """Raise ``HttpError`` if the status code is not 2xx.
+
+        A no-op for responses with ``200 <= status < 300``.
+
+        Raises:
+            HttpError: If the status code indicates an error (< 200 or >= 300).
+
+        Example:
+            ```mojo
+            var resp = client.get("https://httpbin.org/status/404")
+            resp.raise_for_status() # raises HttpError: 404 Not Found
+            ```
+        """
+        if self.status < 200 or self.status >= 300:
+            raise HttpError(self.status, self.reason)
+
+    def set_cookie(mut self, var cookie: Cookie) raises:
+        """Append a ``Set-Cookie`` response header for ``cookie``.
+
+        Multiple cookies are emitted as separate ``Set-Cookie`` lines
+        per RFC 6265 paragraph 3, never folded into a single header.
+
+        Args:
+            cookie: The cookie to set (ownership taken).
+        """
+        var serialized = cookie.to_set_cookie_header()
+        self.headers.append("Set-Cookie", serialized)
+
+    def cookies(self) -> CookieJar:
+        """Parse all ``Set-Cookie`` headers into a ``CookieJar``.
+
+        Each ``Set-Cookie`` header is parsed independently with
+        ``parse_set_cookie_header`` (attributes preserved). Returns
+        an empty jar when no ``Set-Cookie`` headers are present.
+        """
+        var jar = CookieJar()
+        var values = self.headers.get_all("set-cookie")
+        for v in values:
+            jar.set(parse_set_cookie_header(v))
+        return jar^
+
+    def iter_bytes(self, chunk_size: Int = 8192) -> _BytesIter:
+        """Return an iterator that yields the body in chunks.
+
+        The entire body is already buffered in memory, so this does not
+        perform additional I/O. Useful for streaming-style processing.
+
+        Args:
+            chunk_size: Maximum bytes per chunk (default 8192).
+
+        Returns:
+            A ``_BytesIter`` yielding ``List[UInt8]`` chunks.
+
+        Example:
+            ```mojo
+            for chunk in resp.iter_bytes(1024):
+                process(chunk[])
+            ```
+        """
+        return _BytesIter(self.body, chunk_size)
+
+    def lower(deinit self) -> ResponseImpl[InlineBody]:
+        """Erase the phantom body type, yielding the concrete ``Response``
+        (``ResponseImpl[InlineBody]``) that every wire driver consumes.
+
+        ``B`` never affected the layout, so this moves every field across
+        unchanged -- no copy of the body bytes or the stream box. Typed
+        handlers that author a ``ResponseImpl[SomeBody]`` call this at the
+        wire boundary to hand the reactor the single erased representation.
+
+        Uses the ``deinit self`` convention so the fields can be moved out
+        and repacked into the ``InlineBody`` binding without a copy.
+
+        Returns:
+            The same response, retyped as the erased ``Response``.
+        """
+        var out = ResponseImpl[InlineBody](
+            status=self.status,
+            reason=self.reason^,
+            body=self.body^,
+            version=self.version^,
+        )
+        out.headers = self.headers^
+        out.trailers = self.trailers^
+        out.body_stream = self.body_stream^
+        return out^
+
+
+comptime Response = ResponseImpl[InlineBody]
+"""The concrete, body-type-erased HTTP response every wire driver consumes.
+
+This is the ergonomic public spelling of :struct:`ResponseImpl` bound to
+:struct:`InlineBody`. Because a bare defaulted struct name
+(``ResponseImpl``) is not itself concrete, ``Response`` is
+provided as a ``comptime`` alias -- all existing ``Response(...)`` /
+``-> Response`` / ``Optional[Response]`` sites resolve through it
+unchanged. Handlers that want the typed authoring surface build a
+``ResponseImpl[SomeBody]`` and call ``.lower()`` to obtain this type."""
+
+
+def stream_response[
+    S: ChunkSource
+](var source: S, status: Int = 200) raises -> Response:
+    """Build a streaming ``Response`` backed by ``source`` (K1).
+
+    The reactor serves this with ``Transfer-Encoding: chunked``,
+    pulling ``source.next(cancel)`` in bounded batches per writable edge
+    until it returns ``None`` (end-of-stream), so an open-ended or large
+    body never has to materialise in memory. A source with nothing ready
+    returns an empty chunk to end the batch. Set response headers (e.g.
+    ``Content-Type: text/event-stream`` for SSE) on the returned value
+    before returning it from a handler.
+
+    Args:
+        source: The chunk source; ownership transfers in.
+        status: HTTP status code (default 200).
+
+    Returns:
+        A ``Response`` whose ``body_stream`` carries ``source`` and
+        whose ``body`` is empty.
+    """
+    var resp = Response(status=status)
+    resp.body_stream = Optional[ChunkSourceBox](
+        ChunkSourceBox.create[S](source^)
+    )
+    return resp^
+
+
+# ── Parametric-body bridge (Response[B: Body] ergonomics) ─────────────────────
+#
+# The concrete ``Response`` (``ResponseImpl[InlineBody]``) stays byte-buffered
+# on the hot path. ``ResponseImpl[B]`` carries the authored ``Body`` type as a
+# phantom parameter (see the struct docstring); this helper builds one from ANY
+# ``Body`` impl and lowers it to the erased carrier the wire drivers consume. A
+# body that knows its length is buffered (``Content-Length`` framing, identical
+# to today); an open-ended body is lowered onto the K1 ``body_stream`` path
+# (``Transfer-Encoding: chunked``).
+
+
+struct _BodyChunkSource[B: Body](ChunkSource, Movable):
+    """Adapts a ``Body`` to the ``ChunkSource`` box so an open-ended body
+    can ride the existing ``Response.body_stream`` streaming path."""
+
+    var body: Self.B
+
+    def __init__(out self, var body: Self.B):
+        self.body = body^
+
+    def next(mut self, cancel: Cancel) raises -> Optional[List[UInt8]]:
+        return self.body.next_chunk(cancel)
+
+
+def response_from_body[
+    B: Body
+](var body: B, status: Int = 200, var reason: String = "") raises -> Response:
+    """Build a concrete ``Response`` from any ``Body`` impl (opt-in
+    ``Response[B]`` ergonomics).
+
+    Known-length bodies (``content_length()`` is ``Some``) are drained into
+    the buffered ``Response.body`` -- byte-identical to the ordinary
+    ``Response`` path. Open-ended bodies (``None``) are attached to
+    ``body_stream`` so the reactor emits ``Transfer-Encoding: chunked`` and
+    pulls chunks on writable edges. Set headers on the returned value before
+    returning it from a ``Handler``.
+
+    Args:
+        body: The body source; ownership transfers in.
+        status: HTTP status code (default 200).
+        reason: Status reason phrase (default empty -> filled at serialise).
+
+    Returns:
+        A concrete ``Response`` ready to return from ``Handler.serve``.
+    """
+    if body.content_length():
+        # A known-length body buffers into the ordinary Response.body
+        # (Content-Length framing). Use the never-cancel sentinel: this is
+        # a synchronous drain at handler-return time, not a reactor edge.
+        var cancel = Cancel.never()
+        var bytes = List[UInt8]()
+        while True:
+            var c = body.next_chunk(cancel)
+            if not c:
+                break
+            var cb = c.value().copy()
+            for i in range(len(cb)):
+                bytes.append(cb[i])
+        return Response(status=status, reason=reason^, body=bytes^)
+    var resp = stream_response[_BodyChunkSource[B]](
+        _BodyChunkSource[B](body^), status
+    )
+    resp.reason = reason^
+    return resp^
+
+
+struct _BytesIter(Movable):
+    """Iterator that yields body bytes in fixed-size chunks.
+
+    Produced by ``Response.iter_bytes()``. All data is already in memory;
+    the iterator simply slices through ``_body`` from ``_pos`` to end.
+    """
+
+    var _body: List[UInt8]
+    var _chunk_size: Int
+    var _pos: Int
+
+    def __init__(out self, body: List[UInt8], chunk_size: Int):
+        self._body = body.copy()
+        self._chunk_size = chunk_size if chunk_size > 0 else 8192
+        self._pos = 0
+
+    def __iter__(var self) -> _BytesIter:
+        """Return ``self`` as the iterator (consumed).
+
+        Returns:
+            This iterator (moved).
+        """
+        return self^
+
+    def __next__(mut self) -> List[UInt8]:
+        """Return the next chunk of up to ``chunk_size`` bytes.
+
+        Returns:
+            A ``List[UInt8]`` containing the next chunk (may be smaller than
+            ``chunk_size`` for the final chunk).
+        """
+        var end = self._pos + self._chunk_size
+        var n = len(self._body)
+        if end > n:
+            end = n
+        var chunk = List[UInt8](capacity=end - self._pos)
+        for i in range(self._pos, end):
+            chunk.append(self._body[i])
+        self._pos = end
+        return chunk^
+
+    def __has_next__(self) -> Bool:
+        """Return ``True`` while there are unread bytes.
+
+        Returns:
+            ``True`` if ``_pos < len(_body)``.
+        """
+        return self._pos < len(self._body)

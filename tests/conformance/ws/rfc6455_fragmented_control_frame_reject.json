@@ -1,0 +1,7 @@
+{
+  "name": "5.5.1_fragmented_control_frame",
+  "spec": "RFC 6455 §5.4 (Control frames MUST NOT be fragmented; FIN must be 1)",
+  "input_hex": "09 00",
+  "expect": "reject",
+  "expect_reason": "OP=PING (0x9) with FIN=0 -- control frames MUST be unfragmented per RFC 6455 §5.4"
+}

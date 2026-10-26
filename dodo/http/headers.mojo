@@ -1,0 +1,317 @@
+"""HTTP header collection with case-insensitive key lookup.
+
+Lookups use inline case-insensitive byte comparison (no pre-computed
+lowercase mirror). Original casing is preserved for wire serialisation.
+"""
+
+from std.format import Writable, Writer
+
+from .proto.ascii import ascii_unchecked_string
+
+
+@always_inline
+def _eq_icase(a: String, b: String) -> Bool:
+    """Case-insensitive ASCII string comparison without allocation."""
+    if a.byte_length() != b.byte_length():
+        return False
+    var ap = a.unsafe_ptr()
+    var bp = b.unsafe_ptr()
+    for i in range(a.byte_length()):
+        var ac = ap[unsafe_offset=i]
+        var bc = bp[unsafe_offset=i]
+        if ac >= 65 and ac <= 90:
+            ac = ac + 32
+        if bc >= 65 and bc <= 90:
+            bc = bc + 32
+        if ac != bc:
+            return False
+    return True
+
+
+@always_inline
+def _lower(s: String) -> String:
+    """Return ASCII-lowercase copy of ``s``.
+
+    Bulk-write variant: pre-size a byte buffer, write each byte through
+    raw pointers, then wrap in a String once. Avoids the per-byte
+    allocation of the naive ``out += chr(...)`` loop.
+    """
+    var n = s.byte_length()
+    if n == 0:
+        return String("")
+    var buf = List[UInt8]()
+    buf.resize(n, UInt8(0))
+    var src = s.unsafe_ptr()
+    var dst = buf.unsafe_ptr()
+    for i in range(n):
+        var c = src[unsafe_offset=i]
+        if c >= 65 and c <= 90:
+            dst[unsafe_offset=i] = c + 32
+        else:
+            dst[unsafe_offset=i] = c
+    return ascii_unchecked_string(Span[UInt8, _](buf))
+
+
+struct HeaderInjectionError(Copyable, Writable):
+    """Raised when a header key or value contains CR or LF bytes."""
+
+    var field: String
+    var value: String
+
+    def __init__(out self, field: String, value: String):
+        self.field = field
+        self.value = value
+
+    def write_to[W: Writer](self, mut writer: W):
+        writer.write(
+            "HeaderInjectionError: field='",
+            self.field,
+            "' value='",
+            self.value,
+            "'",
+        )
+
+
+@always_inline
+def _check_injection(key: String, value: String) raises:
+    """Raise ``HeaderInjectionError`` if key or value contain CR/LF."""
+    for i in range(key.byte_length()):
+        var c = key.unsafe_ptr()[unsafe_offset=i]
+        if c == 13 or c == 10:
+            raise HeaderInjectionError(key, value)
+    for i in range(value.byte_length()):
+        var c = value.unsafe_ptr()[unsafe_offset=i]
+        if c == 13 or c == 10:
+            raise HeaderInjectionError(key, value)
+
+
+def trailer_field_allowed(name: String) -> Bool:
+    """Whether a trailer field may be kept: not one that frames, routes,
+    authenticates or describes the content (RFC 9110 sec 6.5.1)."""
+    var n = name.lower()
+    return not (
+        n == "content-length"
+        or n == "transfer-encoding"
+        or n == "trailer"
+        or n == "te"
+        or n == "host"
+        or n == "authorization"
+        or n == "proxy-authorization"
+        or n == "cookie"
+        or n == "set-cookie"
+        or n == "content-encoding"
+        or n == "content-type"
+        or n == "content-range"
+        or n == "expect"
+        or n == "range"
+    )
+
+
+struct HeaderMap(Movable, Writable):
+    """An ordered, case-insensitive HTTP header collection.
+
+    Keys are stored in their original casing. Lookups use inline
+    case-insensitive byte comparison -- no pre-computed lowercase list.
+
+    This type is ``Movable`` but not ``Copyable``.
+    Use ``copy()`` when an explicit copy is needed.
+
+    Example:
+        ```mojo
+        var h = HeaderMap()
+        h.set("Content-Type", "application/json")
+        print(h.get("content-type")) # application/json
+        ```
+    """
+
+    var _keys: List[String]
+    var _values: List[String]
+
+    def __init__(out self):
+        self._keys = List[String]()
+        self._values = List[String]()
+
+    def reserve(mut self, n: Int):
+        """Make room for ``n`` fields without regrowing."""
+        self._keys.reserve(n)
+        self._values.reserve(n)
+
+    def set_unchecked(mut self, key: String, lk: String, value: String):
+        """Set a header without injection checks.
+
+        The ``lk`` parameter is accepted for API compatibility but ignored;
+        lookup uses inline case-insensitive comparison on ``key``.
+
+        Args:
+            key: Header name.
+            lk: Ignored (kept for backward compat).
+            value: Header value.
+        """
+        for i in range(len(self._keys)):
+            if _eq_icase(self._keys[i], key):
+                self._keys[i] = key
+                self._values[i] = value
+                return
+        self._keys.append(key)
+        self._values.append(value)
+
+    def copy(self) -> HeaderMap:
+        """Return a deep copy of this ``HeaderMap``."""
+        var out = HeaderMap()
+        for i in range(len(self._keys)):
+            out._keys.append(self._keys[i])
+            out._values.append(self._values[i])
+        return out^
+
+    def set(mut self, key: String, value: String) raises:
+        """Set a header, replacing any existing value with the same key.
+
+        Args:
+            key: Header name (case-insensitive; stored in original casing).
+            value: Header value.
+
+        Raises:
+            HeaderInjectionError: If ``key`` or ``value`` contains ``\\r`` or ``\\n``.
+        """
+        _check_injection(key, value)
+        for i in range(len(self._keys)):
+            if _eq_icase(self._keys[i], key):
+                self._keys[i] = key
+                self._values[i] = value
+                return
+        self._keys.append(key)
+        self._values.append(value)
+
+    def append(mut self, key: String, value: String) raises:
+        """Append a header without replacing existing values.
+
+        Args:
+            key: Header name.
+            value: Header value.
+
+        Raises:
+            HeaderInjectionError: If ``key`` or ``value`` contains ``\\r`` or ``\\n``.
+        """
+        _check_injection(key, value)
+        self._keys.append(key)
+        self._values.append(value)
+
+    def get(self, key: String) -> String:
+        """Return the first value for ``key``, or ``""`` if absent.
+
+        Args:
+            key: Header name (case-insensitive).
+
+        Returns:
+            The header value, or ``""`` if not present.
+        """
+        for i in range(len(self._keys)):
+            if _eq_icase(self._keys[i], key):
+                return self._values[i]
+        return ""
+
+    def get_all(self, key: String) -> List[String]:
+        """Return all values for ``key`` in insertion order.
+
+        Args:
+            key: Header name (case-insensitive).
+
+        Returns:
+            All matching values; empty list if absent.
+        """
+        var out = List[String]()
+        for i in range(len(self._keys)):
+            if _eq_icase(self._keys[i], key):
+                out.append(self._values[i])
+        return out^
+
+    def contains(self, key: String) -> Bool:
+        """Return True if the header is present.
+
+        Args:
+            key: Header name (case-insensitive).
+
+        Returns:
+            True if at least one entry with this key exists.
+        """
+        for i in range(len(self._keys)):
+            if _eq_icase(self._keys[i], key):
+                return True
+        return False
+
+    def remove(mut self, key: String) -> Bool:
+        """Remove all entries with the given key.
+
+        Args:
+            key: Header name (case-insensitive).
+
+        Returns:
+            True if at least one entry was removed.
+        """
+        var new_keys = List[String]()
+        var new_values = List[String]()
+        var removed = False
+        for i in range(len(self._keys)):
+            if _eq_icase(self._keys[i], key):
+                removed = True
+            else:
+                new_keys.append(self._keys[i])
+                new_values.append(self._values[i])
+        self._keys = new_keys^
+        self._values = new_values^
+        return removed
+
+    def len(self) -> Int:
+        """Return the total number of header entries (including duplicates)."""
+        return len(self._keys)
+
+    def name_at(self, i: Int) raises -> ref[origin_of(self._keys[0])] String:
+        """The name of field ``i``, in the order the fields were added.
+
+        With :meth:`value_at` and :meth:`len`, this walks every field once,
+        repeated names as separate entries, without copying::
+
+            for i in range(h.len()):
+                use(h.name_at(i), h.value_at(i))
+
+        Raises:
+            Error: If ``i`` is not in ``[0, len())``.
+        """
+        if i < 0 or i >= len(self._keys):
+            raise Error("HeaderMap.name_at: index out of range")
+        return self._keys[i]
+
+    def value_at(self, i: Int) raises -> ref[origin_of(self._values[0])] String:
+        """The value of field ``i``; see :meth:`name_at`.
+
+        Raises:
+            Error: If ``i`` is not in ``[0, len())``.
+        """
+        if i < 0 or i >= len(self._values):
+            raise Error("HeaderMap.value_at: index out of range")
+        return self._values[i]
+
+    def write_to[W: Writer](self, mut writer: W):
+        for i in range(len(self._keys)):
+            writer.write(self._keys[i], ": ", self._values[i], "\r\n")
+
+    def encode_to(self, mut buf: List[UInt8]):
+        """Serialise all headers as wire bytes into ``buf``.
+
+        Appends ``key: value\\r\\n`` for each header.
+        """
+        for i in range(len(self._keys)):
+            var k = self._keys[i]
+            var kp = k.unsafe_ptr()
+            var kn = k.byte_length()
+            for j in range(kn):
+                buf.append(kp[unsafe_offset=j])
+            buf.append(58)
+            buf.append(32)
+            var v = self._values[i]
+            var vp = v.unsafe_ptr()
+            var vn = v.byte_length()
+            for j in range(vn):
+                buf.append(vp[unsafe_offset=j])
+            buf.append(13)
+            buf.append(10)

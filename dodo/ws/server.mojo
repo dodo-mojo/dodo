@@ -1,0 +1,1403 @@
+"""WebSocket server: upgrades HTTP connections to WebSocket (RFC 6455).
+
+Server-to-client frames MUST NOT be masked (RFC 6455 §5.3).
+Client-to-server frames MUST be masked; ``WsConnection.recv`` un-masks
+them automatically.
+
+The upgrade handshake (§4.2):
+    1. Accept TCP connection.
+    2. Read the HTTP GET request and locate ``Sec-WebSocket-Key``.
+    3. Compute ``Sec-WebSocket-Accept = base64(SHA-1(key + GUID))``.
+    4. Send ``101 Switching Protocols``.
+    5. Hand off to ``WsConnection``.
+"""
+
+from std.builtin.debug_assert import debug_assert
+from std.atomic import Atomic
+from std.ffi import OwnedDLHandle, _get_global, c_int
+from std.memory import Layout, OptionalPointer, Pointer, alloc
+
+from .frame import (
+    DEFAULT_MAX_FRAME_BYTES,
+    WS_TOO_BIG_MARKER,
+    WsFrame,
+    WsOpcode,
+    WsCloseCode,
+    WsProtocolError,
+    _DecodeResult,
+    _is_valid_utf8,
+    ws_frame_length,
+)
+from .client import WsMessage
+from .protocol import _close_reply_payload
+from ..crypto.base64 import base64_decode as _b64_decode_srv
+from ..crypto.base64 import base64_encode as _b64_encode_srv
+from ..http.response import Status
+from ..tcp import TcpListener, TcpStream
+from ..net import SocketAddr, NetworkError, _find_dodo_lib
+from ..runtime._thread import ThreadHandle, _OpaquePtr, _null_ptr
+from ..runtime.reuseport import bind_reuseport
+from ..utils.dylib import dl_sym
+
+# RFC 6455 §1.3 magic GUID
+comptime _WS_GUID: String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+comptime _SHA1_LEN: Int = 20
+
+
+# ── SHA-1 helper (same approach as ws/client.mojo) ───────────────────────────
+
+
+def _do_sha1_srv(
+    imm lib: OwnedDLHandle, data_bytes: Span[UInt8, _]
+) raises -> List[UInt8]:
+    """Invoke the SHA-1 C function with ``lib`` borrowed.
+
+    Doing both the symbol lookup and the call inside the borrow keeps
+    ``lib`` mapped across the entire FFI surface — matches the
+    canonical idiom from ``dodo.http.encoding._do_compress`` and
+    avoids the ASAP-destruction window where the cached function
+    pointer would dangle after the lookup returns. See the long
+    discussion in ``dodo/http/encoding.mojo``.
+
+    Args:
+        lib: Borrowed handle to ``libdodo_tls`` (keeps it mapped).
+        data_bytes: Input bytes to hash.
+
+    Returns:
+        20-byte SHA-1 digest as ``List[UInt8]``.
+    """
+    var fn_sha1 = dl_sym[def(Int, Int, Int) thin abi("C") -> Int](lib, "SHA1")
+    var digest = List[UInt8](capacity=_SHA1_LEN)
+    digest.resize(_SHA1_LEN, 0)
+    _ = fn_sha1(
+        Int(data_bytes.unsafe_ptr()),
+        Int(len(data_bytes)),
+        Int(digest.unsafe_ptr()),
+    )
+    return digest^
+
+
+def _sha1_srv(data: String) raises -> List[UInt8]:
+    """Compute SHA-1 via the bundled libdodo_tls shared library.
+
+    Args:
+        data: Input string to hash.
+
+    Returns:
+        20-byte SHA-1 digest.
+
+    Raises:
+        NetworkError: If the SHA-1 function cannot be loaded.
+    """
+    var lib = OwnedDLHandle(_find_dodo_lib())
+    return _do_sha1_srv(lib, data.as_bytes())
+
+
+# ── Sec-WebSocket-Accept derivation uses RFC 4648 §4 base64 from
+#    dodo.crypto.base64 ───────────────────────────────────────────────────────
+#
+# The standard-alphabet base64 encoder lives in
+# :mod:`dodo.crypto.base64`; the local ``_b64_encode_srv`` alias
+# above keeps the call sites readable while routing through the
+# canonical implementation shared with the client (and the
+# ``Basic`` auth helper).
+
+
+def _compute_accept_srv(key: String) raises -> String:
+    """Compute ``Sec-WebSocket-Accept`` for ``key``.
+
+    Args:
+        key: The ``Sec-WebSocket-Key`` value from the client.
+
+    Returns:
+        Base64-encoded SHA-1 of key + RFC 6455 GUID.
+    """
+    var combined = key + _WS_GUID
+    var digest = _sha1_srv(combined)
+    return _b64_encode_srv(Span[UInt8, _](digest))
+
+
+# ── Handshake request reader ──────────────────────────────────────────────────
+
+
+def _read_line_srv(mut stream: TcpStream) raises -> String:
+    """Read one CRLF-terminated line from ``stream``.
+
+    Args:
+        stream: Open TCP stream.
+
+    Returns:
+        Line content without the terminator.
+    """
+    var line = String(capacity_bytes=256)
+    var buf = List[UInt8](capacity=1)
+    buf.append(UInt8(0))
+    while True:
+        var n = stream.read(buf.unsafe_ptr(), 1)
+        if n == 0:
+            return line^
+        var c = buf[0]
+        if c == 13:
+            continue
+        if c == 10:
+            return line^
+        line += chr(Int(c))
+
+
+def _lower_srv(s: String) -> String:
+    """Return ASCII-lowercase of ``s``."""
+    var out = String(capacity_bytes=s.byte_length())
+    for i in range(s.byte_length()):
+        var c = s.unsafe_ptr()[unsafe_offset=i]
+        if c >= 65 and c <= 90:
+            out += chr(Int(c) + 32)
+        else:
+            out += chr(Int(c))
+    return out^
+
+
+def _str_find_srv(s: String, sub: String) -> Int:
+    """Return the index of the first ``sub`` in ``s``, or -1."""
+    var n = s.byte_length()
+    var m = sub.byte_length()
+    if m == 0:
+        return 0
+    for i in range(n - m + 1):
+        var ok = True
+        for j in range(m):
+            if (
+                s.unsafe_ptr()[unsafe_offset=i + j]
+                != sub.unsafe_ptr()[unsafe_offset=j]
+            ):
+                ok = False
+                break
+        if ok:
+            return i
+    return -1
+
+
+@fieldwise_init
+struct _WsUpgradeRequest(Movable):
+    """The handshake fields the server keeps from an Upgrade request.
+
+    Fields:
+        key: The ``Sec-WebSocket-Key`` header value (always present; the
+            parsers raise when it is missing).
+        origin: The ``Origin`` header value, or empty when the client
+            sent none. Non-browser clients routinely omit it.
+    """
+
+    var key: String
+    var origin: String
+
+
+comptime _WS_VERSION_REJECTED = "unsupported Sec-WebSocket-Version"
+"""Start of the error for a handshake that fails only on its version; the
+standalone server answers it with 426 (RFC 6455 sec 4.2.2 point 4)."""
+
+
+def _field_has_token(values: List[String], token: String) -> Bool:
+    """Whether any comma-separated, case-insensitive token of ``values`` is
+    ``token`` (``token`` is lower case)."""
+    for v in values:
+        for t in v.split(","):
+            if _lower_srv(String(String(t).strip())) == token:
+                return True
+    return False
+
+
+def _ws_key_is_valid(key: String) -> Bool:
+    """RFC 6455 sec 4.2.1 point 5 / sec 11.3.1: base64 of a 16-byte nonce."""
+    try:
+        return len(_b64_decode_srv(key)) == 16
+    except:
+        return False
+
+
+def _ws_handshake_problem(
+    method: String,
+    version: String,
+    upgrades: List[String],
+    connections: List[String],
+    keys: List[String],
+    versions: List[String],
+) -> String:
+    """Why a request is not a valid WebSocket opening handshake, or "".
+
+    The one rule both servers apply -- the standalone ``WsServer`` parsers
+    and the reactor's ``_handle_ws_upgrade`` -- so they cannot disagree
+    (RFC 6455 sec 4.2.1, sec 11.3.1, sec 11.3.5):
+
+    * a ``GET`` request over ``HTTP/1.1``;
+    * an ``Upgrade`` field with the token ``websocket``;
+    * a ``Connection`` field with the token ``upgrade`` (a token, not a
+      substring: ``noupgrade`` does not count);
+    * exactly one ``Sec-WebSocket-Key``, base64 of 16 bytes;
+    * exactly one ``Sec-WebSocket-Version``, ``13``. A version problem is
+      reported last and starts with ``_WS_VERSION_REJECTED``.
+
+    Args:
+        method: The request method.
+        version: The request's HTTP version, e.g. ``HTTP/1.1``.
+        upgrades: Every ``Upgrade`` field value.
+        connections: Every ``Connection`` field value.
+        keys: Every ``Sec-WebSocket-Key`` field value.
+        versions: Every ``Sec-WebSocket-Version`` field value.
+
+    Returns:
+        The empty string if the handshake is valid, else the reason.
+    """
+    if method != "GET":
+        return "WebSocket upgrade request is not a GET"
+    if version != "HTTP/1.1":
+        return "WebSocket upgrade request is not HTTP/1.1"
+    if not _field_has_token(upgrades, "websocket"):
+        return (
+            "WebSocket upgrade request missing Upgrade: websocket or"
+            " Connection: Upgrade headers"
+        )
+    if not _field_has_token(connections, "upgrade"):
+        return (
+            "WebSocket upgrade request missing Upgrade: websocket or"
+            " Connection: Upgrade headers"
+        )
+    if len(keys) == 0 or (len(keys) == 1 and keys[0].byte_length() == 0):
+        return "WebSocket upgrade request missing Sec-WebSocket-Key"
+    if len(keys) > 1:
+        return "WebSocket upgrade request repeats Sec-WebSocket-Key"
+    if not _ws_key_is_valid(keys[0]):
+        return (
+            "WebSocket upgrade request has a Sec-WebSocket-Key that is not"
+            " base64 of 16 bytes"
+        )
+    if len(versions) != 1 or versions[0] != "13":
+        return (
+            String(_WS_VERSION_REJECTED)
+            + " (RFC 6455 sec 4.2.1): only 13 is supported"
+        )
+    return String("")
+
+
+struct _UpgradeFields(Movable):
+    """The request line and the handshake fields of an Upgrade request,
+    collected line by line by both handshake readers."""
+
+    var request_line: String
+    var upgrades: List[String]
+    var connections: List[String]
+    var keys: List[String]
+    var versions: List[String]
+    var origin: String
+
+    def __init__(out self, var request_line: String):
+        self.request_line = request_line^
+        self.upgrades = List[String]()
+        self.connections = List[String]()
+        self.keys = List[String]()
+        self.versions = List[String]()
+        self.origin = String("")
+
+    def observe(mut self, line: String):
+        """Record one header line (lines without a colon are ignored)."""
+        var colon = _str_find_srv(line, ":")
+        if colon < 0:
+            return
+        var k = _lower_srv(
+            String(
+                String(String(unsafe_from_utf8=line.as_bytes()[:colon])).strip()
+            )
+        )
+        var v = String(
+            String(
+                String(unsafe_from_utf8=line.as_bytes()[colon + 1 :])
+            ).strip()
+        )
+        if k == "sec-websocket-key":
+            self.keys.append(v^)
+        elif k == "sec-websocket-version":
+            self.versions.append(v^)
+        elif k == "origin":
+            self.origin = v^
+        elif k == "upgrade":
+            self.upgrades.append(v^)
+        elif k == "connection":
+            self.connections.append(v^)
+
+    def finish(self) raises -> _WsUpgradeRequest:
+        """Validate the request and return the retained fields.
+
+        Raises:
+            NetworkError: If it is not a valid opening handshake.
+        """
+        var method = String("")
+        var version = String("")
+        var parts = List[String]()
+        for p in self.request_line.split(" "):
+            parts.append(String(p))
+        if len(parts) == 3:
+            method = parts[0].copy()
+            version = parts[2].copy()
+        var problem = _ws_handshake_problem(
+            method,
+            version,
+            self.upgrades,
+            self.connections,
+            self.keys,
+            self.versions,
+        )
+        if problem.byte_length() != 0:
+            raise NetworkError(problem)
+        return _WsUpgradeRequest(self.keys[0].copy(), self.origin.copy())
+
+
+def _send_handshake_rejection(mut stream: TcpStream, reason: String):
+    """Best-effort HTTP answer to a refused handshake before the close.
+
+    RFC 6455 sec 4.2.2 point 4: a version the server does not speak gets
+    426 with the supported version; anything else refused is a 400.
+    """
+    var resp: String
+    if _WS_VERSION_REJECTED in reason:
+        resp = String(
+            "HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version:"
+            " 13\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    else:
+        resp = String(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection:"
+            " close\r\n\r\n"
+        )
+    try:
+        stream.write_all(Span[UInt8, _](resp.as_bytes()))
+    except:
+        pass
+
+
+def _parse_ws_upgrade_bytes(data: Span[UInt8, _]) raises -> _WsUpgradeRequest:
+    """Parse an HTTP WebSocket Upgrade request from a byte buffer.
+
+    Identical logic to ``_read_upgrade_request`` but reads from a
+    ``Span[UInt8, _]`` instead of a ``TcpStream``. Suitable for fuzz
+    harnesses and unit tests that operate on raw bytes.
+
+    Args:
+        data: Raw HTTP/1.1 Upgrade request bytes.
+
+    Returns:
+        The retained handshake fields (``Sec-WebSocket-Key`` + ``Origin``).
+
+    Raises:
+        NetworkError: If the request is malformed or missing required headers.
+    """
+    var pos = 0
+
+    def read_line(data: Span[UInt8, _], mut pos: Int) -> String:
+        var line = String(capacity_bytes=256)
+        while pos < len(data):
+            var c = data[pos]
+            pos += 1
+            if c == 13:
+                continue
+            if c == 10:
+                return line^
+            line += chr(Int(c))
+        return line^
+
+    var fields = _UpgradeFields(read_line(data, pos))
+    while True:
+        var line = read_line(data, pos)
+        if line.byte_length() == 0:
+            break
+        fields.observe(line)
+    return fields.finish()
+
+
+def _read_upgrade_request(mut stream: TcpStream) raises -> _WsUpgradeRequest:
+    """Read an HTTP upgrade request and return the retained fields.
+
+    Reads until the blank line terminating HTTP headers.
+
+    Args:
+        stream: Accepted TCP stream.
+
+    Returns:
+        The retained handshake fields (``Sec-WebSocket-Key`` + ``Origin``).
+
+    Raises:
+        NetworkError: If the upgrade request is malformed or missing the key.
+    """
+    var fields = _UpgradeFields(_read_line_srv(stream))
+    while True:
+        var line = _read_line_srv(stream)
+        if line.byte_length() == 0:
+            break
+        fields.observe(line)
+    return fields.finish()
+
+
+def _upgrade_response(accept: String) -> String:
+    """The 101 Switching Protocols response for ``accept``."""
+    return (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Sec-WebSocket-Accept: "
+        + accept
+        + "\r\n"
+        + "\r\n"
+    )
+
+
+def _send_upgrade_response(mut stream: TcpStream, accept: String) raises:
+    """Send the 101 Switching Protocols response.
+
+    Args:
+        stream: TCP stream for the client connection.
+        accept: The computed ``Sec-WebSocket-Accept`` value.
+    """
+    var resp = _upgrade_response(accept)
+    stream.write_all(Span[UInt8, _](resp.as_bytes()))
+
+
+# ── WsConnection ──────────────────────────────────────────────────────────────
+
+
+struct WsConnection(Movable):
+    """An accepted WebSocket connection (server side).
+
+    Server-side frames MUST NOT be masked (RFC 6455 §5.3).
+    Client-side frames MUST be masked; ``recv`` unmasks them automatically.
+
+    This type is ``Movable`` but not ``Copyable``.
+
+    A CLOSE received by :meth:`recv` is answered here (RFC 6455 sec
+    5.5.1), and once a CLOSE has been sent, by that reply or by
+    :meth:`close`, every ``send_*`` raises: an endpoint MUST NOT send
+    data after its CLOSE.
+
+    Fields:
+        _stream: The underlying TCP stream.
+        _peer: The remote socket address.
+        origin: The handshake ``Origin`` header (empty when absent).
+
+    Example:
+        ```mojo
+        def on_connect(conn: WsConnection) raises:
+            var frame = conn.recv()
+            conn.send_text(frame.text_payload()) # echo back
+
+        var srv = WsServer.bind(SocketAddr.localhost(9001))
+        srv.serve(on_connect)
+        ```
+    """
+
+    var _stream: TcpStream
+    var _peer: SocketAddr
+    var _close_sent: Bool
+    """Whether this side has written its CLOSE frame."""
+    var origin: String
+    """The ``Origin`` header sent with the upgrade handshake, or empty
+    when the client sent none.
+
+    Exposed so a handler can enforce a same-origin (or allow-list)
+    policy of its own. Browsers do NOT apply the same-origin policy to
+    ``ws://`` connects and send no preflight, so **any** page a user
+    visits can open a WebSocket to a server this process is running --
+    including one bound to loopback. ``Origin`` is the only signal in
+    the handshake that says which site opened the socket.
+
+    Trust it only as far as browsers make it trustworthy: a browser sets
+    it and script cannot forge it, but a non-browser client sends
+    whatever it likes (or nothing at all). It authenticates the *page*,
+    never the user.
+
+    Three cases an allow-list check has to handle: an absent header and
+    a present-but-empty ``Origin:`` both yield ``""``; a repeated
+    ``Origin`` header keeps the last value seen; and a browser sends the
+    literal ``"null"`` for an opaque origin (sandboxed iframe, ``data:``
+    URL, some redirect chains), which matches no real origin and is not
+    the same as absent.
+
+    Both accept paths send the ``101`` before the handler runs, so a
+    ``close`` here is a policy close on a live WebSocket, not a refused
+    handshake:
+
+    Example:
+        ```mojo
+        def on_connect(mut conn: WsConnection) raises:
+            if conn.origin != "https://app.example.com":
+                conn.close(WsCloseCode.POLICY_VIOLATION)
+                return
+        ```
+    """
+
+    var max_frame_size: Int
+    """Largest frame payload :meth:`recv` accepts. A client frame that
+    declares more is answered with CLOSE 1009 (MESSAGE_TOO_BIG) and
+    :meth:`recv` raises, before any of the payload is buffered.
+    Defaults to :data:`DEFAULT_MAX_FRAME_BYTES`; set it in the handler
+    before the first ``recv`` to change it."""
+
+    var _prebuf: List[UInt8]
+    """Bytes already read off the socket before this ``WsConnection``
+    took ownership of the fd, plus whatever a decode leaves behind.
+
+    It starts non-empty only on the shared-listener upgrade path
+    (``ServerConfig.ws = WsUpgrade(...)``), where the HTTP/1.1 reactor may
+    have buffered post-handshake WebSocket frame bytes in the same
+    ``recv`` that delivered the upgrade request (TCP coalescing).
+    ``_recv_one`` drains it before issuing any socket ``read`` and puts
+    back whatever the decoded frame did not consume, so a client that
+    pipelines several frames behind the handshake loses none of them.
+    Empty throughout for the standalone ``WsServer`` path, which reads
+    the handshake byte-at-a-time and leaves nothing buffered."""
+
+    def __init__(
+        out self,
+        var stream: TcpStream,
+        peer: SocketAddr,
+        var origin: String = String(""),
+    ):
+        self._stream = stream^
+        self._peer = peer
+        self._close_sent = False
+        self.origin = origin^
+        self.max_frame_size = DEFAULT_MAX_FRAME_BYTES
+        self._prebuf = List[UInt8]()
+
+    def __init__(
+        out self,
+        var stream: TcpStream,
+        peer: SocketAddr,
+        var prebuf: List[UInt8],
+        var origin: String = String(""),
+    ):
+        """Construct a ``WsConnection`` seeded with already-buffered
+        post-handshake bytes.
+
+        Used by the ``HttpServer`` WebSocket-upgrade seam to hand off
+        any frame bytes the HTTP reactor had already read past the
+        upgrade request. ``prebuf`` is consumed by the first
+        ``recv``/``_recv_one`` before any socket read.
+
+        Args:
+            stream: The upgraded connection, already in blocking mode.
+            peer: Remote address, for :attr:`peer`.
+            prebuf: Bytes the reactor read past the upgrade request.
+            origin: The handshake's ``Origin``, for :attr:`origin`.
+        """
+        self._stream = stream^
+        self._peer = peer
+        self._close_sent = False
+        self.origin = origin^
+        self.max_frame_size = DEFAULT_MAX_FRAME_BYTES
+        self._prebuf = prebuf^
+
+    def __deinit__(deinit self):
+        self._stream.close()
+
+    def send_text(self, msg: String) raises:
+        """Send a UTF-8 text message to the client.
+
+        Server-to-client frames are NOT masked (RFC 6455 §5.3).
+
+        Args:
+            msg: The UTF-8 string to send.
+
+        Raises:
+            NetworkError: On I/O failure, or if a CLOSE was already sent.
+        """
+        self._require_open()
+        var frame = WsFrame.text(msg)
+        var wire = frame.encode(mask=False)
+        self._stream.write_all(Span[UInt8, _](wire))
+
+    def send_binary(self, data: List[UInt8]) raises:
+        """Send a binary message to the client.
+
+        Server-to-client frames are NOT masked (RFC 6455 §5.3).
+
+        Args:
+            data: The raw binary payload.
+
+        Raises:
+            NetworkError: On I/O failure, or if a CLOSE was already sent.
+        """
+        self._require_open()
+        var frame = WsFrame.binary(data)
+        var wire = frame.encode(mask=False)
+        self._stream.write_all(Span[UInt8, _](wire))
+
+    def send_frame(mut self, frame: WsFrame) raises:
+        """Send an already-constructed frame (server, no masking).
+
+        Sending a CLOSE frame marks the closing handshake as started, the
+        same as :meth:`close`; a second CLOSE is dropped.
+
+        Args:
+            frame: Frame to send. The ``mask`` bit is always ``False``.
+
+        Raises:
+            NetworkError: On I/O failure, or if a CLOSE was already sent.
+        """
+        if frame.opcode == WsOpcode.CLOSE:
+            if self._close_sent:
+                return
+            self._close_sent = True
+        else:
+            self._require_open()
+        var wire = frame.encode(mask=False)
+        self._stream.write_all(Span[UInt8, _](wire))
+
+    def _require_open(self) raises:
+        """Raise if this side has already sent its CLOSE frame."""
+        if self._close_sent:
+            raise NetworkError(
+                "WebSocket: CLOSE already sent; no more frames may be sent"
+                " (RFC 6455 sec 5.5.1)"
+            )
+
+    def recv(mut self) raises -> WsFrame:
+        """Receive the next data frame from the client.
+
+        Automatically replies to PING frames with an unmasked PONG and
+        continues reading. Returns TEXT or BINARY frames. Client frames
+        are unmasked by ``WsFrame.decode_one`` automatically.
+
+        A CLOSE frame is answered before it is returned (RFC 6455 sec
+        5.5.1): with the received status code, with an empty CLOSE when
+        the body is empty, or with 1002 when the body is invalid (a
+        1-byte body, a code that may not be sent, a reason that is not
+        UTF-8). The reply is skipped if :meth:`close` already sent a
+        CLOSE. The frame is still returned, so a handler can leave its
+        loop; later ``send_*`` calls raise.
+
+        A frame that violates the protocol fails the connection after a
+        best-effort CLOSE: an unmasked client frame with 1002 (RFC 6455
+        sec 5.1), a final TEXT frame whose payload is not valid UTF-8
+        with 1007 (sec 8.1), an oversized frame with 1009. ``recv``
+        raises in each case and later ``send_*`` calls raise too.
+
+        Returns:
+            The next complete data frame (TEXT, BINARY, or CLOSE).
+
+        Raises:
+            WsProtocolError: If the client sends an unmasked frame, or a
+                final TEXT frame that is not valid UTF-8.
+            NetworkError: On I/O failure.
+        """
+        while True:
+            var frame = self._recv_one()
+            if frame.opcode == WsOpcode.PING:
+                # RFC 6455 §5.5.3: respond with unmasked PONG
+                var pong = WsFrame.pong(frame.payload)
+                var wire = pong.encode(mask=False)
+                self._stream.write_all(Span[UInt8, _](wire))
+                continue
+            if (
+                frame.opcode == WsOpcode.TEXT
+                and frame.fin
+                and not _is_valid_utf8(frame.payload)
+            ):
+                # RFC 6455 sec 8.1 / 7.4.1: a TEXT message that is not
+                # UTF-8 fails the connection with 1007. Only an
+                # unfragmented message is checked: this type does not
+                # reassemble fragments (a lone fragment may end inside
+                # a multi-byte sequence).
+                self._fail_connection(WsCloseCode.INVALID_PAYLOAD)
+                raise WsProtocolError(
+                    "TEXT frame payload is not valid UTF-8 (RFC 6455 sec"
+                    " 8.1); closed with 1007"
+                )
+            if frame.opcode == WsOpcode.CLOSE and not self._close_sent:
+                # RFC 6455 sec 5.5.1: answer a CLOSE with a CLOSE.
+                self._close_sent = True
+                var reply = WsFrame(
+                    opcode=WsOpcode.CLOSE,
+                    payload=_close_reply_payload(frame.payload),
+                )
+                var wire = reply.encode(mask=False)
+                try:
+                    self._stream.write_all(Span[UInt8, _](wire))
+                except:
+                    pass  # best-effort: the peer may be gone already
+            return frame^
+
+    def recv_message(mut self) raises -> WsMessage:
+        """Receive the next complete message, reassembled.
+
+        A fragmented message (a TEXT or BINARY frame without FIN, then
+        CONTINUATION frames up to one with FIN, RFC 6455 sec 5.4) comes
+        back whole; :meth:`recv` returns its pieces one by one. PING is
+        answered and PONG skipped, between fragments too. A text message
+        is checked for UTF-8 as a whole, so a code point may be split
+        across fragments. The reassembled payload is bounded by
+        ``max_frame_size``.
+
+        Raises:
+            NetworkError: If the client sent CLOSE (already answered by
+                :meth:`recv`), or on I/O failure.
+            WsProtocolError: After failing the connection with 1002 for a
+                CONTINUATION with no message to continue or a new data
+                frame inside a fragmented one, 1007 for a text message
+                that is not UTF-8, 1009 for a message over
+                ``max_frame_size``.
+        """
+        var first = self._recv_data_frame()
+        if first.opcode == WsOpcode.CONTINUATION:
+            self._fail_connection(WsCloseCode.PROTOCOL_ERROR)
+            raise WsProtocolError(
+                "CONTINUATION frame with no message to continue (RFC 6455"
+                " sec 5.4)"
+            )
+        var is_text = first.opcode == WsOpcode.TEXT
+        var fin = first.fin
+        var payload = List[UInt8]()
+        swap(payload, first.payload)
+        while not fin:
+            var next = self._recv_data_frame()
+            if next.opcode != WsOpcode.CONTINUATION:
+                self._fail_connection(WsCloseCode.PROTOCOL_ERROR)
+                raise WsProtocolError(
+                    "new data frame inside a fragmented message (RFC 6455"
+                    " sec 5.4)"
+                )
+            if len(payload) + len(next.payload) > self.max_frame_size:
+                self._fail_connection(WsCloseCode.MESSAGE_TOO_BIG)
+                raise WsProtocolError(
+                    WS_TOO_BIG_MARKER
+                    + ": reassembled message exceeds "
+                    + String(self.max_frame_size)
+                    + " bytes"
+                )
+            payload.extend(Span[UInt8, _](next.payload))
+            fin = next.fin
+        if not is_text:
+            return WsMessage(payload)
+        if not _is_valid_utf8(payload):
+            self._fail_connection(WsCloseCode.INVALID_PAYLOAD)
+            raise WsProtocolError(
+                "TEXT message is not valid UTF-8 (RFC 6455 sec 8.1); closed"
+                " with 1007"
+            )
+        return WsMessage(
+            WsFrame(opcode=WsOpcode.TEXT, payload=payload).text_payload()
+        )
+
+    def _recv_data_frame(mut self) raises -> WsFrame:
+        """The next TEXT, BINARY or CONTINUATION frame; PONG is skipped
+        and a CLOSE raises (``recv`` has answered it)."""
+        while True:
+            var frame = self.recv()
+            if frame.opcode == WsOpcode.PONG:
+                continue
+            if frame.opcode == WsOpcode.CLOSE:
+                raise NetworkError(
+                    "WebSocket: the client closed the connection"
+                )
+            return frame^
+
+    def _fail_connection(mut self, code: UInt16):
+        """Best-effort CLOSE ``code`` before the caller raises (once).
+
+        Marks the closing handshake as started, so no data frame is sent
+        afterwards. Skipped when a CLOSE was already written.
+        """
+        if self._close_sent:
+            return
+        self._close_sent = True
+        try:
+            var wire = WsFrame.close(code).encode(mask=False)
+            self._stream.write_all(Span[UInt8, _](wire))
+        except:
+            pass  # the peer may be gone already
+
+    def _recv_one(mut self) raises -> WsFrame:
+        """Read bytes from stream and decode one complete frame.
+
+        ``_prebuf`` is the connection's receive buffer: bytes the HTTP
+        reactor pre-buffered past the handshake on the shared-listener
+        path, and whatever followed the previous frame. Reads append to
+        it until :func:`ws_frame_length` says the frame is whole, or the
+        declared length is already past the cap, which ``decode_one``
+        then rejects without waiting for the payload.
+        """
+        while True:
+            var need = ws_frame_length(Span[UInt8, _](self._prebuf))
+            if need >= 0 and (
+                len(self._prebuf) >= need or need > self.max_frame_size + 14
+            ):
+                break
+            var have = len(self._prebuf)
+            self._prebuf.resize(unsafe_uninit_length=have + 4096)
+            var n = self._stream.read(
+                self._prebuf.unsafe_ptr().unsafe_offset(have), 4096
+            )
+            self._prebuf.resize(unsafe_uninit_length=have + max(n, 0))
+            if n <= 0:
+                raise NetworkError("WebSocket connection closed unexpectedly")
+        var result: _DecodeResult
+        try:
+            result = WsFrame.decode_one(
+                Span[UInt8, _](self._prebuf), max_payload=self.max_frame_size
+            )
+        except e:
+            if WS_TOO_BIG_MARKER in String(e):
+                # RFC 6455 sec 7.4.1: 1009 tells the client why.
+                # Best effort: the raise below is what matters.
+                self._fail_connection(WsCloseCode.MESSAGE_TOO_BIG)
+            raise e^
+        # RFC 6455 §5.1: server MUST close conn if client sends unmasked frame
+        if not result.frame.masked:
+            # RFC 6455 sec 7.4.1: say why (1002), best effort.
+            self._fail_connection(WsCloseCode.PROTOCOL_ERROR)
+            raise WsProtocolError("client sent unmasked frame (RFC 6455 §5.1)")
+        # Whatever followed the frame stays for the next call: two frames
+        # in one segment used to lose the second and hang the next recv().
+        var used = result.consumed
+        if used >= len(self._prebuf):
+            self._prebuf.clear()
+        else:
+            var rest = List[UInt8](capacity=len(self._prebuf) - used)
+            rest.extend(Span[UInt8, _](self._prebuf)[used : len(self._prebuf)])
+            self._prebuf = rest^
+        return result^.take_frame()
+
+    def close(
+        mut self,
+        code: UInt16 = WsCloseCode.NORMAL,
+        reason: String = "",
+    ) raises:
+        """Send a CLOSE frame, once.
+
+        Starts the closing handshake (RFC 6455 sec 7.1.2) and does not
+        wait for the peer's CLOSE: call :meth:`recv` to read it. A second
+        call, or a call after :meth:`recv` has already answered the
+        client's CLOSE, sends nothing. After this every ``send_*`` raises.
+
+        Args:
+            code: Close status code (see ``WsCloseCode.*``).
+            reason: Optional UTF-8 reason phrase (≤123 bytes).
+        """
+        if self._close_sent:
+            return
+        self._close_sent = True
+        var close_frame = WsFrame.close(code, reason)
+        var wire = close_frame.encode(mask=False)
+        try:
+            self._stream.write_all(Span[UInt8, _](wire))
+        except:
+            pass  # best-effort
+
+    def peer_addr(self) -> SocketAddr:
+        """Return the remote socket address.
+
+        Returns:
+            The client's ``SocketAddr``.
+        """
+        return self._peer
+
+
+# ── WsServer ──────────────────────────────────────────────────────────────────
+
+
+trait WsHandler(Copyable, Deinitable):
+    """Stateful per-connection WebSocket handler.
+
+    The struct-handler counterpart to the ``def(mut WsConnection)``
+    callback: because :meth:`on_connection` takes ``mut self``, the
+    handler can carry state (a shared registry, a counter, config) that
+    persists across the connections one server instance serves. Mount via
+    :meth:`WsServer.serve` (the ``[H: WsHandler]`` overload).
+
+    The trait is protocol-agnostic -- it drives a :class:`WsConnection`,
+    which is the h1 carrier today; the same handler will run over the
+    WS-over-h2 carrier once that bridge lands (carrier abstraction).
+    """
+
+    def on_connection(mut self, mut conn: WsConnection) raises -> None:
+        """Run one established WebSocket connection to completion."""
+        ...
+
+
+struct WsServer(Movable):
+    """A WebSocket server that upgrades incoming HTTP connections.
+
+    Accepts TCP connections, performs the HTTP Upgrade handshake, and
+    calls ``handler`` once per established WebSocket connection.
+
+    This type is ``Movable`` but not ``Copyable``.
+
+    Fields:
+        _listener: The bound TCP listener.
+
+    Example:
+        ```mojo
+        def handle(conn: WsConnection) raises:
+            while True:
+                var frame = conn.recv()
+                if frame.opcode == WsOpcode.CLOSE:
+                    break  # recv() has already sent the CLOSE reply
+                conn.send_text(frame.text_payload())
+
+        var srv = WsServer.bind(SocketAddr.localhost(9001))
+        srv.serve(handle)
+        ```
+    """
+
+    var _listener: TcpListener
+
+    def __init__(out self, var listener: TcpListener):
+        self._listener = listener^
+
+    def __deinit__(deinit self):
+        self._listener.close()
+
+    @staticmethod
+    def bind(addr: SocketAddr) raises -> WsServer:
+        """Bind a WebSocket server on ``addr``.
+
+        Args:
+            addr: Local address to accept connections on.
+
+        Returns:
+            A ``WsServer`` ready to call ``serve()``.
+
+        Raises:
+            AddressInUse: If the port is already bound.
+            NetworkError: For any other OS error.
+        """
+        var listener = TcpListener.bind(addr)
+        return WsServer(listener^)
+
+    def serve(self, handler: def(mut WsConnection) raises thin -> None) raises:
+        """Accept WebSocket connections in a single-threaded loop.
+
+        For each accepted TCP connection:
+            1. Read the HTTP Upgrade request.
+            2. Compute ``Sec-WebSocket-Accept``.
+            3. Send ``101 Switching Protocols``.
+            4. Call ``handler(conn)``.
+
+        Upgrade errors for individual connections are silently
+        skipped; only fatal accept-loop errors propagate.
+        For the multi-worker variant (``num_workers >= 2``), see
+        :meth:`serve_multicore`.
+
+        Args:
+            handler: Callback invoked once per successfully upgraded
+                connection.
+
+        Raises:
+            NetworkError: On fatal accept-loop errors.
+        """
+        while True:
+            var stream = self._listener.accept()
+            var peer = stream.peer_addr()
+            _handle_ws_connection(stream^, peer, handler)
+
+    def serve(
+        mut self,
+        handler: def(mut WsConnection) raises thin -> None,
+        num_workers: Int,
+    ) raises:
+        """Accept WebSocket connections across ``num_workers`` threads.
+
+        ``num_workers <= 1`` falls back to the single-threaded
+        :meth:`serve` shape (one worker on the current thread).
+        ``num_workers >= 2`` binds ``num_workers`` ``SO_REUSEPORT``
+        listeners on the same port (kernel-level load balancing
+        across worker threads, matching the
+        :class:`dodo.http.HttpServer` multi-worker shape) and
+        spawns one pthread per worker. Each worker runs its own
+        single-threaded accept loop, so the per-connection
+        upgrade + handler dispatch is unchanged.
+
+        The original :attr:`_listener` (whose port the
+        ``SO_REUSEPORT`` listeners bind to) is closed so its
+        backlog doesn't accept connections that would never be
+        served. Workers are joined before this method returns,
+        which today means it never returns: the workers run
+        forever (no drain machinery yet). Use ``Ctrl-C`` /
+        ``kill`` to terminate.
+
+        Args:
+            handler: Per-connection callback (same shape as the
+                single-threaded variant). Function pointers are
+                trivially copyable so the same value is shared
+                across all workers without per-worker context
+                packaging.
+            num_workers: Worker count. ``<= 0`` is coerced to 1.
+                Values > 256 are rejected.
+
+        Raises:
+            NetworkError: On listener bind failure for any worker.
+            Error: On ``pthread_create`` failure when
+                ``num_workers >= 2``.
+        """
+        if num_workers <= 1:
+            self.serve(handler)
+            return
+        if num_workers > 256:
+            raise Error("WsServer.serve: num_workers must be <= 256")
+        var addr = self._listener.local_addr()
+        # Close the original listener so its backlog doesn't
+        # silently swallow connections we never serve. The
+        # SO_REUSEPORT listeners below take over the port.
+        self._listener.close()
+        _ws_serve_multicore(addr, handler, num_workers)
+
+    def serve[H: WsHandler](mut self, var handler: H) raises:
+        """Accept WebSocket connections, dispatching each to a stateful
+        :trait:`WsHandler` struct.
+
+        The struct-handler variant of :meth:`serve`: one ``handler``
+        instance serves every connection via ``mut self``, so it can
+        accumulate state (connection count, a shared room registry, etc.)
+        across connections. Single-threaded; a multi-worker struct-handler
+        path (per-worker handler copies over the SO_REUSEPORT listeners)
+        is a follow-up -- the ``def`` handler already has ``num_workers``.
+
+        Upgrade errors for individual connections are logged and skipped;
+        only fatal accept-loop errors propagate.
+        """
+        while True:
+            var stream = self._listener.accept()
+            var peer = stream.peer_addr()
+            try:
+                var upgrade: _WsUpgradeRequest
+                try:
+                    upgrade = _read_upgrade_request(stream)
+                except e:
+                    _send_handshake_rejection(stream, String(e))
+                    raise e^
+                var accept = _compute_accept_srv(upgrade.key)
+                _send_upgrade_response(stream, accept)
+                var conn = WsConnection(stream^, peer, upgrade.origin.copy())
+                handler.on_connection(conn)
+            except e:
+                print("[ws] connection error: " + String(e))
+
+    def local_addr(self) -> SocketAddr:
+        """Return the local address the server is bound to.
+
+        Returns:
+            The bound ``SocketAddr``.
+        """
+        return self._listener.local_addr()
+
+    def close(mut self):
+        """Stop accepting connections. Idempotent."""
+        self._listener.close()
+
+
+def _handle_ws_connection(
+    var stream: TcpStream,
+    peer: SocketAddr,
+    handler: def(mut WsConnection) raises thin -> None,
+):
+    """Perform the WebSocket handshake and call handler.
+
+    Upgrade errors are swallowed so the accept loop continues.
+    """
+    try:
+        var upgrade: _WsUpgradeRequest
+        try:
+            upgrade = _read_upgrade_request(stream)
+        except e:
+            _send_handshake_rejection(stream, String(e))
+            raise e^
+        var accept = _compute_accept_srv(upgrade.key)
+        _send_upgrade_response(stream, accept)
+        var conn = WsConnection(stream^, peer, upgrade.origin.copy())
+        handler(conn)
+    except e:
+        print("[ws] connection error: " + String(e))
+
+
+# ── Off-reactor connection offload ─────────────────────────────────────────
+# With ``ServerConfig.ws.offload`` set, the HTTP/1.1 reactor hands each
+# upgraded WebSocket to a fresh detached pthread instead of running
+# ``ws_handler(conn)`` inline and parking the worker for the connection's
+# lifetime. By this point the fd is already detached from the reactor and
+# back in blocking mode, so the connection's whole lifecycle -- every
+# ``recv`` / ``send_text`` / ``close``, and the final socket close in
+# ``WsConnection.__del__`` -- happens on that one thread. No fd is ever
+# touched from two threads, so nothing has to marshal writes across them.
+
+
+@fieldwise_init
+struct _WsOffloadCtx(Movable):
+    """Heap hand-off carrying one upgraded connection and its handler onto
+    the offload thread. ``WsConnection`` is move-only because it owns the
+    fd; the ``def`` handler is a trivially-copyable function pointer. Same
+    Int-address stash :func:`_ws_serve_multicore` and ``block_in_pool`` use
+    to cross a pthread boundary."""
+
+    var conn: WsConnection
+    var handler: def(mut WsConnection) raises thin -> None
+
+
+comptime DEFAULT_MAX_OFFLOADED_WS: Int = 4096
+"""Detached WebSocket threads a process runs at once by default."""
+
+
+def _offload_cell_init() -> (
+    OptionalPointer[NoneType, UntrackedOrigin[mut=True]]
+):
+    var raw = alloc(Layout[Int64](count=1)).unsafe_leak()
+    raw.unsafe_write(Int64(0))
+    return Pointer[NoneType, UntrackedOrigin[mut=True]](
+        unsafe_from_address=Int(raw)
+    )
+
+
+def _offload_cell_keep(p: OptionalPointer[NoneType, UntrackedOrigin[mut=True]]):
+    pass
+
+
+def _offload_slot() -> Pointer[Scalar[DType.int64], MutUntrackedOrigin]:
+    var p = _get_global[
+        "dodo_ws_offloaded", _offload_cell_init, _offload_cell_keep
+    ]()
+    return Pointer[Scalar[DType.int64], MutUntrackedOrigin](
+        unsafe_from_address=Int(p.value())
+    )
+
+
+def ws_offload_try_acquire(limit: Int) -> Bool:
+    """Claim one of ``limit`` detached WebSocket threads, process-wide.
+    False when all are held: the upgrade is then refused rather than
+    letting clients spawn threads until the process hits its limit."""
+    var slot = _offload_slot()
+    var held = Atomic[Int64].load(slot)
+    while held < Int64(limit):
+        if Atomic[Int64].compare_exchange(slot, held, held + 1):
+            return True
+    return False
+
+
+def ws_offload_release():
+    """Give back a thread claimed by ``ws_offload_try_acquire``."""
+    _ = Atomic[Int64].fetch_add(_offload_slot(), -1)
+
+
+def ws_offloaded() -> Int:
+    """Detached WebSocket threads currently running."""
+    return Int(Atomic[Int64].load(_offload_slot()))
+
+
+def _ws_offload_entry(arg: _OpaquePtr) -> _OpaquePtr:
+    """``pthread`` start routine for one offloaded WebSocket connection.
+
+    Rebuilds the ``_WsOffloadCtx`` from the opaque argument, frees the heap
+    slot, and runs the handler to completion. The handler may raise; a
+    start routine may not, so errors are reported and swallowed -- the same
+    contract :func:`_handle_ws_connection` follows. When this returns,
+    ``ctx`` and the ``WsConnection`` it owns are destroyed, closing the
+    socket.
+    """
+    var ctx_addr = Int(arg)
+    debug_assert[assert_mode="safe"](
+        ctx_addr != 0,
+        "_ws_offload_entry: ctx pointer must be non-NULL",
+    )
+    var raw = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=ctx_addr)
+    var ctx_ptr = raw.unsafe_bitcast[_WsOffloadCtx]()
+    var ctx = ctx_ptr.unsafe_take_pointee()
+    ctx_ptr.unsafe_free()
+    try:
+        ctx.handler(ctx.conn)
+    except e:
+        print("[ws] offloaded connection error: " + String(e))
+    ws_offload_release()
+    return _null_ptr()
+
+
+def _spawn_ws_offload(
+    var conn: WsConnection,
+    handler: def(mut WsConnection) raises thin -> None,
+) raises:
+    """Run ``handler(conn)`` on a fresh detached pthread, fire-and-forget.
+
+    Heap-allocates a ``_WsOffloadCtx``, spawns a thread that takes
+    ownership of it, and detaches so the OS reclaims the thread when it
+    exits -- it outlives this call frame and is never joined. Returns as
+    soon as the thread is spawned, which is what lets the reactor move on.
+
+    Raises:
+        Error: If ``pthread_create`` fails. The context is destroyed and
+            freed first, which closes the socket: by this point the
+            reactor has already zeroed its own copy of the fd, so this
+            function is the only owner left and dropping it on the floor
+            would leak a live socket per failed handshake. ``EAGAIN`` at
+            the process thread limit is the reachable case. The caller
+            claimed a slot with ``ws_offload_try_acquire``; it is given
+            back here on failure and by the thread when it ends.
+    """
+    from std.memory.alloc import unsafe_alloc
+
+    var ctx_ptr = unsafe_alloc[_WsOffloadCtx](1)
+    debug_assert[assert_mode="safe"](
+        Int(ctx_ptr) != 0,
+        "_spawn_ws_offload: unsafe_alloc[_WsOffloadCtx] returned NULL",
+    )
+    ctx_ptr.unsafe_write(_WsOffloadCtx(conn^, handler))
+    var arg = Pointer[UInt8, MutUntrackedOrigin](
+        unsafe_from_address=Int(ctx_ptr)
+    )
+    var th: ThreadHandle
+    try:
+        # One thread per offloaded connection, alive as long as the
+        # connection: a dedicated OS thread, since a pool task would
+        # hold one of the pool's fixed workers each.
+        th = ThreadHandle.spawn_os[_ws_offload_entry](arg)
+    except e:
+        ctx_ptr.unsafe_deinit_pointee()
+        ctx_ptr.unsafe_free()
+        ws_offload_release()
+        raise e
+    # No free on this path even if it raises: the thread is already
+    # running and owns the context, so a free here would be a double
+    # free once `_ws_offload_entry` takes the pointee.
+    th.detach()
+
+
+# ── Multi-worker WsServer ──────────────────────────────────────────────────
+
+
+@fieldwise_init
+struct _WsWorkerCtx(Movable):
+    """Heap-allocated per-worker context for :func:`_ws_serve_multicore`.
+
+    Carries a *fully-bound* per-worker ``SO_REUSEPORT`` listener
+    (the parent thread does the bind so the bind itself is
+    serialised across workers and there is no concurrent-bind
+    race) plus a copy of the ``def`` handler function pointer.
+    Mojo ``def`` function pointers are trivially copyable, so
+    every worker shares the same callable with no per-worker
+    closure state.
+    """
+
+    var listener: TcpListener
+    var handler: def(mut WsConnection) raises thin -> None
+
+
+def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
+    """``pthread`` start routine for one WebSocket worker.
+
+    Casts ``arg`` back to a ``_WsWorkerCtx`` pointer, runs the
+    standard single-threaded WsServer accept loop until either
+    ``accept`` raises or the listener is closed. Errors are
+    swallowed -- per-connection upgrade errors are already
+    handled inside :func:`_handle_ws_connection`; the only way
+    out of this loop today is a fatal ``accept`` failure (e.g.
+    listener closed during shutdown).
+    """
+    var ctx_addr = Int(arg)
+    debug_assert[assert_mode="safe"](
+        ctx_addr != 0,
+        "_ws_worker_entry: ctx pointer must be non-NULL",
+    )
+    var raw = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=ctx_addr)
+    var ctx_ptr = raw.unsafe_bitcast[_WsWorkerCtx]()
+    try:
+        while True:
+            var stream = ctx_ptr[].listener.accept()
+            var peer = stream.peer_addr()
+            _handle_ws_connection(stream^, peer, ctx_ptr[].handler)
+    except:
+        pass
+    # Pointer is non-nullable; build C NULL from a runtime 0.
+    var null_addr = 0
+    return Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=null_addr)
+
+
+def _ws_serve_multicore(
+    addr: SocketAddr,
+    handler: def(mut WsConnection) raises thin -> None,
+    num_workers: Int,
+) raises:
+    """Spawn ``num_workers`` WebSocket worker threads sharing a port.
+
+    Each worker binds its own ``SO_REUSEPORT`` listener on the
+    parent thread (so the binds are serialised, no concurrent-
+    bind race), then runs an independent single-threaded accept
+    loop. The kernel hashes new 4-tuples across the listener set
+    so accept fairness is at the OS level, identical to the
+    :class:`dodo.http.HttpServer` multi-worker path.
+
+    Workers are spawned via :class:`dodo.runtime.ThreadHandle`
+    and joined before this function returns. Today the workers
+    never exit on their own (no graceful drain machinery for
+    WebSocket); use ``Ctrl-C`` to terminate.
+    """
+    debug_assert[assert_mode="safe"](
+        num_workers >= 2 and num_workers <= 256,
+        "_ws_serve_multicore: num_workers must be in [2,256]; got ",
+        num_workers,
+    )
+    if num_workers <= 1:
+        raise Error("_ws_serve_multicore: num_workers must be >= 2")
+
+    from std.memory.alloc import unsafe_alloc
+
+    # Heap-allocate one _WsWorkerCtx per worker via the native
+    # Mojo allocator. We keep the ctx addresses in a List[Int]
+    # since List[ThreadHandle] is not legal (ThreadHandle is
+    # Movable-only by design -- POSIX forbids double-join, so
+    # the type is non-Copyable; see dodo/runtime/_thread.mojo).
+    # ThreadHandles themselves live in an Pointer-backed
+    # array we walk by index.
+    var ctx_addrs = List[Int]()
+    var threads_ptr = unsafe_alloc[ThreadHandle](num_workers)
+    debug_assert[assert_mode="safe"](
+        Int(threads_ptr) != 0,
+        "_ws_serve_multicore: unsafe_alloc[ThreadHandle] returned NULL",
+    )
+
+    for i in range(num_workers):
+        var listener = bind_reuseport(addr)
+        var ctx = _WsWorkerCtx(listener^, handler)
+        var ctx_ptr = unsafe_alloc[_WsWorkerCtx](1)
+        debug_assert[assert_mode="safe"](
+            Int(ctx_ptr) != 0,
+            (
+                "_ws_serve_multicore: unsafe_alloc[_WsWorkerCtx] returned NULL"
+                " on worker "
+            ),
+            i,
+        )
+        ctx_ptr.unsafe_write(ctx^)
+        var arg = ctx_ptr.unsafe_bitcast[UInt8]()
+        var addr_int = Int(arg)
+        ctx_addrs.append(addr_int)
+        var th = ThreadHandle.spawn_serving[_ws_worker_entry](
+            Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr_int)
+        )
+        (threads_ptr.unsafe_offset(i)).unsafe_write(th^)
+    # See Scheduler.start: no serving loop may stay queued on the
+    # AsyncRT pool. No-op for OS threads.
+    for i in range(num_workers):
+        (threads_ptr.unsafe_offset(i))[].wait_started()
+
+    # Workers run forever; this join blocks until each worker
+    # exits (normally never, since the per-worker listener
+    # stays open). Closing the listener from another thread
+    # would unblock the worker's accept call -- the intended
+    # graceful-shutdown handle once WsServer grows a drain API.
+    for i in range(num_workers):
+        (threads_ptr.unsafe_offset(i))[].join()
+    # Free per-worker contexts now the threads are joined.
+    for i in range(len(ctx_addrs)):
+        debug_assert[assert_mode="safe"](
+            ctx_addrs[i] != 0,
+            "_ws_serve_multicore: ctx_addrs[i] is null on free; i=",
+            i,
+        )
+        var raw = Pointer[UInt8, MutUntrackedOrigin](
+            unsafe_from_address=ctx_addrs[i]
+        )
+        raw.unsafe_bitcast[_WsWorkerCtx]().unsafe_deinit_pointee()
+        raw.unsafe_free()
+    threads_ptr.unsafe_free()

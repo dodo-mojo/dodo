@@ -1,0 +1,526 @@
+"""HTTP content-encoding helpers: gzip and deflate via zlib FFI.
+
+Calls zlib through ``libdodo_zlib.so``, a thin C wrapper built automatically
+on ``pixi install`` / environment activation via ``dodo/http/ffi/build.sh``.
+
+**Why a C wrapper instead of calling zlib directly?**
+
+The C wrapper exposes a single-call ``(const void*, int, void*, int, int) -> int``
+API so Mojo never needs to re-read z_stream fields after a foreign call — Mojo's
+JIT can serve stale stack-slot values for memory modified by external calls,
+returning incorrect byte counts.
+
+**Why helper functions with borrowed ``lib``?**
+
+Mojo's ASAP (As Soon As Possible) destruction policy destroys an ``OwnedDLHandle``
+immediately after its last *Mojo-visible* use, which is the ``get_function`` call
+that retrieves the function pointer. ASAP then calls ``dlclose`` and unmaps the
+library *before* the pointer is actually invoked, crashing the JIT on both macOS
+ARM64 and Linux.
+
+The fix: each public entry point opens ``lib``, then delegates to a private helper
+that accepts ``lib`` as a ``read`` (borrowed) parameter. A borrow cannot be
+ASAP-destroyed — it stays alive for the helper's entire execution, including every
+C call inside it.
+
+Public API surface:
+
+- ``decompress_gzip(data)`` → ``List[UInt8]``
+- ``decompress_deflate(data)`` → ``List[UInt8]``
+- ``compress_gzip(data, level=6)`` → ``List[UInt8]``
+- ``decode_content(data, encoding)`` → ``List[UInt8]``
+"""
+
+from std.os import getenv
+from std.ffi import OwnedDLHandle, c_int
+from std.memory import Pointer, unsafe_memcpy
+
+from ..utils.dylib import find_dodo_lib, dl_sym, pinned_dodo_lib
+
+
+comptime DEFAULT_MAX_DECOMPRESSED_BYTES: Int = 16 * 1024 * 1024
+"""Default decompressed-size ceiling for a single body (16 MiB).
+A malicious server can ship a tiny compressed payload that inflates
+without bound (a "zip bomb"); the decoders bail with an Error before
+growing output past this cap. Mirrors the WS permessage-deflate cap
+(``dodo/ws/permessage_deflate.mojo``)."""
+
+
+def _find_dodo_zlib_lib() -> String:
+    """Return the path to ``libdodo_zlib.so``.
+
+    Thin wrapper over :func:`dodo.utils.dylib.find_dodo_lib`
+    pinned to the ``"zlib"`` shim name; kept under the
+    ``dodo.http.encoding`` namespace because every gzip /
+    deflate call site here imports it. (The canonical resolver
+    is :mod:`dodo.utils.dylib`.)
+    """
+    return find_dodo_lib("zlib")
+
+
+def _find_dodo_brotli_lib() -> String:
+    """Return the path to ``libdodo_brotli.so``.
+
+    Thin wrapper over :func:`dodo.utils.dylib.find_dodo_lib`
+    pinned to the ``"brotli"`` shim name. Same search order as
+    :func:`_find_dodo_zlib_lib`; only the bundled shim's
+    suffix differs.
+    """
+    return find_dodo_lib("brotli")
+
+
+struct Encoding:
+    """HTTP ``Content-Encoding`` / ``Accept-Encoding`` token constants."""
+
+    comptime IDENTITY: String = "identity"
+    """No encoding applied; pass-through."""
+
+    comptime GZIP: String = "gzip"
+    """IETF gzip format (zlib + gzip wrapper, windowBits = 15 | 16)."""
+
+    comptime DEFLATE: String = "deflate"
+    """Raw deflate or zlib-wrapped deflate (windowBits = 15 or -15)."""
+
+    comptime BR: String = "br"
+    """Brotli encoding (libbrotlidec / libbrotlienc via libdodo_brotli)."""
+
+
+def _take_inflated(
+    imm lib: OwnedDLHandle, n: Int64, addr: Int, max_out: Int
+) raises -> List[UInt8]:
+    """Copy ``n`` bytes out of a buffer ``dodo_inflate_all`` malloc'ed at
+    ``addr`` and free it, or raise for a negative ``n``.
+
+    Decoding happens in one pass in C and succeeds only at the end of
+    the compressed stream: a truncated body used to come back as a
+    partial one with no error, ``Z_NEED_DICT`` was read as a length of 2,
+    and every buffer doubling re-inflated the input from the start.
+    """
+    if n < 0:
+        if n == -100:
+            raise Error("compressed body is truncated")
+        if n == -101:
+            raise Error(
+                "decompressed output exceeded max_decompressed_bytes ("
+                + String(max_out)
+                + " bytes)"
+            )
+        if n == -103:
+            raise Error("compressed body needs a preset dictionary")
+        raise Error("decompression failed: " + String(n))
+    var out = List[UInt8](length=Int(n), fill=0)
+    if n > 0:
+        unsafe_memcpy(
+            dest=out.unsafe_ptr(),
+            src=Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr),
+            count=Int(n),
+        )
+    var fn_free = dl_sym[def(Int) thin abi("C") -> None](lib, "dodo_zlib_free")
+    fn_free(addr)
+    return out^
+
+
+def _do_decompress(
+    imm lib: OwnedDLHandle,
+    data: Span[UInt8, _],
+    window_bits: c_int,
+    max_out: Int,
+) raises -> List[UInt8]:
+    """Decompress using ``dodo_decompress``, growing the output buffer on overflow.
+
+    ``lib`` is a borrow: it cannot be ASAP-destroyed while this function runs,
+    keeping the shared library mapped across every C call below.
+
+    Args:
+        lib: Borrowed handle to ``libdodo_zlib.so``.
+        data: Compressed input bytes.
+        window_bits: zlib windowBits (47=auto gzip/zlib, 15=zlib, -15=raw).
+        max_out: Decompressed-size ceiling; raises before growing past it.
+
+    Returns:
+        Decompressed bytes.
+
+    Raises:
+        Error: If zlib reports a non-recoverable error.
+    """
+    var fn_inflate = dl_sym[
+        def(Int, Int, Int, Int, c_int) thin abi("C") -> Int64
+    ](lib, "dodo_inflate_all")
+    var out_ptr = List[Int](length=1, fill=0)
+    var n = fn_inflate(
+        Int(data.unsafe_ptr()),
+        len(data),
+        Int(out_ptr.unsafe_ptr()),
+        max_out,
+        window_bits,
+    )
+    return _take_inflated(lib, n, out_ptr[0], max_out)
+
+
+def _decompress_impl(
+    data: Span[UInt8, _], window_bits: c_int, max_out: Int
+) raises -> List[UInt8]:
+    """Entry point for gzip/zlib decompression.
+
+    Args:
+        data: Compressed input bytes.
+        window_bits: zlib windowBits passed through to ``_do_decompress``.
+        max_out: Decompressed-size ceiling; raises before growing past it.
+
+    Returns:
+        Decompressed bytes.
+
+    Raises:
+        Error: If zlib reports a non-recoverable error.
+    """
+    if len(data) == 0:
+        return List[UInt8]()
+    ref lib = pinned_dodo_lib["zlib"]()[]
+    return _do_decompress(lib, data, window_bits, max_out)
+
+
+def _do_decompress_deflate(
+    imm lib: OwnedDLHandle,
+    data: Span[UInt8, _],
+    max_out: Int,
+) raises -> List[UInt8]:
+    """Decompress using ``dodo_decompress_deflate``, growing on overflow.
+
+    ``lib`` is a borrow: it cannot be ASAP-destroyed while this function runs,
+    keeping the shared library mapped across every C call below.
+
+    Args:
+        lib: Borrowed handle to ``libdodo_zlib.so``.
+        data: Compressed input bytes.
+        max_out: Decompressed-size ceiling; raises before growing past it.
+
+    Returns:
+        Decompressed bytes.
+
+    Raises:
+        Error: If neither zlib-wrapped nor raw deflate succeeds.
+    """
+    var fn_inflate = dl_sym[def(Int, Int, Int, Int) thin abi("C") -> Int64](
+        lib, "dodo_inflate_all_deflate"
+    )
+    var out_ptr = List[Int](length=1, fill=0)
+    var n = fn_inflate(
+        Int(data.unsafe_ptr()), len(data), Int(out_ptr.unsafe_ptr()), max_out
+    )
+    return _take_inflated(lib, n, out_ptr[0], max_out)
+
+
+def _decompress_deflate_impl(
+    data: Span[UInt8, _], max_out: Int
+) raises -> List[UInt8]:
+    """Entry point for deflate decompression (zlib-wrapped with raw fallback).
+
+    Args:
+        data: Compressed input bytes.
+        max_out: Decompressed-size ceiling; raises before growing past it.
+
+    Returns:
+        Decompressed bytes.
+
+    Raises:
+        Error: If neither zlib-wrapped nor raw deflate succeeds.
+    """
+    if len(data) == 0:
+        return List[UInt8]()
+    ref lib = pinned_dodo_lib["zlib"]()[]
+    return _do_decompress_deflate(lib, data, max_out)
+
+
+def _do_compress(
+    imm lib: OwnedDLHandle,
+    data: Span[UInt8, _],
+    level: c_int,
+) raises -> List[UInt8]:
+    """Compress using ``dodo_compress_gzip``.
+
+    ``lib`` is a borrow: it cannot be ASAP-destroyed while this function runs,
+    keeping the shared library mapped across the C call below.
+
+    Args:
+        lib: Borrowed handle to ``libdodo_zlib.so``.
+        data: Plaintext input bytes.
+        level: Compression level (1–9).
+
+    Returns:
+        Gzip-compressed bytes.
+
+    Raises:
+        Error: If compression fails.
+    """
+    var fn_comp = dl_sym[
+        def(Int, c_int, Int, c_int, c_int) thin abi("C") -> c_int
+    ](lib, "dodo_compress_gzip")
+
+    # Worst-case gzip overhead: ~18 bytes header/trailer + 0.1% + 12 bytes.
+    var cap = len(data) + (len(data) >> 10) + 32
+    var out = List[UInt8](capacity=cap)
+    out.resize(cap, 0)
+
+    var written = fn_comp(
+        Int(data.unsafe_ptr()),
+        c_int(len(data)),
+        Int(out.unsafe_ptr()),
+        c_int(cap),
+        level,
+    )
+
+    if Int(written) < 0:
+        raise Error("dodo_compress_gzip failed: " + String(written))
+
+    out.resize(Int(written), 0)
+    return out^
+
+
+def decompress_gzip(
+    data: Span[UInt8, _],
+    max_out: Int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+) raises -> List[UInt8]:
+    """Decompress a gzip-encoded buffer using zlib.
+
+    Uses ``dodo_decompress`` with ``windowBits = 47`` (auto-detect gzip or
+    zlib-wrapped deflate).
+
+    Args:
+        data: The compressed bytes to decompress.
+        max_out: Decompressed-size ceiling; decompression bails with an
+            Error before growing output past this (zip-bomb guard).
+
+    Returns:
+        The decompressed bytes.
+
+    Raises:
+        Error: If the input is not valid gzip data, decompression fails,
+            or the output would exceed ``max_out``.
+    """
+    return _decompress_impl(data, c_int(47), max_out)
+
+
+def decompress_deflate(
+    data: Span[UInt8, _],
+    max_out: Int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+) raises -> List[UInt8]:
+    """Decompress a deflate-encoded buffer using zlib.
+
+    Tries zlib-wrapped deflate first; falls back to raw deflate, matching
+    browser behaviour for the ambiguous ``deflate`` encoding.
+
+    Args:
+        data: The compressed bytes to decompress.
+        max_out: Decompressed-size ceiling (zip-bomb guard).
+
+    Returns:
+        The decompressed bytes.
+
+    Raises:
+        Error: If neither zlib-wrapped nor raw deflate succeeds, or the
+            output would exceed ``max_out``.
+    """
+    return _decompress_deflate_impl(data, max_out)
+
+
+def compress_gzip(data: Span[UInt8, _], level: Int = 6) raises -> List[UInt8]:
+    """Compress bytes using gzip via zlib.
+
+    Args:
+        data: The plaintext bytes to compress.
+        level: Compression level (1 = fastest, 9 = best; 6 = default).
+
+    Returns:
+        The gzip-compressed bytes (including gzip header and trailer).
+
+    Raises:
+        Error: If compression fails or the output buffer was unexpectedly small.
+    """
+    if len(data) == 0:
+        return List[UInt8]()
+    ref lib = pinned_dodo_lib["zlib"]()[]
+    return _do_compress(lib, data, c_int(level))
+
+
+def decode_content(
+    data: Span[UInt8, _],
+    encoding: String,
+    max_out: Int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+) raises -> List[UInt8]:
+    """Decode ``data`` according to the ``Content-Encoding`` header value.
+
+    Args:
+        data: The (possibly compressed) response body.
+        encoding: The value of the HTTP ``Content-Encoding`` header.
+        max_out: Decompressed-size ceiling for the compressed encodings
+            (zip-bomb guard); ignored for identity.
+
+    Returns:
+        Decoded bytes. If ``encoding`` is ``"identity"`` or ``""``
+        the original bytes are copied and returned.
+
+    Raises:
+        Error: If the encoding is not supported, decompression fails, or
+            the decompressed output would exceed ``max_out``.
+    """
+    if encoding == Encoding.GZIP:
+        return decompress_gzip(data, max_out)
+    elif encoding == Encoding.DEFLATE:
+        return decompress_deflate(data, max_out)
+    elif encoding == Encoding.BR:
+        return decompress_brotli(data, max_out)
+    elif encoding == Encoding.IDENTITY or encoding == "":
+        var out = List[UInt8](capacity=len(data))
+        for b in data:
+            out.append(b)
+        return out^
+    else:
+        raise Error("decode_content: unsupported encoding '" + encoding + "'")
+
+
+# ── Brotli ────────────────────────────────────────────────────
+
+
+def _do_compress_brotli(
+    imm lib: OwnedDLHandle, data: Span[UInt8, _], quality: c_int
+) raises -> List[UInt8]:
+    """Compress using ``dodo_brotli_compress``, growing on overflow.
+
+    ``lib`` is a borrow: it cannot be ASAP-destroyed while this function runs,
+    keeping the shared library mapped across every C call below. Without the
+    borrow, the function-local handle is reclaimed after ``get_function`` and
+    the cached pointer dangles, which segfaults the Mojo runtime on macOS
+    arm64 (libKGENCompilerRTShared.dylib+0x40528).
+
+    Args:
+        lib: Borrowed handle to ``libdodo_brotli.so``.
+        data: Plaintext input bytes.
+        quality: Brotli quality level (0-11).
+
+    Returns:
+        Brotli-compressed bytes.
+
+    Raises:
+        Error: If the FFI call fails or the output buffer cannot be grown.
+    """
+    var fn_comp = dl_sym[def(Int, Int, Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_brotli_compress"
+    )
+    var cap = max(len(data) * 2 + 64, 1024)
+    while True:
+        var out = List[UInt8](capacity=cap)
+        out.resize(cap, 0)
+        var written = fn_comp(
+            Int(data.unsafe_ptr()),
+            len(data),
+            Int(out.unsafe_ptr()),
+            cap,
+            quality,
+        )
+        var w = Int(written)
+        if w == -2:
+            cap *= 2
+            continue
+        if w < 0:
+            raise Error("dodo_brotli_compress failed: " + String(written))
+        out.resize(w, 0)
+        return out^
+
+
+def compress_brotli(
+    data: Span[UInt8, _], quality: Int = 5
+) raises -> List[UInt8]:
+    """Compress bytes using brotli via ``libdodo_brotli``.
+
+    Args:
+        data: Plaintext input bytes.
+        quality: Brotli quality level 0-11 (5 = sensible default,
+                 11 = max compression but slow). Out-of-range values
+                 are clamped by the C wrapper.
+
+    Returns:
+        Brotli-compressed bytes.
+
+    Raises:
+        Error: If the FFI call fails or the output buffer cannot be
+               grown enough to hold the result.
+    """
+    if len(data) == 0:
+        return List[UInt8]()
+    ref lib = pinned_dodo_lib["brotli"]()[]
+    return _do_compress_brotli(lib, data, c_int(quality))
+
+
+def _do_decompress_brotli(
+    imm lib: OwnedDLHandle, data: Span[UInt8, _], max_out: Int
+) raises -> List[UInt8]:
+    """Decompress using ``dodo_brotli_decompress``, growing on overflow.
+
+    ``lib`` is a borrow: it cannot be ASAP-destroyed while this function runs,
+    keeping the shared library mapped across every C call below.
+
+    Args:
+        lib: Borrowed handle to ``libdodo_brotli.so``.
+        data: Brotli-encoded input.
+        max_out: Decompressed-size ceiling; raises before growing past it.
+
+    Returns:
+        Decoded plaintext.
+
+    Raises:
+        Error: If the FFI call fails or the input is not valid brotli.
+    """
+    var fn_dec = dl_sym[def(Int, Int, Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_brotli_decompress"
+    )
+    var cap = max(len(data) * 8, 4096)
+    if cap > max_out:
+        cap = max_out
+    while True:
+        var out = List[UInt8](capacity=cap)
+        out.resize(cap, 0)
+        var written = fn_dec(
+            Int(data.unsafe_ptr()),
+            len(data),
+            Int(out.unsafe_ptr()),
+            cap,
+        )
+        var w = Int(written)
+        if w == -2:
+            if cap >= max_out:
+                raise Error(
+                    "decompressed output exceeded max_decompressed_bytes ("
+                    + String(max_out)
+                    + " bytes)"
+                )
+            cap *= 2
+            if cap > max_out:
+                cap = max_out
+            continue
+        if w < 0:
+            raise Error("dodo_brotli_decompress failed: " + String(written))
+        out.resize(w, 0)
+        return out^
+
+
+def decompress_brotli(
+    data: Span[UInt8, _],
+    max_out: Int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+) raises -> List[UInt8]:
+    """Decompress brotli-encoded bytes.
+
+    Args:
+        data: Brotli-encoded input.
+        max_out: Decompressed-size ceiling (zip-bomb guard).
+
+    Returns:
+        Decoded plaintext.
+
+    Raises:
+        Error: If the FFI call fails, the input is not valid brotli, or
+            the output would exceed ``max_out``.
+    """
+    if len(data) == 0:
+        return List[UInt8]()
+    ref lib = pinned_dodo_lib["brotli"]()[]
+    return _do_decompress_brotli(lib, data, max_out)

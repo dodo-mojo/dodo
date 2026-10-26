@@ -1,0 +1,56 @@
+# Draft rattler-build recipe for the modular-community channel.
+# Submit as recipes/dodo/recipe.yaml in a PR to github.com/modular/modular-community
+# once a tagged release exists that builds and passes tests.
+# Modeled on the emberjson recipe (Mojo 1.1 era); bump pins to the Mojo version we release against.
+context:
+  version: 0.0.1
+
+package:
+  name: "dodo"
+  version: ${{ version }}
+
+source:
+  - git: https://github.com/dodo-mojo/dodo.git
+    tag: v${{ version }}
+
+build:
+  number: 0
+  script:
+    - mojo precompile dodo -o ${{ PREFIX }}/lib/mojo/dodo.mojoc
+
+requirements:
+  host:
+    - mojo-compiler =1.2.0
+  build:
+    - mojo-compiler =1.2.0
+  run:
+    - ${{ pin_compatible('mojo-compiler') }}
+
+tests:
+  - script:
+      - if: unix
+        then:
+          - python scripts/run_tests.py
+    files:
+      source:
+        - scripts/run_tests.py
+        - tests/
+        - dodo/
+    requirements:
+      build:
+        - mojo =1.2.0
+      run:
+        - mojo =1.2.0
+
+about:
+  homepage: https://github.com/dodo-mojo/dodo
+  license: Apache-2.0
+  license_file: LICENSE
+  summary: Web framework for Mojo with in-process AI and GPU, built for humans and AI agents
+  repository: https://github.com/dodo-mojo/dodo
+
+extra:
+  maintainers:
+    - anubhav-qt
+  project_name:
+    - dodo

@@ -1,0 +1,35 @@
+"""Buffered I/O utilities for dodo streams.
+
+Provides ``Readable`` — a trait for byte-stream types — and ``BufReader``
+— a generic buffered reader with line-oriented helpers.
+
+## Public API
+
+```mojo
+from dodo.io import Readable, BufReader
+```
+
+- ``Readable`` — Trait satisfied by ``TcpStream`` and ``TlsStream``.
+- ``BufReader`` — Wraps any ``Readable`` and adds ``readline``,
+  ``read_until``, ``read_exact``.
+- ``ByteReader`` / ``ByteWriter`` — bounds-checked, sans-I/O byte
+  cursors over an in-memory buffer (big- + little-endian integers,
+  ``read_utf8`` validates).
+
+## Example
+
+```mojo
+from dodo.tcp import TcpStream
+from dodo.io import BufReader
+
+def main() raises:
+    var s = TcpStream.connect("example.com", 80)
+    s.write_all("GET / HTTP/1.0\\r\\nHost: example.com\\r\\n\\r\\n".as_bytes())
+    var r = BufReader(s^)
+    var status = r.readline()
+    print(status) # HTTP/1.0 200 OK (or similar)
+```
+"""
+
+from .buf_reader import Readable, BufReader
+from .byte_cursor import ByteReader, ByteWriter

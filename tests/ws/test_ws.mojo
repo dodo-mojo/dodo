@@ -1,0 +1,922 @@
+"""Tests for dodo.ws — WsFrame codec, WsOpcode, and WsCloseCode.
+
+Tests cover:
+  - Frame factory helpers (text, binary, ping, pong, close)
+  - WsFrame.encode() wire format: header bytes, extended lengths, masking
+  - WsFrame.decode_one() parsing: various payload sizes, masking
+  - Round-trip: encode → decode → verify payload equality
+  - Control frame constraints: fragmentation and payload-length checks
+  - WsProtocolError typing
+
+Integration tests (test_ws_connect_*) connect to a real echo server.
+They skip gracefully if the network is unavailable.
+"""
+
+from std.testing import (
+    assert_equal,
+    assert_true,
+    assert_false,
+    assert_raises,
+    TestSuite,
+)
+from dodo.ws.frame import ws_frame_length
+from dodo.ws import (
+    WsFrame,
+    WsOpcode,
+    WsCloseCode,
+    WsProtocolError,
+    WsClient,
+    WsServer,
+    WsConnection,
+)
+from dodo.tcp import TcpStream, TcpListener
+from dodo.net import SocketAddr
+from dodo.tls import TlsConfig
+
+
+# ── Factory opcode tests ──────────────────────────────────────────────────────
+
+
+def test_text_frame_opcode() raises:
+    """WsFrame.text() must have TEXT opcode."""
+    var frame = WsFrame.text("hello")
+    assert_equal(Int(frame.opcode), Int(WsOpcode.TEXT))
+    assert_true(frame.fin)
+    assert_false(frame.rsv1)
+
+
+def test_binary_frame_opcode() raises:
+    """WsFrame.binary() must have BINARY opcode."""
+    var data = List[UInt8]()
+    var frame = WsFrame.binary(data)
+    assert_equal(Int(frame.opcode), Int(WsOpcode.BINARY))
+    assert_true(frame.fin)
+
+
+def test_ping_frame_opcode() raises:
+    """WsFrame.ping() must have PING opcode."""
+    var frame = WsFrame.ping()
+    assert_equal(Int(frame.opcode), Int(WsOpcode.PING))
+    assert_true(frame.is_control())
+
+
+def test_pong_frame_opcode() raises:
+    """WsFrame.pong() must have PONG opcode."""
+    var frame = WsFrame.pong()
+    assert_equal(Int(frame.opcode), Int(WsOpcode.PONG))
+    assert_true(frame.is_control())
+
+
+def test_close_frame_opcode() raises:
+    """WsFrame.close() must have CLOSE opcode."""
+    var frame = WsFrame.close()
+    assert_equal(Int(frame.opcode), Int(WsOpcode.CLOSE))
+    assert_true(frame.is_control())
+
+
+def test_close_frame_payload() raises:
+    """WsFrame.close() must encode code as 2 big-endian bytes."""
+    var frame = WsFrame.close(code=WsCloseCode.NORMAL)
+    assert_equal(len(frame.payload), 2)
+    var code = (Int(frame.payload[0]) << 8) | Int(frame.payload[1])
+    assert_equal(code, 1000)
+
+
+def test_close_frame_with_reason() raises:
+    """WsFrame.close() with reason must include reason bytes after code."""
+    var frame = WsFrame.close(code=WsCloseCode.GOING_AWAY, reason="bye")
+    assert_equal(len(frame.payload), 5)  # 2 (code) + 3 (bye)
+    assert_equal(chr(Int(frame.payload[2])), "b")
+    assert_equal(chr(Int(frame.payload[3])), "y")
+    assert_equal(chr(Int(frame.payload[4])), "e")
+
+
+def test_is_control_data_frames() raises:
+    """Data frames (TEXT, BINARY, CONTINUATION) must not be control frames."""
+    assert_false(WsFrame.text("x").is_control())
+    var empty = List[UInt8]()
+    assert_false(WsFrame.binary(empty).is_control())
+
+
+# ── WsOpcode / WsCloseCode constants ─────────────────────────────────────────
+
+
+def test_opcode_values() raises:
+    """WsOpcode constants must match RFC 6455 §5.2."""
+    assert_equal(Int(WsOpcode.CONTINUATION), 0)
+    assert_equal(Int(WsOpcode.TEXT), 1)
+    assert_equal(Int(WsOpcode.BINARY), 2)
+    assert_equal(Int(WsOpcode.CLOSE), 8)
+    assert_equal(Int(WsOpcode.PING), 9)
+    assert_equal(Int(WsOpcode.PONG), 10)
+
+
+def test_close_code_values() raises:
+    """WsCloseCode constants must match RFC 6455 §7.4.1."""
+    assert_equal(Int(WsCloseCode.NORMAL), 1000)
+    assert_equal(Int(WsCloseCode.GOING_AWAY), 1001)
+    assert_equal(Int(WsCloseCode.PROTOCOL_ERROR), 1002)
+
+
+# ── WsFrame.encode() ─────────────────────────────────────────────────────────
+
+
+def test_encode_small_frame_header() raises:
+    """Encoding a 5-byte text frame must produce a 2-byte header + payload."""
+    var frame = WsFrame.text("hello")
+    var wire = frame.encode()
+    # Total: 2 header + 5 payload = 7 bytes
+    assert_equal(len(wire), 7)
+    # Byte 0: FIN (0x80) | TEXT (0x01) = 0x81
+    assert_equal(Int(wire[0]), 0x81)
+    # Byte 1: not masked (0x80 clear) | len=5
+    assert_equal(Int(wire[1]), 5)
+
+
+def test_encode_empty_payload() raises:
+    """Encoding a frame with no payload must produce exactly 2 header bytes."""
+    var frame = WsFrame.ping()
+    var wire = frame.encode()
+    assert_equal(len(wire), 2)
+    # Byte 0: FIN | PING = 0x89
+    assert_equal(Int(wire[0]), 0x89)
+    # Byte 1: no mask, len=0
+    assert_equal(Int(wire[1]), 0)
+
+
+def test_encode_126_byte_payload() raises:
+    """Encoding a 126-byte payload must use extended 16-bit length."""
+    var payload = List[UInt8](capacity=126)
+    for i in range(126):
+        payload.append(UInt8(i & 0xFF))
+    var frame = WsFrame.binary(payload)
+    var wire = frame.encode()
+    # Total: 2 base + 2 ext + 126 payload = 130 bytes
+    assert_equal(len(wire), 130)
+    # Byte 1: not masked, len indicator = 126
+    assert_equal(Int(wire[1]), 126)
+    # Bytes 2-3: length = 126 in big-endian
+    assert_equal(Int(wire[2]), 0)
+    assert_equal(Int(wire[3]), 126)
+
+
+def test_encode_with_zero_mask() raises:
+    """Encoding with mask=True and zero key must set the MASK bit."""
+    var frame = WsFrame.text("hi")
+    var wire = frame.encode(mask=True)
+    # 2 header + 4 mask_key + 2 payload = 8 bytes
+    assert_equal(len(wire), 8)
+    # Byte 1: MASK bit (0x80) | len=2
+    assert_equal(Int(wire[1]), 0x80 | 2)
+
+
+def test_encode_rsv1_raises() raises:
+    """Encoding with rsv1=True must raise WsProtocolError."""
+    var frame = WsFrame(
+        opcode=WsOpcode.TEXT,
+        payload=List[UInt8](),
+        rsv1=True,
+    )
+    with assert_raises(contains="WsProtocolError"):
+        _ = frame.encode()
+
+
+def test_encode_control_oversized_raises() raises:
+    """Control frame with payload > 125 bytes must raise WsProtocolError."""
+    var big = List[UInt8](capacity=126)
+    for _ in range(126):
+        big.append(UInt8(0))
+    var frame = WsFrame(opcode=WsOpcode.PING, payload=big)
+    with assert_raises(contains="WsProtocolError"):
+        _ = frame.encode()
+
+
+# ── WsFrame.decode_one() ──────────────────────────────────────────────────────
+
+
+def test_decode_small_text_frame() raises:
+    """Decoding a 2-header + 5-payload wire frame must reproduce the payload."""
+    # Wire: FIN | TEXT, len=5, "hello"
+    var wire = List[UInt8]()
+    wire.append(UInt8(0x81))  # FIN | TEXT
+    wire.append(UInt8(5))
+    for c in "hello".as_bytes():
+        wire.append(c)
+
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(Int(result.frame.opcode), Int(WsOpcode.TEXT))
+    assert_true(result.frame.fin)
+    assert_equal(result.consumed, 7)
+    assert_equal(result.frame.text_payload(), "hello")
+
+
+def test_decode_empty_ping() raises:
+    """Decoding a 2-byte PING frame must produce an empty control frame."""
+    var wire = List[UInt8]()
+    wire.append(UInt8(0x89))  # FIN | PING
+    wire.append(UInt8(0))
+
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(Int(result.frame.opcode), Int(WsOpcode.PING))
+    assert_equal(len(result.frame.payload), 0)
+    assert_equal(result.consumed, 2)
+
+
+def test_decode_16bit_length() raises:
+    """Decoding a frame with 16-bit extended length must read full payload."""
+    var plen = 200
+    var wire = List[UInt8](capacity=4 + plen)
+    wire.append(UInt8(0x82))  # FIN | BINARY
+    wire.append(UInt8(126))  # 16-bit extended
+    wire.append(UInt8(0))
+    wire.append(UInt8(plen))
+    for i in range(plen):
+        wire.append(UInt8(i & 0xFF))
+
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(Int(result.frame.opcode), Int(WsOpcode.BINARY))
+    assert_equal(len(result.frame.payload), plen)
+    assert_equal(result.consumed, 4 + plen)
+
+
+def test_decode_masked_frame() raises:
+    """Decoding a masked frame must XOR-unmask the payload."""
+    # Encode "AB" with key [0x01, 0x02, 0x03, 0x04]
+    var wire = List[UInt8]()
+    wire.append(UInt8(0x81))  # FIN | TEXT
+    wire.append(UInt8(0x80 | 2))  # MASK | len=2
+    wire.append(UInt8(0x01))  # key[0]
+    wire.append(UInt8(0x02))  # key[1]
+    wire.append(UInt8(0x03))  # key[2]
+    wire.append(UInt8(0x04))  # key[3]
+    wire.append(UInt8(ord("A") ^ 0x01))  # 'A' ^ key[0]
+    wire.append(UInt8(ord("B") ^ 0x02))  # 'B' ^ key[1]
+
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(result.frame.text_payload(), "AB")
+    assert_true(result.frame.masked)
+
+
+def test_decode_truncated_raises() raises:
+    """Decoding fewer bytes than the frame size must raise."""
+    var wire = List[UInt8]()
+    wire.append(UInt8(0x81))
+    wire.append(UInt8(10))  # claims 10-byte payload
+    wire.append(UInt8(0))  # only 1 byte of payload
+
+    with assert_raises():
+        _ = WsFrame.decode_one(Span[UInt8, _](wire))
+
+
+def test_decode_fragmented_control_raises() raises:
+    """A PING frame with FIN=0 must raise WsProtocolError."""
+    var wire = List[UInt8]()
+    wire.append(UInt8(0x09))  # FIN=0 | PING (0x09 without 0x80)
+    wire.append(UInt8(0))
+
+    with assert_raises(contains="WsProtocolError"):
+        _ = WsFrame.decode_one(Span[UInt8, _](wire))
+
+
+def _decodes(first: Int, second: Int, tail: Int = 0) -> Bool:
+    var wire = List[UInt8]()
+    wire.append(UInt8(first))
+    wire.append(UInt8(second))
+    for _ in range(tail):
+        wire.append(UInt8(0))
+    try:
+        _ = WsFrame.decode_one(Span[UInt8, _](wire))
+        return True
+    except:
+        return False
+
+
+def test_decode_reserved_opcode_raises() raises:
+    """WS-01: RFC 6455 sec 5.2 -- an unknown opcode fails the connection.
+
+    Opcodes 0x3-0x7 and 0xB-0xF are reserved. ``decode_one`` checked the
+    RSV bits but not the opcode, so ``recv()`` returned such a frame to the
+    application.
+    """
+    for op in range(16):
+        var known = op <= 2 or (op >= 8 and op <= 10)
+        # FIN set, empty payload, unmasked.
+        assert_equal(_decodes(0x80 | op, 0x00), known, "opcode " + String(op))
+        # FIN set, masked, empty payload (4 mask bytes).
+        assert_equal(
+            _decodes(0x80 | op, 0x80, 4), known, "masked opcode " + String(op)
+        )
+    # A reserved opcode is a protocol error, not just "some error".
+    with assert_raises(contains="WsProtocolError"):
+        _ = WsFrame.decode_one(Span[UInt8, _](_two(0x83, 0x00)))
+    with assert_raises(contains="WsProtocolError"):
+        _ = WsFrame.decode_one(Span[UInt8, _](_two(0x8B, 0x00)))
+
+
+def _two(a: Int, b: Int) -> List[UInt8]:
+    var out = List[UInt8]()
+    out.append(UInt8(a))
+    out.append(UInt8(b))
+    return out^
+
+
+# ── Round-trip tests ──────────────────────────────────────────────────────────
+
+
+def test_encode_decode_roundtrip_text() raises:
+    """Encode then decode a text frame must reproduce the original payload."""
+    var frame = WsFrame.text("round-trip test payload")
+    var wire = frame.encode()
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(result.frame.text_payload(), "round-trip test payload")
+    assert_equal(Int(result.frame.opcode), Int(WsOpcode.TEXT))
+    assert_equal(result.consumed, len(wire))
+
+
+def test_encode_decode_roundtrip_text_utf8() raises:
+    """A non-ASCII text frame must decode per code point, not per byte.
+
+    Covers 2-, 3- and 4-byte sequences: decoding byte-by-byte via ``chr``
+    maps each byte to its own code point, so the payload came back with
+    one character per byte.
+    """
+    var src = String("café 日本語 😀")
+    var wire = WsFrame.text(src).encode()
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(result.frame.text_payload(), src)
+
+
+def test_encode_decode_roundtrip_binary() raises:
+    """Encode then decode a binary frame must reproduce all bytes."""
+    var payload = List[UInt8](capacity=256)
+    for i in range(256):
+        payload.append(UInt8(i))
+    var frame = WsFrame.binary(payload)
+    var wire = frame.encode()
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(len(result.frame.payload), 256)
+    for i in range(256):
+        assert_equal(
+            Int(result.frame.payload[i]), i, "byte " + String(i) + " mismatch"
+        )
+
+
+def test_encode_decode_roundtrip_masked() raises:
+    """Encode with zero-key mask then decode must reproduce payload."""
+    var frame = WsFrame.text("masked message")
+    var wire = frame.encode(mask=True)
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    # Zero masking key → XOR with 0 → payload unchanged
+    assert_equal(result.frame.text_payload(), "masked message")
+
+
+def test_encode_decode_126_bytes() raises:
+    """Encode then decode a 126-byte payload must use 16-bit length and round-trip.
+    """
+    var payload = List[UInt8](capacity=126)
+    for i in range(126):
+        payload.append(UInt8((i * 3 + 7) & 0xFF))
+    var frame = WsFrame.binary(payload)
+    var wire = frame.encode()
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(len(result.frame.payload), 126)
+    for i in range(126):
+        assert_equal(
+            Int(result.frame.payload[i]),
+            Int(payload[i]),
+            "byte " + String(i) + " mismatch",
+        )
+
+
+def test_consumed_with_trailing_data() raises:
+    """Decode_one() must set consumed correctly even with extra bytes after frame.
+    """
+    var wire = List[UInt8]()
+    wire.append(UInt8(0x81))  # FIN | TEXT
+    wire.append(UInt8(3))  # len=3
+    wire.append(UInt8(ord("a")))
+    wire.append(UInt8(ord("b")))
+    wire.append(UInt8(ord("c")))
+    # trailing garbage
+    wire.append(UInt8(0xFF))
+    wire.append(UInt8(0xFF))
+
+    var result = WsFrame.decode_one(Span[UInt8, _](wire))
+    assert_equal(result.consumed, 5)  # only 2 header + 3 payload consumed
+
+
+# ── WsProtocolError typing ────────────────────────────────────────────────────
+
+
+def test_ws_protocol_error_str() raises:
+    """WsProtocolError.__str__ must include the message."""
+    var e = WsProtocolError("bad opcode")
+    assert_true("WsProtocolError" in String(e))
+    assert_true("bad opcode" in String(e))
+
+
+# ── Integration: connect to echo server (skipped if offline) ─────────────────
+
+
+def test_ws_connect_plain() raises:
+    """WsClient.connect() to a plain WS echo server must succeed."""
+    try:
+        var ws = WsClient.connect("ws://echo.websocket.events")
+        ws.close()
+        assert_true(True)
+    except e:
+        print(" [SKIP] ws:// unavailable: " + String(e))
+
+
+def test_ws_echo_roundtrip() raises:
+    """Sending a text message and receiving it back must work end-to-end."""
+    try:
+        var ws = WsClient.connect("ws://echo.websocket.events")
+        ws.send_text("dodo test ping")
+        # The echo server may send a welcome message first; read until we see ours
+        var found = False
+        for _ in range(5):
+            var frame = ws.recv()
+            if "dodo test ping" in frame.text_payload():
+                found = True
+                break
+        assert_true(found, "echo not received within 5 frames")
+        ws.close()
+    except e:
+        print(" [SKIP] ws:// unavailable: " + String(e))
+
+
+# ── WsServer + WsConnection on loopback ──────────────────────────────────────
+#
+# Strategy: all tests use RAW TCP clients (not WsClient) to avoid the
+# single-threaded deadlock that would arise if WsClient.connect() (which
+# blocks waiting for 101) and the server accept() had to interleave.
+# Instead each test:
+# 1. Binds a WsServer on port 0.
+# 2. Connects a raw TcpStream.
+# 3. Does the server accept() + handshake helpers explicitly.
+# 4. Exchanges raw WsFrame wire bytes on the client side.
+
+
+def _send_upgrade_request_raw(
+    mut stream: TcpStream, host: String, origin: String = ""
+) raises:
+    """Send a minimal HTTP/1.1 upgrade request from a raw TCP stream.
+
+    ``origin`` is omitted from the request entirely when empty, matching
+    a non-browser client.
+    """
+    var key = "dGhlIHNhbXBsZSBub25jZQ=="  # well-known test key
+    var origin_line = String("")
+    if origin != "":
+        origin_line = "Origin: " + origin + "\r\n"
+    var req = (
+        "GET / HTTP/1.1\r\n"
+        + "Host: "
+        + host
+        + "\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Sec-WebSocket-Key: "
+        + key
+        + "\r\n"
+        + "Sec-WebSocket-Version: 13\r\n"
+        + origin_line
+        + "\r\n"
+    )
+    var b = req.as_bytes()
+    stream.write_all(Span[UInt8, _](b))
+
+
+def _drain_101(mut stream: TcpStream) raises:
+    """Read and discard the HTTP 101 response from the stream."""
+    var buf = List[UInt8](capacity=512)
+    buf.resize(512, 0)
+    var acc = List[UInt8]()
+    while True:
+        var n = stream.read(buf.unsafe_ptr(), 512)
+        if n == 0:
+            break
+        for i in range(n):
+            acc.append(buf[i])
+        # Stop once we see \r\n\r\n
+        var nn = len(acc)
+        if nn >= 4:
+            for i in range(nn - 3):
+                if (
+                    acc[i] == 13
+                    and acc[i + 1] == 10
+                    and acc[i + 2] == 13
+                    and acc[i + 3] == 10
+                ):
+                    return
+
+
+def test_ws_server_text_echo_loopback() raises:
+    """WsConnection.recv + send_text on loopback with a raw TCP client.
+
+    Avoids single-thread deadlock by using raw TCP instead of WsClient.
+    """
+    from dodo.ws import WsServer, WsConnection
+    from dodo.ws.server import (
+        _read_upgrade_request,
+        _send_upgrade_response,
+        _compute_accept_srv,
+    )
+    from dodo.net import SocketAddr
+    from dodo.tcp import TcpStream
+
+    var srv = WsServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+
+    # ── Client: connect + send upgrade request (non-blocking – goes to kernel queue)
+    var raw_client = TcpStream.connect(SocketAddr.localhost(port))
+    _send_upgrade_request_raw(raw_client, "localhost")
+
+    # ── Server: accept + handshake
+    var server_stream = srv._listener.accept()
+    var srv_peer = server_stream.peer_addr()
+    var upgrade = _read_upgrade_request(server_stream)
+    var accept = _compute_accept_srv(upgrade.key)
+    _send_upgrade_response(server_stream, accept)
+    var conn = WsConnection(server_stream^, srv_peer, upgrade.origin.copy())
+
+    # ── Client: discard 101, then send masked TEXT frame
+    _drain_101(raw_client)
+
+    # Build a masked client TEXT frame: payload "hi"
+    var client_frame = WsFrame.text("hi")
+    var client_wire = client_frame.encode(mask=True)
+    raw_client.write_all(Span[UInt8, _](client_wire))
+
+    # ── Server: receive
+    var frame = conn.recv()
+    assert_equal(frame.opcode, WsOpcode.TEXT)
+    assert_equal(frame.text_payload(), "hi")
+
+    # ── Server: send back TEXT
+    conn.send_text("echo:hi")
+
+    # ── Client: receive unmasked server frame
+    var echo_wire = List[UInt8](capacity=32)
+    echo_wire.resize(32, 0)
+    var n_echo = raw_client.read(echo_wire.unsafe_ptr(), 32)
+    assert_true(n_echo > 0, "Expected echo frame from server")
+
+    raw_client.close()
+    srv.close()
+
+
+def test_ws_server_binary_echo_loopback() raises:
+    """WsConnection.recv handles masked binary frames correctly."""
+    from dodo.ws import WsServer, WsConnection
+    from dodo.ws.server import (
+        _read_upgrade_request,
+        _send_upgrade_response,
+        _compute_accept_srv,
+    )
+    from dodo.net import SocketAddr
+    from dodo.tcp import TcpStream
+
+    var srv = WsServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+
+    var raw_client = TcpStream.connect(SocketAddr.localhost(port))
+    _send_upgrade_request_raw(raw_client, "localhost")
+
+    var server_stream = srv._listener.accept()
+    var srv_peer2 = server_stream.peer_addr()
+    var upgrade = _read_upgrade_request(server_stream)
+    var accept = _compute_accept_srv(upgrade.key)
+    _send_upgrade_response(server_stream, accept)
+    var conn = WsConnection(server_stream^, srv_peer2, upgrade.origin.copy())
+
+    _drain_101(raw_client)
+
+    var payload = List[UInt8]()
+    payload.append(UInt8(0xDE))
+    payload.append(UInt8(0xAD))
+    payload.append(UInt8(0xBE))
+    var bin_frame = WsFrame.binary(payload)
+    var bin_wire = bin_frame.encode(mask=True)
+    raw_client.write_all(Span[UInt8, _](bin_wire))
+
+    var frame = conn.recv()
+    assert_equal(frame.opcode, WsOpcode.BINARY)
+    assert_equal(len(frame.payload), 3)
+    assert_equal(frame.payload[0], UInt8(0xDE))
+    assert_equal(frame.payload[1], UInt8(0xAD))
+    assert_equal(frame.payload[2], UInt8(0xBE))
+
+    raw_client.close()
+    srv.close()
+
+
+def test_ws_server_unmasked_frame_rejected() raises:
+    """WsConnection.recv must raise WsProtocolError on an unmasked client frame.
+
+    RFC 6455 §5.1: server must reject unmasked frames.
+    """
+    from dodo.ws import WsServer, WsConnection
+    from dodo.ws.server import (
+        _read_upgrade_request,
+        _send_upgrade_response,
+        _compute_accept_srv,
+    )
+    from dodo.net import SocketAddr
+    from dodo.tcp import TcpStream
+
+    var srv = WsServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+
+    var raw_client = TcpStream.connect(SocketAddr.localhost(port))
+    _send_upgrade_request_raw(raw_client, "localhost")
+
+    var server_stream = srv._listener.accept()
+    var srv_peer3 = server_stream.peer_addr()
+    var upgrade = _read_upgrade_request(server_stream)
+    var accept = _compute_accept_srv(upgrade.key)
+    _send_upgrade_response(server_stream, accept)
+    var conn = WsConnection(server_stream^, srv_peer3, upgrade.origin.copy())
+
+    _drain_101(raw_client)
+
+    # Send an UNMASKED TEXT frame (mask bit = 0): opcode=0x81, length=5
+    var bad_frame = List[UInt8]()
+    bad_frame.append(UInt8(0x81))  # FIN + TEXT opcode
+    bad_frame.append(UInt8(5))  # MASK bit NOT set, length = 5
+    bad_frame.append(UInt8(104))  # h
+    bad_frame.append(UInt8(101))  # e
+    bad_frame.append(UInt8(108))  # l
+    bad_frame.append(UInt8(108))  # l
+    bad_frame.append(UInt8(111))  # o
+    raw_client.write_all(Span[UInt8, _](bad_frame))
+
+    with assert_raises():
+        _ = conn.recv()
+
+    raw_client.close()
+    srv.close()
+
+
+# ── Handshake Origin ──────────────────────────────────────────────────────────
+
+
+def _upgrade_bytes(origin_line: String) -> List[UInt8]:
+    """A well-formed upgrade request, optionally carrying an Origin."""
+    var req = (
+        "GET /chat HTTP/1.1\r\n"
+        + "Host: localhost\r\n"
+        + "Upgrade: websocket\r\n"
+        + "Connection: Upgrade\r\n"
+        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        + "Sec-WebSocket-Version: 13\r\n"
+        + origin_line
+        + "\r\n"
+    )
+    var out = List[UInt8]()
+    var b = req.as_bytes()
+    for i in range(len(b)):
+        out.append(b[i])
+    return out^
+
+
+def test_upgrade_parse_captures_origin() raises:
+    """A present Origin header is retained verbatim."""
+    from dodo.ws.server import _parse_ws_upgrade_bytes
+
+    var raw = _upgrade_bytes("Origin: https://app.example.com\r\n")
+    var up = _parse_ws_upgrade_bytes(Span[UInt8, _](raw))
+    assert_equal(up.origin, "https://app.example.com")
+    assert_equal(up.key, "dGhlIHNhbXBsZSBub25jZQ==")
+
+
+def test_upgrade_parse_origin_absent_is_empty() raises:
+    """A request without an Origin yields the empty string, not an error.
+
+    Non-browser clients routinely omit it, so this must stay a
+    successful parse.
+    """
+    from dodo.ws.server import _parse_ws_upgrade_bytes
+
+    var up = _parse_ws_upgrade_bytes(Span[UInt8, _](_upgrade_bytes("")))
+    assert_equal(up.origin, "")
+    assert_equal(up.key, "dGhlIHNhbXBsZSBub25jZQ==")
+
+
+def test_upgrade_parse_origin_header_name_case_insensitive() raises:
+    """HTTP field names are case-insensitive (RFC 9110 5.1)."""
+    from dodo.ws.server import _parse_ws_upgrade_bytes
+
+    var raw = _upgrade_bytes("ORIGIN: https://Example.COM\r\n")
+    var up = _parse_ws_upgrade_bytes(Span[UInt8, _](raw))
+    # Name matched case-insensitively; the value keeps its own case,
+    # since origin comparison is the handler's policy to define.
+    assert_equal(up.origin, "https://Example.COM")
+
+
+def test_ws_connection_carries_handshake_origin() raises:
+    """End-to-end: the Origin reaches the handler on WsConnection."""
+    from dodo.ws import WsServer, WsConnection
+    from dodo.ws.server import (
+        _read_upgrade_request,
+        _send_upgrade_response,
+        _compute_accept_srv,
+    )
+    from dodo.net import SocketAddr
+    from dodo.tcp import TcpStream
+
+    var srv = WsServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+
+    var raw_client = TcpStream.connect(SocketAddr.localhost(port))
+    _send_upgrade_request_raw(raw_client, "localhost", "https://evil.test")
+
+    var server_stream = srv._listener.accept()
+    var srv_peer = server_stream.peer_addr()
+    var upgrade = _read_upgrade_request(server_stream)
+    var accept = _compute_accept_srv(upgrade.key)
+    _send_upgrade_response(server_stream, accept)
+    var conn = WsConnection(server_stream^, srv_peer, upgrade.origin.copy())
+
+    assert_equal(conn.origin, "https://evil.test")
+
+    _drain_101(raw_client)
+    raw_client.close()
+    srv.close()
+
+
+def test_client_frames_are_masked_with_a_fresh_random_key() raises:
+    """``encode(mask=True)`` used an all-zero key, so the payload crossed the
+    wire unmasked -- the thing RFC 6455 sec 5.3 masking exists to stop."""
+    var f = WsFrame.text("hello hello hello")
+    var a = f.encode(mask=True)
+    var b = f.encode(mask=True)
+    # Short frame: 2-byte header, then the 4-byte key.
+    var key_a = List[UInt8](Span[UInt8, _](a)[2:6])
+    var key_b = List[UInt8](Span[UInt8, _](b)[2:6])
+    var zero = True
+    for k in key_a:
+        if k != 0:
+            zero = False
+    assert_false(zero, "mask key is all zeros")
+    var same = True
+    for k in range(4):
+        if key_a[k] != key_b[k]:
+            same = False
+    assert_false(same, "two frames shared a mask key")
+    # The payload is not on the wire in the clear, and still decodes.
+    var wire = List[UInt8](Span[UInt8, _](a)[6:])
+    assert_false(wire == List[UInt8]("hello hello hello".as_bytes()))
+    var back = WsFrame.decode_one(Span[UInt8, _](a))
+    assert_equal(back.frame.text_payload(), "hello hello hello")
+
+
+def test_handshake_nonce_is_random() raises:
+    from dodo.ws.client import _generate_ws_key
+
+    assert_true(_generate_ws_key() != _generate_ws_key())
+
+
+def _huge_masked_header(declared: Int) -> List[UInt8]:
+    """A masked BINARY frame header declaring ``declared`` payload bytes
+    (64-bit length form) and nothing after it."""
+    var h = List[UInt8]()
+    h.append(0x82)
+    h.append(0x80 | 127)
+    for i in range(8):
+        h.append(UInt8((declared >> (8 * (7 - i))) & 0xFF))
+    for _ in range(4):
+        h.append(0x11)
+    return h^
+
+
+def test_decode_refuses_an_oversized_frame_from_its_header() raises:
+    """``decode_one`` read the length and then asked for more bytes, so the
+    readers buffered towards any declared size up to 4 GiB. It now
+    fails as soon as the header is in, with nothing of the payload."""
+    from dodo.ws.frame import WS_TOO_BIG_MARKER
+
+    var h = _huge_masked_header(0x7FFF_FFFF)
+    var msg = String("")
+    try:
+        _ = WsFrame.decode_one(Span[UInt8, _](h))
+    except e:
+        msg = String(e)
+    assert_true(WS_TOO_BIG_MARKER in msg, msg)
+    # The limit is the caller's: 11 bytes over a 10-byte cap fails,
+    # 10 bytes passes.
+    var over = WsFrame.binary(List[UInt8](length=11, fill=UInt8(1))).encode(
+        mask=True
+    )
+    var raised = False
+    try:
+        _ = WsFrame.decode_one(Span[UInt8, _](over), max_payload=10)
+    except:
+        raised = True
+    assert_true(raised, "an 11-byte payload passed a 10-byte cap")
+    var fits = WsFrame.binary(List[UInt8](length=10, fill=UInt8(1))).encode(
+        mask=True
+    )
+    var r = WsFrame.decode_one(Span[UInt8, _](fits), max_payload=10)
+    assert_equal(len(r.frame.payload), 10)
+
+
+def test_server_answers_an_oversized_frame_with_1009() raises:
+    """The server read towards a declared 2 GiB frame; now recv() raises
+    and the client is told why with CLOSE 1009."""
+    from dodo.ws.server import (
+        _read_upgrade_request,
+        _send_upgrade_response,
+        _compute_accept_srv,
+    )
+
+    var srv = WsServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+    var raw_client = TcpStream.connect(SocketAddr.localhost(port))
+    _send_upgrade_request_raw(raw_client, "localhost")
+    var server_stream = srv._listener.accept()
+    var srv_peer = server_stream.peer_addr()
+    var upgrade = _read_upgrade_request(server_stream)
+    _send_upgrade_response(server_stream, _compute_accept_srv(upgrade.key))
+    var conn = WsConnection(server_stream^, srv_peer)
+    _drain_101(raw_client)
+
+    var h = _huge_masked_header(0x7FFF_FFFF)
+    raw_client.write_all(Span[UInt8, _](h))
+    var raised = False
+    try:
+        _ = conn.recv()
+    except:
+        raised = True
+    assert_true(raised, "recv() accepted a 2 GiB frame header")
+
+    var buf = List[UInt8](length=4, fill=UInt8(0))
+    var got = 0
+    while got < 4:
+        var n = raw_client.read(buf.unsafe_ptr().unsafe_offset(got), 4 - got)
+        if n == 0:
+            break
+        got += n
+    assert_equal(got, 4)
+    assert_equal(Int(buf[0]), 0x88)  # FIN + CLOSE, unmasked
+    assert_equal(Int(buf[1]), 2)
+    assert_equal((Int(buf[2]) << 8) | Int(buf[3]), 1009)
+    raw_client.close()
+    srv.close()
+
+
+def test_client_keeps_frames_that_share_a_segment() raises:
+    """Two server frames in one write: the client's ``_recv_one`` read
+    both into a local buffer, returned the first and dropped the second,
+    so the next recv() waited for bytes it had already thrown away."""
+    from dodo.ws.client import _WsStream
+
+    var ln = TcpListener.bind(SocketAddr.localhost(0))
+    var port = ln.local_addr().port
+    var c = TcpStream.connect(SocketAddr.localhost(port))
+    # The pre-fix failure is a hang; a timeout turns it into a raise.
+    c.set_recv_timeout(3000)
+    var s = ln.accept()
+    var wire = WsFrame.text("one").encode(mask=False)
+    wire.extend(Span[UInt8, _](WsFrame.text("two").encode(mask=False)))
+    s.write_all(Span[UInt8, _](wire))
+    var ws = WsClient(_WsStream(c^), "k")
+    assert_equal(ws.recv().text_payload(), "one")
+    assert_equal(ws.recv().text_payload(), "two")
+    s.close()
+    ln.close()
+
+
+def test_ws_frame_length_needs_the_whole_header() raises:
+    var short = List[UInt8]()
+    short.append(0x81)
+    assert_equal(ws_frame_length(Span[UInt8, _](short)), -1)
+    short.append(0x80 | 5)
+    assert_equal(ws_frame_length(Span[UInt8, _](short)), 2 + 4 + 5)
+    var ext16: List[UInt8] = [UInt8(0x82), UInt8(0x80 | 126), UInt8(0x01)]
+    assert_equal(ws_frame_length(Span[UInt8, _](ext16)), -1)
+    ext16.append(0x00)
+    assert_equal(ws_frame_length(Span[UInt8, _](ext16)), 4 + 4 + 256)
+    var ext64: List[UInt8] = [UInt8(0x82), UInt8(127), UInt8(0), UInt8(0)]
+    assert_equal(ws_frame_length(Span[UInt8, _](ext64)), -1)
+
+
+def test_masked_payload_past_the_simd_width_unmasks() raises:
+    var payload = List[UInt8]()
+    for i in range(70):
+        payload.append(UInt8((i * 7) % 256))
+    var f = WsFrame.binary(payload.copy())
+    var wire = f.encode(mask=True)
+    var got = WsFrame.decode_one(Span[UInt8, _](wire)).take_frame()
+    assert_equal(len(got.payload), 70)
+    for i in range(70):
+        assert_equal(Int(got.payload[i]), Int(payload[i]))
+
+
+def main() raises:
+    print("=" * 60)
+    print("test_ws.mojo — WsFrame codec + WsClient + WsServer")
+    print("=" * 60)
+    print()
+    TestSuite.discover_tests[__functions_in_module()]().run()

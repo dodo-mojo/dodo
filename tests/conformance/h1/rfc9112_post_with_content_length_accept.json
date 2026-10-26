@@ -1,0 +1,11 @@
+{
+  "name": "post_with_content_length",
+  "spec": "RFC 9112 §6.2 (Content-Length-framed body)",
+  "input_hex": "50 4f 53 54 20 2f 73 75 62 6d 69 74 20 48 54 54 50 2f 31 2e 31 0d 0a 48 6f 73 74 3a 20 65 78 61 6d 70 6c 65 2e 63 6f 6d 0d 0a 43 6f 6e 74 65 6e 74 2d 4c 65 6e 67 74 68 3a 20 35 0d 0a 0d 0a 68 65 6c 6c 6f",
+  "expect": "accept",
+  "expect_reason": "POST /submit with Content-Length: 5 and 5-byte body",
+  "leniency": {},
+  "expected_method": "POST",
+  "expected_uri": "/submit",
+  "expected_version": "HTTP/1.1"
+}

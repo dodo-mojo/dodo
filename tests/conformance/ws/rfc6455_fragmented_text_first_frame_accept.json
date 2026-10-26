@@ -1,0 +1,10 @@
+{
+  "name": "5.1.1_fragmented_text_first_frame",
+  "spec": "RFC 6455 §5.4 (Fragmentation; FIN=0 first frame of message)",
+  "input_hex": "01 03 66 72 61",
+  "expect": "accept",
+  "expect_reason": "FIN=0 OP=TEXT len=3 payload='fra' -- first frame of a fragmented text message; reassembly is the recv-message layer's job",
+  "expected_opcode": 1,
+  "expected_fin": false,
+  "expected_payload_hex": "66 72 61"
+}

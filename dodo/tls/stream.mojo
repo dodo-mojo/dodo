@@ -1,0 +1,1206 @@
+"""TLS stream: encrypts a TcpStream via OpenSSL FFI.
+
+The shared library ``libdodo_tls.so`` is built automatically on pixi
+activation via ``dodo/tls/ffi/build.sh`` and installed to
+``$CONDA_PREFIX/lib/`` when using the packaged distribution.
+
+Opaque C pointers (SSL_CTX*, SSL*) are held as ``Int`` values since Mojo
+requires all ``Pointer`` type parameters to have an explicit
+``mut`` parameter which is not inferable for ``NoneType``. Using ``Int``
+(64-bit on all supported platforms) stores pointer values safely.
+
+Security defaults enforced unconditionally:
+- TLS 1.2 minimum (TLS 1.0 / 1.1 disabled at the protocol level)
+- Forward-secret AEAD cipher suites only (ECDHE + AES-GCM / ChaCha20)
+- Certificate verification REQUIRED (opt-out via ``TlsConfig.insecure()``)
+- SNI always sent for hostname targets
+
+Example:
+    ```mojo
+    from dodo.tls import TlsStream, TlsConfig
+
+    var stream = TlsStream.connect("example.com", 443, TlsConfig())
+    stream.write_all("GET / HTTP/1.1\\r\\nHost: example.com\\r\\n\\r\\n".as_bytes())
+    var buf = List[UInt8](capacity=4096)
+    buf.resize(4096, 0)
+    var n = stream.read(buf.unsafe_ptr(), len(buf))
+    ```
+
+## OwnedDLHandle / ASAP-destruction discipline
+
+Mojo's ASAP destruction policy reclaims an ``OwnedDLHandle`` right
+after its last Mojo-visible use. In a naive ``var lib =
+OwnedDLHandle(...); var fn = lib.get_function(...); fn(...)``
+sequence the runtime considers ``lib`` dead immediately after
+``get_function`` returns and runs the destructor (``dlclose``)
+before ``fn`` is invoked, leaving the cached function pointer
+dangling into freed memory.
+
+Discipline this file follows: every FFI call goes through a
+``_do_ssl_*(imm lib: OwnedDLHandle, ...)`` borrow helper that
+does both ``get_function`` and the invocation inside the borrow.
+Public methods open ``lib`` once and pass it through to a chain
+of helpers; the borrow keeps the dylib mapped across the whole
+sequence. Same idiom as
+``dodo.http.encoding._do_compress`` /
+``dodo.http.middleware._dodo_fs_access`` /
+``dodo.tls._server_ffi._do_ssl_ctx_new_server``.
+"""
+
+from std.sys import stderr
+from std.ffi import OwnedDLHandle, c_char, c_int, CStringSpan
+from std.memory import Pointer, stack_allocation
+from ..dns import resolve
+from ..net import SocketAddr, NetworkError, _find_dodo_lib
+from ..utils.dylib import dl_sym
+from ..tcp import TcpStream
+from ..tcp.stream import _connect_with_fallback
+from ..io import Readable
+from .config import TlsConfig, TlsVerify
+from ..net.error import Timeout
+from ._server_ffi import (
+    SSL_IO_EOF_UNCLEAN,
+    SSL_IO_WANT_READ,
+    SSL_IO_WANT_WRITE,
+)
+from .error import (
+    TlsHandshakeError,
+    CertificateExpired,
+    CertificateHostnameMismatch,
+    CertificateUntrusted,
+)
+
+# Subject DN buffer size (matches X509_NAME_oneline output limit)
+comptime _CERT_SUBJ_LEN: Int = 512
+
+
+# ── Borrow helpers (one per FFI export) ──────────────────────────────────────
+
+
+def _c_err(imm lib: OwnedDLHandle) raises -> String:
+    """Return the last OpenSSL error string from ``dodo_ssl_last_error()``.
+
+    Args:
+        lib: Borrowed handle to ``libdodo_tls`` (kept mapped across
+            the call).
+
+    Returns:
+        Human-readable error string (empty if no error).
+    """
+    var fn_err = dl_sym[
+        def() thin abi("C") -> Pointer[UInt8, MutUntrackedOrigin]
+    ](lib, "dodo_ssl_last_error")
+    var p = fn_err()
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSpan(
+                unsafe_from_ptr=p.unsafe_bitcast[c_char]()
+            )
+        )
+    )
+
+
+def _do_ssl_ctx_new(imm lib: OwnedDLHandle) raises -> Int:
+    var f = dl_sym[def() thin abi("C") -> Int](lib, "dodo_ssl_ctx_new")
+    return f()
+
+
+def _do_ssl_ctx_free(imm lib: OwnedDLHandle, ctx: Int) raises:
+    if ctx == 0:
+        return
+    var f = dl_sym[def(Int) thin abi("C") -> None](lib, "dodo_ssl_ctx_free")
+    f(ctx)
+
+
+def _do_ssl_ctx_set_security_policy(
+    imm lib: OwnedDLHandle, ctx: Int
+) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_set_security_policy"
+    )
+    return Int(f(ctx))
+
+
+def _do_ssl_ctx_set_verify_peer(
+    imm lib: OwnedDLHandle, ctx: Int, verify: c_int
+) raises -> Int:
+    var f = dl_sym[def(Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_set_verify_peer"
+    )
+    return Int(f(ctx, verify))
+
+
+def _do_ssl_ctx_load_ca_bundle(
+    imm lib: OwnedDLHandle, ctx: Int, var ca_path: String
+) raises -> Int:
+    var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_load_ca_bundle"
+    )
+    # NUL-terminate in place before the C call. A path materialized from
+    # a StringSlice is not NUL-terminated under unsafe_ptr, so OpenSSL's
+    # file open would read past it (same defect as the SNI host fixed in
+    # _do_ssl_connect). `ca_path` is owned and outlives the call; `ca_c`
+    # views its now-terminated buffer.
+    var ca_c = ca_path.as_c_string_span()
+    var rc = Int(f(ctx, Int(ca_c.ptr())))
+    # The C-string pointer escapes as raw Int; anchor the owned buffer
+    # past the synchronous call so it is not ASAP-destroyed before
+    # OpenSSL reads the path (heap-use-after-free under asan when
+    # as_c_string_slice had to reallocate a slice-derived path).
+    _ = ca_path^
+    return rc
+
+
+def _do_ssl_ctx_load_cert_key(
+    imm lib: OwnedDLHandle,
+    ctx: Int,
+    var cert_path: String,
+    var key_path: String,
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_load_cert_key"
+    )
+    # See _do_ssl_ctx_load_ca_bundle: NUL-terminate slice-derived paths
+    # in place. Both owned args outlive the single FFI call.
+    var cert_c = cert_path.as_c_string_span()
+    var key_c = key_path.as_c_string_span()
+    var rc = Int(f(ctx, Int(cert_c.ptr()), Int(key_c.ptr())))
+    # Anchor the owned buffers past the call (see _do_ssl_ctx_load_ca_bundle).
+    _ = cert_path^
+    _ = key_path^
+    return rc
+
+
+def _do_ssl_ctx_set_alpn_protos(
+    imm lib: OwnedDLHandle, ctx: Int, blob: List[UInt8]
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_set_alpn_protos"
+    )
+    return Int(f(ctx, Int(blob.unsafe_ptr()), c_int(len(blob))))
+
+
+def _do_ssl_new(imm lib: OwnedDLHandle, ctx: Int, fd: c_int) raises -> Int:
+    var f = dl_sym[def(Int, c_int) thin abi("C") -> Int](lib, "dodo_ssl_new")
+    return f(ctx, fd)
+
+
+def _do_ssl_free(imm lib: OwnedDLHandle, ssl: Int) raises:
+    if ssl == 0:
+        return
+    var f = dl_sym[def(Int) thin abi("C") -> None](lib, "dodo_ssl_free")
+    f(ssl)
+
+
+def _do_ssl_connect(
+    imm lib: OwnedDLHandle, ssl: Int, var sni: String
+) raises -> Int:
+    var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_connect"
+    )
+    # NUL-terminate in place: a `sni` materialised from a StringSlice (the
+    # common case — `Url.parse(...).host`) is not NUL-terminated under
+    # `unsafe_ptr`, so OpenSSL's SSL_set_tlsext_host_name would read past the
+    # hostname and send a corrupted SNI (some servers reply handshake_failure).
+    # `as_c_string_slice` is mutating and `sni` is owned + lives across the call.
+    var cstr = sni.as_c_string_span()
+    var rc = Int(f(ssl, Int(cstr.ptr())))
+    # Anchor the owned SNI buffer past the call (see
+    # _do_ssl_ctx_load_ca_bundle); Url.parse(...).host is slice-derived.
+    _ = sni^
+    return rc
+
+
+def _do_ssl_connect_ex(
+    imm lib: OwnedDLHandle, ssl: Int, var sni: String
+) raises -> Int:
+    """``dodo_ssl_connect`` with the failure classified: 0 on success,
+    else an ``SSL_IO_*`` sentinel. On a blocking fd, WANT_READ /
+    WANT_WRITE mean the socket's own send/receive timeout expired
+    mid-handshake -- ``dodo_ssl_connect`` flattens that to -1 with an
+    empty error string, which is indistinguishable from a protocol
+    failure."""
+    var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_connect_ex"
+    )
+    # Same NUL-termination dance as _do_ssl_connect; see the note there.
+    var cstr = sni.as_c_string_span()
+    var rc = Int(f(ssl, Int(cstr.ptr())))
+    _ = sni^
+    return rc
+
+
+def _do_ssl_read_blocking(
+    imm lib: OwnedDLHandle,
+    ssl: Int,
+    buf: Pointer[UInt8, _],
+    size: Int,
+) raises -> Int:
+    """``SSL_read`` on a blocking fd: bytes (>0), 0 at end of stream, or
+    an ``SSL_IO_*`` sentinel. Only WANT_READ / WANT_WRITE and FATAL are
+    reachable -- a socket timeout and a real failure respectively. Not
+    ``dodo_ssl_read_ex``, which is the reactor's non-blocking variant
+    and calls an unclean EOF fatal rather than end of stream."""
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_read_blocking"
+    )
+    return Int(f(ssl, Int(buf), c_int(size)))
+
+
+def _do_ssl_write(
+    imm lib: OwnedDLHandle, ssl: Int, data: Span[UInt8, _]
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_write"
+    )
+    return Int(f(ssl, Int(data.unsafe_ptr()), c_int(len(data))))
+
+
+def _do_ssl_shutdown(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](lib, "dodo_ssl_shutdown")
+    return Int(f(ssl))
+
+
+def _do_ssl_get_version(imm lib: OwnedDLHandle, ssl: Int) raises -> String:
+    var f = dl_sym[
+        def(Int) thin abi("C") -> Pointer[UInt8, MutUntrackedOrigin]
+    ](lib, "dodo_ssl_get_version")
+    var p = f(ssl)
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSpan(
+                unsafe_from_ptr=p.unsafe_bitcast[c_char]()
+            )
+        )
+    )
+
+
+def _do_ssl_get_cipher(imm lib: OwnedDLHandle, ssl: Int) raises -> String:
+    var f = dl_sym[
+        def(Int) thin abi("C") -> Pointer[UInt8, MutUntrackedOrigin]
+    ](lib, "dodo_ssl_get_cipher")
+    var p = f(ssl)
+    return String(
+        StringSlice(
+            unsafe_from_utf8=CStringSpan(
+                unsafe_from_ptr=p.unsafe_bitcast[c_char]()
+            )
+        )
+    )
+
+
+def _do_ssl_get_peer_cert_subject(
+    imm lib: OwnedDLHandle, ssl: Int, buf: Pointer[UInt8, _], size: Int
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_get_peer_cert_subject"
+    )
+    return Int(f(ssl, Int(buf), c_int(size)))
+
+
+def _do_ssl_get_alpn_selected(
+    imm lib: OwnedDLHandle, ssl: Int, buf: Pointer[UInt8, _], size: Int
+) raises -> Int:
+    var f = dl_sym[def(Int, Int, c_int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_get_alpn_selected"
+    )
+    return Int(f(ssl, Int(buf), c_int(size)))
+
+
+# ── Session resumption FFI helpers (RFC 5077 / RFC 8446 §4.6.1) ──────────
+
+
+def _do_ssl_ctx_enable_client_session_cache(
+    imm lib: OwnedDLHandle, ctx: Int
+) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_ctx_enable_client_session_cache"
+    )
+    return Int(f(ctx))
+
+
+def _do_ssl_ctx_take_session(imm lib: OwnedDLHandle, ctx: Int) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> Int](
+        lib, "dodo_ssl_ctx_take_session"
+    )
+    return f(ctx)
+
+
+def _do_ssl_session_free(imm lib: OwnedDLHandle, sess: Int) raises:
+    if sess == 0:
+        return
+    var f = dl_sym[def(Int) thin abi("C") -> None](lib, "dodo_ssl_session_free")
+    f(sess)
+
+
+def _do_ssl_set_session(
+    imm lib: OwnedDLHandle, ssl: Int, sess: Int
+) raises -> Int:
+    var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_set_session"
+    )
+    return Int(f(ssl, sess))
+
+
+def _do_ssl_session_reused(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](
+        lib, "dodo_ssl_session_reused"
+    )
+    return Int(f(ssl))
+
+
+# ── Error classification ──────────────────────────────────────────────────
+
+
+def _classify_tls_error(err: String, host: String) raises:
+    """Map an OpenSSL error string to a typed TLS error and raise it.
+
+    The C wrapper prefixes certificate verification failures with ``"verify:"``
+    to distinguish them from generic I/O errors.
+
+    Args:
+        err: Error string from ``dodo_ssl_last_error()``.
+        host: Hostname the client tried to connect to (for context).
+
+    Raises:
+        CertificateExpired: If the cert has passed its ``notAfter``.
+        CertificateHostnameMismatch: If hostname does not match the cert.
+        CertificateUntrusted: For other certificate verification failures.
+        TlsHandshakeError: For all other handshake errors.
+    """
+    if err.startswith("verify:"):
+        var reason = String(unsafe_from_utf8=err.as_bytes()[7:])
+        if (
+            "certificate has expired" in reason
+            or "certificate is not yet valid" in reason
+        ):
+            raise CertificateExpired(reason)
+        if "hostname mismatch" in reason or "IP address mismatch" in reason:
+            raise CertificateHostnameMismatch(host, reason)
+        raise CertificateUntrusted(reason)
+    raise TlsHandshakeError(err)
+
+
+# ── Shared TLS-context setup helper ──────────────────────────────────────────
+#
+# Both ``connect`` and ``connect_timeout`` share the same SSL_CTX setup
+# sequence (new + security policy + verify mode + CA bundle). Factor it
+# into a single borrow-aware helper so the dylib stays mapped across all
+# steps. Returns the freshly-allocated ``SSL_CTX*`` (as ``Int``) and the
+# caller is responsible for freeing it via ``_do_ssl_ctx_free``.
+
+
+def _build_ssl_ctx(imm lib: OwnedDLHandle, config: TlsConfig) raises -> Int:
+    var ctx = _do_ssl_ctx_new(lib)
+    if ctx == 0:
+        raise TlsHandshakeError(_c_err(lib))
+
+    if _do_ssl_ctx_set_security_policy(lib, ctx) != 0:
+        var err = _c_err(lib)
+        _do_ssl_ctx_free(lib, ctx)
+        raise TlsHandshakeError("Security policy error: " + err)
+
+    _ = _do_ssl_ctx_set_verify_peer(lib, ctx, c_int(config.verify))
+
+    # Skip CA bundle load in insecure mode — see the matching comment in
+    # dodo/tls/config.mojo's module docstring for the String-concat
+    # aliasing quirk that motivates the gate.
+    if config.verify != TlsVerify.NONE:
+        if _do_ssl_ctx_load_ca_bundle(lib, ctx, config.ca_bundle) != 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError("CA bundle load failed: " + err)
+
+    # Opt-in client-side session cache (RFC 5077 / RFC 8446
+    # §4.6.1). The ctx-side cache + new_session_cb fire only when
+    # the peer issues a NewSessionTicket -- i.e. cheap by default
+    # and only meaningful when the user wires up
+    # ``connect_resumed``.
+    if config.enable_session_resumption:
+        if _do_ssl_ctx_enable_client_session_cache(lib, ctx) != 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError("Session cache setup failed: " + err)
+
+    # All client connection paths share identity and ALPN setup here.
+    if config.cert_file != "":
+        if (
+            _do_ssl_ctx_load_cert_key(
+                lib, ctx, config.cert_file, config.key_file
+            )
+            != 0
+        ):
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError("mTLS cert/key load failed: " + err)
+    if len(config.alpn) > 0:
+        var blob = List[UInt8]()
+        for protocol in config.alpn:
+            var n = protocol.byte_length()
+            if n == 0 or n > 255:
+                _do_ssl_ctx_free(lib, ctx)
+                raise TlsHandshakeError(
+                    "TlsConfig.alpn: each protocol id must be 1..255 bytes"
+                )
+            blob.append(UInt8(n))
+            blob.extend(List[UInt8](protocol.as_bytes()))
+        if len(blob) > 255:
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(
+                "TlsConfig.alpn: wire-format protos blob must be <= 255 bytes"
+                " total"
+            )
+        if _do_ssl_ctx_set_alpn_protos(lib, ctx, blob) != 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError("ALPN setup failed: " + err)
+
+    return ctx
+
+
+struct TlsSession(Movable):
+    """Opaque, reusable TLS session handle (RFC 5077 / RFC 8446
+    §4.6.1) captured from a completed TLS handshake.
+
+    Constructed exclusively by :meth:`TlsStream.session`, which
+    returns the most recent session OpenSSL surfaced via the
+    ``new_session_cb`` callback for the underlying ``SSL_CTX``.
+    Pass back to :meth:`TlsStream.connect_resumed` to skip the
+    expensive part of the handshake on the next connect to the
+    same origin.
+
+    This type is ``Movable`` but not ``Copyable`` — duplicating
+    an ``SSL_SESSION*`` would require an explicit
+    ``SSL_SESSION_up_ref`` / drop pair which doesn't compose with
+    Mojo's ASAP destruction. Move into the next call site;
+    re-capture per round-trip if you want to share across
+    threads.
+
+    The handle owns the underlying ``SSL_SESSION*`` via
+    ``SSL_SESSION_free`` on drop. Callers don't normally see the
+    raw addr; ``session_addr()`` is exposed for advanced FFI use.
+    """
+
+    var _addr: Int
+    var _lib: OwnedDLHandle
+    var origin: String
+    """``host:port`` of the connection the session came from, the name
+    that connection verified. :meth:`TlsStream.connect_resumed` offers
+    the session only to that same origin."""
+
+    def __init__(
+        out self, var lib: OwnedDLHandle, addr: Int, var origin: String = ""
+    ):
+        self._lib = lib^
+        self._addr = addr
+        self.origin = origin^
+
+    def __deinit__(deinit self):
+        if self._addr != 0:
+            try:
+                _do_ssl_session_free(self._lib, self._addr)
+            except:
+                pass
+
+    def session_addr(self) -> Int:
+        """Underlying ``SSL_SESSION*`` as an ``Int``. For
+        advanced FFI integration only — most callers should pass
+        the whole :class:`TlsSession` to
+        :meth:`TlsStream.connect_resumed`.
+        """
+        return self._addr
+
+
+struct TlsStream(Movable, Readable):
+    """An encrypted TCP stream using TLS (via OpenSSL FFI).
+
+    Wraps a ``TcpStream`` with OpenSSL's SSL session. The TLS handshake is
+    performed in ``connect``; all subsequent I/O is routed through OpenSSL.
+
+    Opaque C pointers (``SSL_CTX*``, ``SSL*``) are stored as ``Int`` values —
+    the canonical approach in Mojo for FFI-managed handles.
+
+    The connection is shut down with a ``close_notify`` alert when destroyed
+    or when ``close()`` is called explicitly.
+
+    This type is ``Movable`` but not ``Copyable`` — an SSL session cannot
+    be duplicated.
+
+    Security defaults:
+        - TLS 1.2 minimum (TLS 1.0 / 1.1 disabled via protocol version + options)
+        - Forward-secret AEAD ciphers only (ECDHE + AES-GCM / ChaCha20)
+        - Certificate verification on by default
+        - SNI always sent for hostname targets
+
+    Thread safety:
+        Not thread-safe.
+
+    Example:
+        ```mojo
+        var stream = TlsStream.connect("httpbin.org", 443, TlsConfig())
+        stream.write_all("GET /get HTTP/1.1\\r\\nHost: httpbin.org\\r\\n\\r\\n".as_bytes())
+        ```
+    """
+
+    # Safety: _ctx and _ssl are pointer values managed by the OpenSSL lifecycle
+    # functions in libdodo_tls.so. They are valid (non-zero) until close() is
+    # called. _tcp keeps the OS fd alive for as long as _ssl needs it.
+    # Ownership: this struct owns both _ctx and _ssl; they are freed in close().
+    var _ctx: Int  # SSL_CTX* as Int (0 = null / closed)
+    var _ssl: Int  # SSL* as Int (0 = null / closed)
+    var _tcp: TcpStream  # owns the TCP fd
+    var _origin: String
+    """``host:port`` this stream verified; see :attr:`TlsSession.origin`."""
+    var _unclean_eof: Bool
+    """Set when :meth:`read` reached end of stream without the peer's
+    close_notify; see :meth:`eof_was_unclean`."""
+    var _lib: OwnedDLHandle
+    """Cached handle to the OpenSSL FFI wrapper, opened once per
+    connection instead of per ``read`` / ``write`` (the per-write
+    dlopen the assessment flagged). Held as a field for the stream's
+    lifetime and always used via the ``read lib`` borrow helpers, the
+    same safe pattern :struct:`TlsSession` uses -- so there is no
+    dlclose-on-ASAP-destruction use-after-free (the hazard was
+    function-local handles reclaimed mid-call, not owned fields)."""
+
+    def __init__(
+        out self,
+        var tcp: TcpStream,
+        ctx: Int,
+        ssl: Int,
+        var origin: String = "",
+    ) raises:
+        """Internal constructor — use ``TlsStream.connect`` instead.
+
+        Args:
+            tcp: Connected TCP stream (fd used by ssl after handshake).
+            ctx: SSL_CTX* stored as Int.
+            ssl: SSL* stored as Int (handshake already complete).
+            origin: ``host:port`` the handshake verified, stamped on
+                the sessions :meth:`session` hands out.
+        """
+        self._tcp = tcp^
+        self._ctx = ctx
+        self._ssl = ssl
+        self._lib = OwnedDLHandle(_find_dodo_lib())
+        self._origin = origin^
+        self._unclean_eof = False
+
+    def __deinit__(deinit self):
+        """Send ``close_notify`` and free OpenSSL objects (best-effort)."""
+        if self._ssl != 0:
+            # Best-effort; the cached lib handle is valid for the
+            # stream's lifetime, so these no longer open (and cannot
+            # fail on) a per-call handle. tcp fd closed by _tcp.__deinit__.
+            try:
+                _ = _do_ssl_shutdown(self._lib, self._ssl)
+                _do_ssl_free(self._lib, self._ssl)
+                _do_ssl_ctx_free(self._lib, self._ctx)
+            except:
+                pass
+
+    # ── Context manager ───────────────────────────────────────────────────────
+
+    def __enter__(var self) -> TlsStream:
+        """Transfer ownership of ``self`` into the ``with`` block.
+
+        Returns:
+            This ``TlsStream`` (moved).
+        """
+        return self^
+
+    # ── Factory ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def connect(
+        host: String, port: UInt16, config: TlsConfig
+    ) raises -> TlsStream:
+        """Open a TLS connection to ``host:port``.
+
+        Resolves the hostname (IPv4), opens a ``TcpStream``, configures
+        OpenSSL, and performs the TLS handshake.
+
+        When ``config.verify == TlsVerify.NONE``, a security warning is
+        printed to stderr on every call (intentional).
+
+        Args:
+            host: Hostname or IP string. SNI is derived from this value.
+            port: Destination TCP port (typically 443 for HTTPS).
+            config: TLS configuration (verification mode, CA bundle, mTLS).
+
+        Returns:
+            A ``TlsStream`` with the TLS handshake complete.
+
+        Raises:
+            NetworkError: DNS resolution or TCP connect failure.
+            TlsHandshakeError: Generic TLS handshake failure.
+            CertificateExpired: Server cert has passed its notAfter.
+            CertificateHostnameMismatch: Hostname does not match the cert.
+            CertificateUntrusted: Cert not trusted by any CA in bundle.
+        """
+        if config.verify == TlsVerify.NONE:
+            print(
+                (
+                    "[dodo TLS SECURITY WARNING] Certificate verification is"
+                    " disabled. This connection is vulnerable to"
+                    " man-in-the-middle attacks. Never use TlsConfig.insecure()"
+                    " in production."
+                ),
+                file=stderr,
+            )
+
+        # ── 1. DNS resolution and TCP connect with fallback ───────────────────
+        var tcp = _connect_with_fallback(host, port, 5000)
+
+        # ── 2. Load OpenSSL wrapper library ───────────────────────────────────
+        var lib = OwnedDLHandle(_find_dodo_lib())
+
+        # ── 3. SSL_CTX + verification + CA bundle + mTLS + ALPN ──────────────
+        var ctx = _build_ssl_ctx(lib, config)
+
+        # ── 4. Create SSL session bound to the TCP fd ─────────────────────────
+        var ssl = _do_ssl_new(lib, ctx, tcp._socket.fd)
+        if ssl == 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(err)
+
+        # ── 5. TLS handshake (dodo_ssl_connect sends SNI) ────────────────────
+        var sni = config.server_name if config.server_name != "" else host
+        if _do_ssl_connect(lib, ssl, sni) != 0:
+            var err = _c_err(lib)
+            _do_ssl_free(lib, ssl)
+            _do_ssl_ctx_free(lib, ctx)
+            _classify_tls_error(err, host)
+            # _classify_tls_error always raises; unreachable:
+            raise TlsHandshakeError(err)
+
+        return TlsStream(tcp^, ctx, ssl, sni + ":" + String(port))
+
+    @staticmethod
+    def connect_timeout(
+        host: String, port: UInt16, config: TlsConfig, timeout_ms: Int
+    ) raises -> TlsStream:
+        """Connect with TLS, failing after ``timeout_ms`` milliseconds.
+
+        Uses ``TcpStream.connect_timeout`` for the TCP phase. The TLS
+        handshake is bounded separately, by arming ``SO_RCVTIMEO`` on
+        the connected socket for its duration: ``timeout_ms`` is
+        therefore a bound on each phase, not one budget shared across
+        both. Without it a peer that completes the TCP handshake and
+        then says nothing parks the caller inside ``SSL_connect``
+        forever -- which is what a bound listener that never calls
+        ``accept`` produces, since the kernel finishes the handshake
+        out of the backlog.
+
+        The option is cleared again once the handshake completes, so a
+        returned stream reads unbounded unless the caller arms its own
+        timeout via :meth:`set_recv_timeout`.
+
+        Args:
+            host: Hostname or IP string.
+            port: Destination TCP port.
+            config: TLS configuration.
+            timeout_ms: Maximum milliseconds for the TCP connect, and
+                again for the TLS handshake that follows it.
+
+        Returns:
+            A ``TlsStream`` with the handshake complete.
+
+        Raises:
+            ConnectionTimeout: If the deadline expires during TCP.
+            Timeout: If the deadline expires during the TLS handshake.
+            NetworkError: DNS resolution failure.
+            TlsHandshakeError: Generic TLS handshake failure.
+            CertificateExpired: Server cert expired.
+            CertificateHostnameMismatch: Hostname does not match the cert.
+            CertificateUntrusted: Cert not trusted by any CA.
+        """
+        if config.verify == TlsVerify.NONE:
+            print(
+                (
+                    "[dodo TLS SECURITY WARNING] Certificate verification is"
+                    " disabled. This connection is vulnerable to"
+                    " man-in-the-middle attacks. Never use TlsConfig.insecure()"
+                    " in production."
+                ),
+                file=stderr,
+            )
+
+        var tcp = _connect_with_fallback(host, port, timeout_ms)
+        var lib = OwnedDLHandle(_find_dodo_lib())
+
+        var ctx = _build_ssl_ctx(lib, config)
+
+        var ssl = _do_ssl_new(lib, ctx, tcp._socket.fd)
+        if ssl == 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(err)
+
+        # Bound the handshake itself. `_connect_with_fallback` above
+        # only bounds `connect(2)`; a peer that completes the TCP
+        # handshake and then sends nothing blocks in `SSL_connect`'s
+        # first `recv` with no deadline of its own.
+        if timeout_ms > 0:
+            tcp.set_recv_timeout(timeout_ms)
+
+        var sni = config.server_name if config.server_name != "" else host
+        var rc = _do_ssl_connect_ex(lib, ssl, sni)
+        if rc != 0:
+            var err = _c_err(lib)
+            _do_ssl_free(lib, ssl)
+            _do_ssl_ctx_free(lib, ctx)
+            if rc == SSL_IO_WANT_READ or rc == SSL_IO_WANT_WRITE:
+                raise Timeout("tls_handshake", timeout_ms)
+            _classify_tls_error(err, host)
+            raise TlsHandshakeError(err)
+
+        # Hand back a stream that reads the way it did before this
+        # bound existed; the caller arms its own read timeout if it
+        # wants one.
+        if timeout_ms > 0:
+            tcp.set_recv_timeout(0)
+
+        return TlsStream(tcp^, ctx, ssl, sni + ":" + String(port))
+
+    @staticmethod
+    def connect_over_tcp(
+        var tcp: TcpStream, host: String, config: TlsConfig
+    ) raises -> TlsStream:
+        """Run the TLS handshake over an already-connected ``tcp``.
+
+        Unlike :meth:`connect` / :meth:`connect_timeout` (which dial the
+        TCP themselves), this takes an existing stream -- e.g. a proxy
+        ``CONNECT`` tunnel -- and performs the client handshake on its
+        fd. ``host`` is used as the default SNI + cert-hostname when
+        ``config.server_name`` is empty.
+        """
+        if config.verify == TlsVerify.NONE:
+            print(
+                (
+                    "[dodo TLS SECURITY WARNING] Certificate verification is"
+                    " disabled. This connection is vulnerable to"
+                    " man-in-the-middle attacks. Never use TlsConfig.insecure()"
+                    " in production."
+                ),
+                file=stderr,
+            )
+        var lib = OwnedDLHandle(_find_dodo_lib())
+        var ctx = _build_ssl_ctx(lib, config)
+        var ssl = _do_ssl_new(lib, ctx, tcp._socket.fd)
+        if ssl == 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(err)
+        var sni = config.server_name if config.server_name != "" else host
+        if _do_ssl_connect(lib, ssl, sni) != 0:
+            var err = _c_err(lib)
+            _do_ssl_free(lib, ssl)
+            _do_ssl_ctx_free(lib, ctx)
+            _classify_tls_error(err, host)
+            raise TlsHandshakeError(err)
+        return TlsStream(tcp^, ctx, ssl)
+
+    # ── I/O ───────────────────────────────────────────────────────────────────
+
+    def read(mut self, buf: Pointer[UInt8, _], size: Int) raises -> Int:
+        """Decrypt and read up to ``size`` bytes into ``buf``.
+
+        Returns 0 on clean TLS closure (``close_notify`` received).
+
+        Reads through ``dodo_ssl_read_blocking`` so the retryable case
+        is classified rather than flattened: with ``SO_RCVTIMEO`` armed
+        (see :meth:`set_recv_timeout`) an expiry reaches OpenSSL as
+        ``recv`` returning ``EAGAIN``, which ``SSL_read`` reports as
+        ``SSL_ERROR_WANT_READ`` on an empty error queue. The plain
+        ``dodo_ssl_read`` turns that into a ``NetworkError`` whose
+        reason is the empty string; here it raises ``Timeout``, so a
+        stalled TLS read reads the same as a stalled cleartext one.
+        It is never reported as a 0-byte read, which would truncate a
+        body into a parsed response. End of stream is unchanged, an
+        unclean one included.
+
+        Args:
+            buf: Destination buffer; the caller must provide at least
+                  ``size`` bytes of valid storage.
+            size: Maximum number of bytes to read.
+
+        Returns:
+            Bytes placed in ``buf``, or 0 on clean EOF.
+
+        Raises:
+            Timeout: If a socket-level send/receive timeout expired
+                mid-record.
+            NetworkError: On I/O or decryption error.
+        """
+        if self._ssl == 0:
+            # close() freed the SSL; OpenSSL was handed NULL and crashed.
+            raise NetworkError("TLS read on a closed stream")
+        var n = _do_ssl_read_blocking(self._lib, self._ssl, buf, size)
+        if n >= 0:
+            return n
+        if n == SSL_IO_EOF_UNCLEAN:
+            self._unclean_eof = True
+            return 0
+        if n == SSL_IO_WANT_READ:
+            raise Timeout("recv")
+        if n == SSL_IO_WANT_WRITE:
+            # A record needed a write mid-read (renegotiation, key
+            # update) and SO_SNDTIMEO expired on it.
+            raise Timeout("send")
+        raise NetworkError("TLS read error: " + _c_err(self._lib))
+
+    def eof_was_unclean(self) -> Bool:
+        """Whether :meth:`read` returned end of stream without the peer's
+        close_notify.
+
+        TLS signs the end of a stream with close_notify so that an
+        attacker who can reset the TCP connection cannot cut a message
+        short and have it pass for complete. Only a caller whose framing
+        is the end of the stream needs this: a length or chunked body
+        already fails when it stops early.
+        """
+        return self._unclean_eof
+
+    def read_exact(mut self, buf: Pointer[UInt8, _], size: Int) raises:
+        """Read exactly ``size`` bytes into ``buf``.
+
+        Args:
+            buf: Destination buffer; must have at least ``size`` bytes.
+            size: Number of bytes to read.
+
+        Raises:
+            NetworkError: If EOF arrives before the buffer is full, or on error.
+        """
+        var received = 0
+        while received < size:
+            var n = self.read(buf.unsafe_offset(received), size - received)
+            if n == 0:
+                raise NetworkError("TLS EOF before buffer full")
+            received += n
+
+    def set_recv_timeout(self, ms: Int) raises:
+        """Bound blocking reads on the underlying TCP socket.
+
+        ``SO_RCVTIMEO`` applies to the socket, not to the TLS record
+        layer: OpenSSL sees the expiry as ``SSL_ERROR_WANT_READ``.
+        :meth:`read` maps that to ``Timeout``, so a stalled read raises
+        after ``ms`` milliseconds without data on the wire and reads
+        the same as a stalled cleartext read -- the case a half-open
+        connection produces when the network drops mid-response.
+
+        Args:
+            ms: Timeout in milliseconds. ``0`` disables the timeout.
+
+        Raises:
+            NetworkError: If ``setsockopt(2)`` fails.
+        """
+        self._tcp.set_recv_timeout(ms)
+
+    def write(self, data: Span[UInt8, _]) raises -> Int:
+        """Encrypt and send bytes.
+
+        Args:
+            data: Bytes to encrypt and transmit.
+
+        Returns:
+            Number of bytes written (may be less than ``len(data)``).
+
+        Raises:
+            NetworkError: On I/O or encryption error.
+        """
+        if self._ssl == 0:
+            raise NetworkError("TLS write on a closed stream")
+        if len(data) == 0:
+            return 0
+        var n = _do_ssl_write(self._lib, self._ssl, data)
+        # SSL_write reports failure as 0 as well as below it. A 0 used to
+        # come back as "wrote nothing", and write_all looped on it for
+        # ever.
+        if n <= 0:
+            raise NetworkError("TLS write error: " + _c_err(self._lib))
+        return n
+
+    def write_all(self, data: Span[UInt8, _]) raises:
+        """Encrypt and send all of ``data``.
+
+        Loops until all bytes are transmitted or an error occurs.
+
+        Args:
+            data: Bytes to transmit completely.
+
+        Raises:
+            NetworkError: On I/O or encryption error.
+        """
+        var total = len(data)
+        var sent = 0
+        var ptr = data.unsafe_ptr()
+        while sent < total:
+            var chunk = Span[UInt8, _](
+                unsafe_ptr=ptr.unsafe_offset(sent), length=total - sent
+            )
+            sent += self.write(chunk)
+
+    # ── Introspection ─────────────────────────────────────────────────────────
+
+    def tls_version(self) -> String:
+        """Return the negotiated TLS version string.
+
+        Returns:
+            E.g. ``"TLSv1.3"`` or ``"TLSv1.2"``. Returns ``"unknown"`` if
+            called before the handshake or if the library cannot be loaded.
+        """
+        if self._ssl == 0:
+            return "unknown"
+        try:
+            return _do_ssl_get_version(self._lib, self._ssl)
+        except:
+            return "unknown"
+
+    def cipher_suite(self) -> String:
+        """Return the negotiated cipher suite name.
+
+        Returns:
+            E.g. ``"TLS_AES_256_GCM_SHA384"`` or ``"unknown"``.
+        """
+        if self._ssl == 0:
+            return "unknown"
+        try:
+            return _do_ssl_get_cipher(self._lib, self._ssl)
+        except:
+            return "unknown"
+
+    def peer_cert_subject(self) raises -> String:
+        """Return the subject DN of the server's certificate.
+
+        Args are described above. Do NOT use for security decisions —
+        use ``config.verify`` for that.
+
+        Returns:
+            E.g. ``"/CN=example.com/O=Example Inc/C=US"``.
+
+        Raises:
+            NetworkError: If no peer certificate is available.
+        """
+        if self._ssl == 0:
+            raise NetworkError("peer_cert_subject: stream is closed")
+        var buf = stack_allocation[_CERT_SUBJ_LEN, UInt8]()
+        var rc = _do_ssl_get_peer_cert_subject(
+            self._lib, self._ssl, buf, _CERT_SUBJ_LEN
+        )
+        if rc != 0:
+            raise NetworkError("peer_cert_subject: " + _c_err(self._lib))
+        return String(
+            StringSlice(
+                unsafe_from_utf8=CStringSpan(
+                    unsafe_from_ptr=buf.unsafe_bitcast[c_char]()
+                )
+            )
+        )
+
+    # ── ALPN introspection ───────────────────────────────────────────────────
+
+    def alpn_selected(self) raises -> String:
+        """Return the ALPN protocol the server selected, or ``""`` if
+        ALPN was not negotiated.
+
+        Calls ``dodo_ssl_get_alpn_selected`` (RFC 7301) on the
+        live SSL session. Useful for clients that advertise
+        multiple protocols via :attr:`dodo.tls.TlsConfig.alpn`
+        (e.g. ``["h2", "http/1.1"]``) and need to know which one
+        the server picked before kicking off the higher-level
+        protocol driver.
+
+        Raises:
+            NetworkError: When the underlying call fails (almost
+                always means the SSL session is closed).
+        """
+        if self._ssl == 0:
+            return String("")
+        var buf = stack_allocation[64, UInt8]()
+        var rc = _do_ssl_get_alpn_selected(self._lib, self._ssl, buf, 64)
+        if rc < 0:
+            raise NetworkError("alpn_selected: " + _c_err(self._lib))
+        if rc == 0:
+            return String("")
+        return String(
+            StringSlice(
+                unsafe_from_utf8=CStringSpan(
+                    unsafe_from_ptr=buf.unsafe_bitcast[c_char]()
+                )
+            )
+        )
+
+    # ── Session resumption ─────────────────────────────────────────────────
+
+    def session(self) raises -> TlsSession:
+        """Return the most recent TLS session OpenSSL surfaced
+        for this connection's ``SSL_CTX``.
+
+        Useful sequence:
+
+        1. ``var s = TlsStream.connect(host, port, cfg)``
+        2. write a request, read the response (so the peer's
+           NewSessionTicket arrives and the C-side
+           ``new_session_cb`` fires).
+        3. ``var sess = s.session()`` -- captures the cached
+           session.
+        4. Hand ``sess`` to the next connect via
+           :meth:`connect_resumed` to skip the expensive part
+           of the handshake.
+
+        The returned :class:`TlsSession` owns the underlying
+        ``SSL_SESSION*`` (drop runs ``SSL_SESSION_free``). For
+        TLS 1.3 the ticket arrives interleaved with application
+        data, so calling ``session()`` immediately after
+        :meth:`connect` returns may yield an empty handle (its
+        ``session_addr() == 0``) -- do at least one I/O round
+        trip first, or accept the empty handle and fall back to
+        a full handshake on the next connect.
+
+        Raises:
+            NetworkError: When the underlying FFI surface
+                refuses (almost always means the SSL session is
+                already closed).
+        """
+        if self._ctx == 0:
+            raise NetworkError("session: stream is closed")
+        var lib = OwnedDLHandle(_find_dodo_lib())
+        var addr = _do_ssl_ctx_take_session(lib, self._ctx)
+        return TlsSession(lib^, addr, self._origin.copy())
+
+    def was_session_reused(self) -> Bool:
+        """Return True if the most recent handshake on this
+        ``TlsStream`` resumed a prior session (peer-acked, full
+        handshake skipped). Mirrors OpenSSL's
+        ``SSL_session_reused``.
+        """
+        if self._ssl == 0:
+            return False
+        try:
+            return _do_ssl_session_reused(self._lib, self._ssl) == 1
+        except:
+            return False
+
+    @staticmethod
+    def connect_resumed(
+        host: String,
+        port: UInt16,
+        config: TlsConfig,
+        var session: TlsSession,
+    ) raises -> TlsStream:
+        """Open a TLS connection and offer ``session`` for
+        resumption. If the server accepts, the handshake skips
+        the certificate exchange and key derivation -- a 1-RTT
+        savings on TLS 1.2, even more on TLS 1.3 (resumption
+        flow uses the early-data shape).
+
+        Falls back to a full handshake silently if the server
+        refuses the session (e.g. ticket expired, key rotated).
+        Use :meth:`was_session_reused` after the call to verify
+        the resumption took.
+
+        Args:
+            host: Hostname or IP string. SNI is derived from
+                this value (or from ``config.server_name`` when
+                set).
+            port: Destination TCP port (typically 443 for HTTPS).
+            config: TLS configuration. ``enable_session_resumption``
+                must be True (the default) for the new ctx to be
+                ready to capture the next session.
+            session: Previously-captured session via
+                :meth:`session`. Ownership is consumed.
+
+        Returns:
+            A ``TlsStream`` with the TLS handshake complete.
+
+        Raises:
+            NetworkError: DNS / TCP / handshake failure.
+            TlsHandshakeError: Generic handshake failure.
+        """
+        if config.verify == TlsVerify.NONE:
+            print(
+                (
+                    "[dodo TLS SECURITY WARNING] Certificate verification is"
+                    " disabled. This connection is vulnerable to"
+                    " man-in-the-middle attacks. Never use TlsConfig.insecure()"
+                    " in production."
+                ),
+                file=stderr,
+            )
+
+        var tcp = _connect_with_fallback(host, port, 5000)
+        var lib = OwnedDLHandle(_find_dodo_lib())
+        var ctx = _build_ssl_ctx(lib, config)
+
+        # mTLS path matches connect().
+        if config.cert_file != "" and config.key_file != "":
+            if (
+                _do_ssl_ctx_load_cert_key(
+                    lib, ctx, config.cert_file, config.key_file
+                )
+                != 0
+            ):
+                var err = _c_err(lib)
+                _do_ssl_ctx_free(lib, ctx)
+                raise TlsHandshakeError("mTLS cert/key load failed: " + err)
+
+        var ssl = _do_ssl_new(lib, ctx, tcp._socket.fd)
+        if ssl == 0:
+            var err = _c_err(lib)
+            _do_ssl_ctx_free(lib, ctx)
+            raise TlsHandshakeError(err)
+
+        # Apply the saved session BEFORE dodo_ssl_connect so
+        # SSL_connect reuses it. Empty handles (addr == 0) are
+        # tolerated -- the server falls back to full handshake.
+        #
+        # Only to the origin it came from. A resumed handshake skips
+        # the certificate, so a session from host A offered to host B
+        # let B's server, if it held A's ticket key, stand in for A
+        # without ever proving it was B.
+        var sni = config.server_name if config.server_name != "" else host
+        var sess_addr = session.session_addr()
+        if session.origin != sni + ":" + String(port):
+            sess_addr = 0
+        if sess_addr != 0:
+            if _do_ssl_set_session(lib, ssl, sess_addr) != 0:
+                var err = _c_err(lib)
+                _do_ssl_free(lib, ssl)
+                _do_ssl_ctx_free(lib, ctx)
+                raise TlsHandshakeError("SSL_set_session failed: " + err)
+
+        if _do_ssl_connect(lib, ssl, sni) != 0:
+            var err = _c_err(lib)
+            _do_ssl_free(lib, ssl)
+            _do_ssl_ctx_free(lib, ctx)
+            _classify_tls_error(err, host)
+            raise TlsHandshakeError(err)
+
+        # ``session`` is consumed; the underlying session ref
+        # was up-ref'd by SSL_set_session, our destructor will
+        # release the original.
+        _ = session^
+        return TlsStream(tcp^, ctx, ssl, sni + ":" + String(port))
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def close(mut self):
+        """Send ``close_notify`` and close the underlying TCP stream.
+
+        Idempotent — safe to call multiple times. The destructor also calls
+        this, so explicit ``close()`` is not required.
+        """
+        if self._ssl != 0:
+            # Use the connection-cached handle (valid for the stream's
+            # lifetime) rather than reopening per close.
+            try:
+                _ = _do_ssl_shutdown(self._lib, self._ssl)
+                _do_ssl_free(self._lib, self._ssl)
+                _do_ssl_ctx_free(self._lib, self._ctx)
+            except:
+                pass
+            self._ssl = 0
+            self._ctx = 0
+        self._tcp.close()

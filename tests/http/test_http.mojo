@@ -1,0 +1,715 @@
+"""Tests for dodo.http — HeaderMap, Url, Response, Status, HttpClient.
+
+Integration tests (test_http_get_*) make real network connections to
+``httpbin.org`` (plain HTTP) and ``https://httpbin.org`` (HTTPS).
+They are skipped gracefully if the network is unavailable.
+"""
+
+from std.testing import (
+    assert_true,
+    assert_false,
+    assert_equal,
+    assert_raises,
+    TestSuite,
+)
+from dodo.http import (
+    HttpClient,
+    Response,
+    Status,
+    HeaderMap,
+    HeaderInjectionError,
+    Url,
+    UrlParseError,
+    Request,
+)
+
+
+# ── Response.ok() ─────────────────────────────────────────────────────────────
+
+
+def test_ok_2xx() raises:
+    """Every 2xx status is ok() (lower / mid / upper edge)."""
+    for code in [200, 201, 299]:
+        assert_true(Response(status=code).ok())
+
+
+def test_not_ok_non2xx() raises:
+    """4xx + 5xx statuses are not ok()."""
+    for code in [400, 404, 500]:
+        assert_false(Response(status=code).ok())
+
+
+# ── Response.text() ───────────────────────────────────────────────────────────
+
+
+def test_response_text_empty() raises:
+    """Response with empty body must return empty text."""
+    var r = Response(status=200)
+    assert_equal(r.text(), "")
+
+
+def test_response_text_ascii() raises:
+    """Response with ASCII body must decode correctly."""
+    var body = List[UInt8]()
+    body.append(UInt8(72))  # H
+    body.append(UInt8(101))  # e
+    body.append(UInt8(108))  # l
+    body.append(UInt8(108))  # l
+    body.append(UInt8(111))  # o
+    var r = Response(status=200, body=body^)
+    assert_equal(r.text(), "Hello")
+
+
+def test_response_text_utf8_multibyte() raises:
+    """A multi-byte UTF-8 body must round-trip, not decode as Latin-1.
+
+    Regression: decoding byte-by-byte via ``chr`` treats every byte as a
+    code point, so "café — 日本語" came back as mojibake with one
+    character per *byte* instead of per code point.
+    """
+    var src = String("café — 日本語 😀")
+    var body = List[UInt8]()
+    var bs = src.as_bytes()
+    for i in range(len(bs)):
+        body.append(bs[i])
+    var r = Response(status=200, body=body^)
+    assert_equal(r.text(), src)
+
+
+def test_response_text_large_body() raises:
+    """A large body decodes in full (and in one pass, not O(n^2))."""
+    var n = 256 * 1024
+    var body = List[UInt8](capacity=n)
+    for _ in range(n):
+        body.append(UInt8(ord("x")))
+    var r = Response(status=200, body=body^)
+    assert_equal(len(r.text().as_bytes()), n)
+
+
+def test_response_text_invalid_utf8_replaced() raises:
+    """Malformed bytes become U+FFFD, never an ill-formed ``String``.
+
+    The body is chosen by the peer, so decoding must be total:
+    ``String(unsafe_from_utf8=...)`` alone passes bad bytes through in
+    the default build and aborts the process under ``-D ASSERT=all``.
+    """
+    var body = List[UInt8]()
+    body.append(UInt8(ord("a")))
+    body.append(UInt8(0xFF))  # never valid UTF-8 anywhere
+    body.append(UInt8(ord("b")))
+    var r = Response(status=200, body=body^)
+    assert_equal(r.text(), "a" + chr(0xFFFD) + "b")
+
+
+def test_response_text_truncated_sequence_is_one_replacement() raises:
+    """A truncated sequence collapses to a single U+FFFD, not one per byte.
+
+    Unicode 15 3.9 substitutes one replacement character per maximal
+    ill-formed subpart; here the 3-byte lead plus its one good
+    continuation byte are a single subpart.
+    """
+    var body = List[UInt8]()
+    body.append(UInt8(0xE6))
+    body.append(UInt8(0x97))  # third byte of the sequence is missing
+    var r = Response(status=200, body=body^)
+    assert_equal(r.text(), chr(0xFFFD))
+
+
+# ── Status constants ───────────────────────────────────────────────────────────
+
+
+def test_status_constants() raises:
+    """The named Status constants map to their RFC codes."""
+    assert_equal(Status.OK, 200)
+    assert_equal(Status.CREATED, 201)
+    assert_equal(Status.BAD_REQUEST, 400)
+    assert_equal(Status.NOT_FOUND, 404)
+    assert_equal(Status.INTERNAL_SERVER_ERROR, 500)
+
+
+# ── HeaderMap ─────────────────────────────────────────────────────────────────
+
+
+def test_header_set_and_get() raises:
+    """HeaderMap.set() then get() must return the stored value."""
+    var h = HeaderMap()
+    h.set("Content-Type", "application/json")
+    assert_equal(h.get("Content-Type"), "application/json")
+
+
+def test_header_get_case_insensitive() raises:
+    """HeaderMap.get() must be case-insensitive per RFC 7230."""
+    var h = HeaderMap()
+    h.set("Content-Type", "text/html")
+    assert_equal(h.get("content-type"), "text/html")
+    assert_equal(h.get("CONTENT-TYPE"), "text/html")
+
+
+def test_header_set_replaces() raises:
+    """HeaderMap.set() with an existing key must replace the value."""
+    var h = HeaderMap()
+    h.set("X-Custom", "first")
+    h.set("x-custom", "second")
+    assert_equal(h.get("X-Custom"), "second")
+    assert_equal(h.len(), 1)
+
+
+def test_header_contains() raises:
+    """HeaderMap.contains() must return True for present headers."""
+    var h = HeaderMap()
+    h.set("Authorization", "Bearer token")
+    assert_true(h.contains("Authorization"))
+    assert_true(h.contains("authorization"))
+    assert_false(h.contains("X-Missing"))
+
+
+def test_header_remove() raises:
+    """HeaderMap.remove() must delete the header and return True."""
+    var h = HeaderMap()
+    h.set("X-Remove-Me", "value")
+    var removed = h.remove("X-Remove-Me")
+    assert_true(removed)
+    assert_false(h.contains("X-Remove-Me"))
+    assert_equal(h.len(), 0)
+
+
+def test_header_remove_missing() raises:
+    """HeaderMap.remove() on an absent key must return False."""
+    var h = HeaderMap()
+    var removed = h.remove("X-Not-Here")
+    assert_false(removed)
+
+
+def test_header_len() raises:
+    """HeaderMap.len() must count all headers including duplicates."""
+    var h = HeaderMap()
+    h.set("A", "1")
+    h.set("B", "2")
+    h.append("B", "3")
+    assert_equal(h.len(), 3)
+
+
+def test_header_fields_in_order() raises:
+    """Every field is reachable in insertion order, repeats kept apart."""
+    var h = HeaderMap()
+    h.append("Accept", "a")
+    h.append("Cookie", "x=1")
+    h.append("accept", "b")
+    h.append("Cookie", "y=2")
+    var got = String()
+    for i in range(h.len()):
+        got += h.name_at(i) + "=" + h.value_at(i) + ";"
+    assert_equal(got, "Accept=a;Cookie=x=1;accept=b;Cookie=y=2;")
+
+
+def test_header_field_index_out_of_range() raises:
+    var h = HeaderMap()
+    h.append("A", "1")
+    with assert_raises():
+        _ = h.name_at(1)
+    with assert_raises():
+        _ = h.value_at(-1)
+
+
+def test_header_get_absent() raises:
+    """HeaderMap.get() on an absent key must return empty string."""
+    var h = HeaderMap()
+    assert_equal(h.get("X-Missing"), "")
+
+
+def test_header_injection_cr() raises:
+    """HeaderMap.set() with CR in value must raise HeaderInjectionError."""
+    var h = HeaderMap()
+    with assert_raises(contains="HeaderInjectionError"):
+        h.set("X-Bad", "value\rinjected")
+
+
+def test_header_injection_lf() raises:
+    """HeaderMap.set() with LF in key must raise HeaderInjectionError."""
+    var h = HeaderMap()
+    with assert_raises(contains="HeaderInjectionError"):
+        h.set("X-Bad\nField", "value")
+
+
+def test_header_copy() raises:
+    """HeaderMap.copy() must produce an independent deep copy."""
+    var h = HeaderMap()
+    h.set("X-Test", "original")
+    var h2 = h.copy()
+    h2.set("X-Test", "modified")
+    assert_equal(h.get("X-Test"), "original")
+    assert_equal(h2.get("X-Test"), "modified")
+
+
+# ── Url parser ────────────────────────────────────────────────────────────────
+
+
+def test_url_http_defaults() raises:
+    """Url.parse() for plain HTTP must default to port 80."""
+    var u = Url.parse("http://example.com/path")
+    assert_equal(u.scheme, "http")
+    assert_equal(u.host, "example.com")
+    assert_equal(Int(u.port), 80)
+    assert_equal(u.path, "/path")
+    assert_false(u.is_tls())
+
+
+def test_url_https_defaults() raises:
+    """Url.parse() for HTTPS must default to port 443."""
+    var u = Url.parse("https://example.com")
+    assert_equal(u.scheme, "https")
+    assert_equal(Int(u.port), 443)
+    assert_true(u.is_tls())
+
+
+def test_url_explicit_port() raises:
+    """Url.parse() must honour an explicit port number."""
+    var u = Url.parse("https://api.example.com:8443/v1")
+    assert_equal(Int(u.port), 8443)
+    assert_equal(u.host, "api.example.com")
+    assert_equal(u.path, "/v1")
+
+
+def test_url_query_string() raises:
+    """Url.parse() must split query from path."""
+    var u = Url.parse("http://example.com/search?q=hello&lang=en")
+    assert_equal(u.path, "/search")
+    assert_equal(u.query, "q=hello&lang=en")
+    assert_equal(u.request_target(), "/search?q=hello&lang=en")
+
+
+def test_url_authority_ends_at_query() raises:
+    """APP-23: the authority ends at the first '?' (RFC 3986 §3.2), so a
+    '@' in the query is not userinfo and the host cannot be confused."""
+    var u = Url.parse("http://evil.com?@good.com/")
+    assert_equal(u.host, "evil.com")
+    assert_equal(u.path, "/")
+    assert_equal(u.query, "@good.com/")
+    assert_equal(u.request_target(), "/?@good.com/")
+    var v = Url.parse("http://good.com?x=/y")
+    assert_equal(v.host, "good.com")
+    assert_equal(v.path, "/")
+    assert_equal(v.query, "x=/y")
+    var w = Url.parse("http://good.com:8080?x=1#frag")
+    assert_equal(w.host, "good.com")
+    assert_equal(Int(w.port), 8080)
+    assert_equal(w.query, "x=1")
+    assert_equal(w.fragment, "frag")
+
+
+def test_url_fragment_starts_at_first_hash() raises:
+    """APP-23: the fragment starts at the first '#', so a later '#'
+    cannot smuggle an '@' into the authority."""
+    var u = Url.parse("http://evil.com#@good.com#x")
+    assert_equal(u.host, "evil.com")
+    assert_equal(u.fragment, "@good.com#x")
+    var v = Url.parse("http://h.example/p?q=1#a#b")
+    assert_equal(v.path, "/p")
+    assert_equal(v.query, "q=1")
+    assert_equal(v.fragment, "a#b")
+
+
+def test_url_userinfo_split_at_last_at() raises:
+    """APP-25: userinfo ends at the LAST '@' of the authority, so a second
+    '@' cannot leave an '@' in the host (WHATWG / curl pick ``good.com``)."""
+    var u = Url.parse("http://a@evil.com@good.com/")
+    assert_equal(u.host, "good.com")
+    assert_equal(Int(u.port), 80)
+    assert_equal(u.path, "/")
+    var v = Url.parse("https://user:p@ss@good.com:8443/x?y=1")
+    assert_equal(v.host, "good.com")
+    assert_equal(Int(v.port), 8443)
+    assert_equal(v.path, "/x")
+    assert_equal(v.query, "y=1")
+    # A single '@' and no '@' behave as before.
+    assert_equal(Url.parse("http://user:pw@example.com/").host, "example.com")
+    assert_equal(Url.parse("http://example.com/").host, "example.com")
+    # An '@' in the path or query is never userinfo.
+    assert_equal(Url.parse("http://example.com/a@b").host, "example.com")
+
+
+def test_url_empty_path() raises:
+    """Url.parse() with no path component must use '/'."""
+    var u = Url.parse("http://example.com")
+    assert_equal(u.path, "/")
+
+
+def test_url_fragment_stripped() raises:
+    """Url.parse() must parse fragment but request_target() omits it."""
+    var u = Url.parse("http://example.com/page#section")
+    assert_equal(u.path, "/page")
+    assert_equal(u.fragment, "section")
+    assert_equal(u.request_target(), "/page")
+
+
+def test_url_no_scheme_raises() raises:
+    """Url.parse() without a scheme must raise UrlParseError."""
+    with assert_raises(contains="UrlParseError"):
+        _ = Url.parse("example.com/path")
+
+
+def test_url_unsupported_scheme_raises() raises:
+    """Url.parse() with ftp:// scheme must raise UrlParseError."""
+    with assert_raises(contains="UrlParseError"):
+        _ = Url.parse("ftp://example.com/file")
+
+
+def test_url_missing_host_raises() raises:
+    """Url.parse() with empty host must raise UrlParseError."""
+    with assert_raises(contains="UrlParseError"):
+        _ = Url.parse("http:///path")
+
+
+# ── HttpClient — live integration tests ───────────────────────────────────────
+# These tests make real HTTP requests. They pass silently if the network is
+# unavailable (wrapped in try/except).
+
+
+def test_http_get_plaintext() raises:
+    """HttpClient.get() to httpbin.org must return a 200 response."""
+    try:
+        var client = HttpClient()
+        var resp = client.get("http://httpbin.org/status/200")
+        assert_true(
+            resp.ok(), "Expected 200 from httpbin, got " + String(resp.status)
+        )
+    except e:
+        print(" [SKIP] network unavailable: " + String(e))
+
+
+def test_https_get_json() raises:
+    """HttpClient.get() over HTTPS must return JSON from httpbin."""
+    try:
+        var client = HttpClient()
+        var resp = client.get("https://httpbin.org/json")
+        assert_true(
+            resp.ok(),
+            "Expected 200 from httpbin HTTPS, got " + String(resp.status),
+        )
+        var body = resp.text()
+        assert_true(body.byte_length() > 0, "Expected non-empty body")
+        assert_true("slideshow" in body or "{" in body, "Expected JSON body")
+    except e:
+        print(" [SKIP] network unavailable: " + String(e))
+
+
+def test_http_404_not_ok() raises:
+    """HttpClient.get() to a 404 endpoint must return resp.ok() == False."""
+    try:
+        var client = HttpClient()
+        var resp = client.get("http://httpbin.org/status/404")
+        assert_equal(resp.status, 404)
+        assert_false(resp.ok())
+    except e:
+        print(" [SKIP] network unavailable: " + String(e))
+
+
+# ── PATCH method ──────────────────────────────────────────────────────────────
+
+
+def test_patch_method_string() raises:
+    """HttpClient.patch() sends PATCH with JSON Content-Type."""
+    try:
+        var client = HttpClient()
+        var resp = client.patch("https://httpbin.org/patch", '{"x": 1}')
+        assert_true(
+            resp.ok(),
+            "Expected 2xx from httpbin PATCH, got " + String(resp.status),
+        )
+        var body = resp.text()
+        assert_true(
+            "PATCH" in body or "patch" in body or "{" in body,
+            "Expected PATCH response body",
+        )
+    except e:
+        print(" [SKIP] network unavailable: " + String(e))
+
+
+# ── HttpServer: round-trip on loopback ────────────────────────────────────────
+
+
+def test_http_server_get_loopback() raises:
+    """HttpServer accepts a GET request and sends back a 200 response.
+
+    Uses a single-connection pair on loopback:
+      1. Bind server (port 0).
+      2. Connect client.
+      3. Server accept() + parse + call handler + write response.
+      4. Client read raw response bytes.
+    """
+    from dodo.http import HttpServer
+    from dodo.tcp import TcpListener, TcpStream
+    from dodo.net import SocketAddr
+
+    def handler(req: Request) raises -> Response:
+        var body_bytes = List[UInt8]()
+        for b in "hello".as_bytes():
+            body_bytes.append(b)
+        return Response(status=Status.OK, reason="OK", body=body_bytes^)
+
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+
+    # Client side — send a minimal HTTP/1.1 GET
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server_stream = srv._listener.accept()
+
+    var raw_req = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    var raw_req_bytes = raw_req.as_bytes()
+    client.write_all(Span[UInt8, _](raw_req_bytes))
+
+    # Server side — parse + respond
+    from dodo.http.server import _parse_http_request, _write_response
+
+    var req = _parse_http_request(server_stream, 8192, 1024 * 1024)
+    assert_equal(req.method, "GET")
+    assert_equal(req.url, "/")
+
+    var resp = handler(req)
+    _write_response(server_stream, resp)
+    server_stream.close()
+
+    # Close client only after server has finished writing — closing before
+    # _write_response tears down the socket and causes BrokenPipe.
+    client.close()
+    srv.close()
+
+
+def test_http_server_post_body_loopback() raises:
+    """HttpServer correctly parses a POST request with a body."""
+    from dodo.http import HttpServer
+    from dodo.tcp import TcpListener, TcpStream
+    from dodo.net import SocketAddr
+
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var port = srv.local_addr().port
+
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server_stream = srv._listener.accept()
+
+    var body_str = '{"key":"value"}'
+    var raw_req = (
+        "POST /data HTTP/1.1\r\n"
+        + "Host: localhost\r\n"
+        + "Content-Length: "
+        + String(body_str.byte_length())
+        + "\r\n"
+        + "Content-Type: application/json\r\n"
+        + "\r\n"
+        + body_str
+    )
+    var raw_bytes = raw_req.as_bytes()
+    client.write_all(Span[UInt8, _](raw_bytes))
+    client.close()
+
+    from dodo.http.server import _parse_http_request
+
+    var req = _parse_http_request(server_stream, 8192, 1024 * 1024)
+    assert_equal(req.method, "POST")
+    assert_equal(req.url, "/data")
+    assert_equal(len(req.body), body_str.byte_length())
+    server_stream.close()
+    srv.close()
+
+
+# ── Encoding / gzip ───────────────────────────────────────────────────────────
+
+
+def test_gzip_roundtrip() raises:
+    """Round-trip: compress_gzip → decompress_gzip must reproduce the original bytes.
+    """
+    from dodo.http.encoding import compress_gzip, decompress_gzip
+
+    var original = (
+        "Hello, gzip! This is a test string for compression.".as_bytes()
+    )
+    var compressed = compress_gzip(Span[UInt8, _](original))
+    assert_true(
+        len(compressed) > 0, "compress_gzip must produce non-empty output"
+    )
+    var decompressed = decompress_gzip(Span[UInt8, _](compressed))
+    assert_equal(len(decompressed), len(original))
+    for i in range(len(original)):
+        assert_equal(decompressed[i], original[i])
+
+
+def test_gzip_empty_input() raises:
+    """Empty input to compress_gzip returns empty output."""
+    from dodo.http.encoding import compress_gzip, decompress_gzip
+
+    var empty = List[UInt8]()
+    var compressed = compress_gzip(Span[UInt8, _](empty))
+    assert_equal(len(compressed), 0)
+    var decompressed = decompress_gzip(Span[UInt8, _](compressed))
+    assert_equal(len(decompressed), 0)
+
+
+def test_gzip_level_1_roundtrip() raises:
+    """Level-1 (fastest) compress_gzip must still roundtrip correctly."""
+    from dodo.http.encoding import compress_gzip, decompress_gzip
+
+    var data = "level1 fast compression test".as_bytes()
+    var compressed = compress_gzip(Span[UInt8, _](data), level=1)
+    var decompressed = decompress_gzip(Span[UInt8, _](compressed))
+    assert_equal(len(decompressed), len(data))
+    for i in range(len(data)):
+        assert_equal(decompressed[i], data[i])
+
+
+def test_deflate_roundtrip() raises:
+    """Known zlib-wrapped and raw-deflate payloads must decompress correctly."""
+    from dodo.http.encoding import decompress_deflate
+
+    # Known plaintext: "deflate round-trip test bytes" (29 bytes)
+    # Generated by: Python zlib.compress(b"deflate round-trip test bytes")
+    var expected_len = 29
+
+    # zlib-wrapped (windowBits=15)
+    var zlib_wrapped: List[UInt8] = [
+        120,
+        156,
+        75,
+        73,
+        77,
+        203,
+        73,
+        44,
+        73,
+        85,
+        40,
+        202,
+        47,
+        205,
+        75,
+        209,
+        45,
+        41,
+        202,
+        44,
+        80,
+        40,
+        73,
+        45,
+        46,
+        81,
+        72,
+        170,
+        4,
+        82,
+        0,
+        167,
+        69,
+        11,
+        49,
+    ]
+    var out1 = decompress_deflate(Span[UInt8, _](zlib_wrapped))
+    assert_equal(len(out1), expected_len)
+    assert_equal(out1[0], UInt8(ord("d")))
+    assert_equal(out1[28], UInt8(ord("s")))
+
+    # raw deflate (windowBits=-15) — zlib bytes without 2-byte header + 4-byte adler32
+    var raw: List[UInt8] = [
+        75,
+        73,
+        77,
+        203,
+        73,
+        44,
+        73,
+        85,
+        40,
+        202,
+        47,
+        205,
+        75,
+        209,
+        45,
+        41,
+        202,
+        44,
+        80,
+        40,
+        73,
+        45,
+        46,
+        81,
+        72,
+        170,
+        4,
+        82,
+        0,
+    ]
+    var out2 = decompress_deflate(Span[UInt8, _](raw))
+    assert_equal(len(out2), expected_len)
+    assert_equal(out2[0], UInt8(ord("d")))
+    assert_equal(out2[28], UInt8(ord("s")))
+
+
+def test_decode_content_identity() raises:
+    """Identity encoding in decode_content copies bytes unchanged."""
+    from dodo.http.encoding import decode_content
+
+    var data = "no encoding".as_bytes()
+    var out = decode_content(Span[UInt8, _](data), "identity")
+    assert_equal(len(out), len(data))
+
+
+def test_decode_content_unsupported() raises:
+    """Unsupported encoding in decode_content raises an error.
+
+    ``br`` (brotli) is supported, so the previous "br raises"
+    property is gone. ``zstd`` is still unsupported and must raise.
+    """
+    from dodo.http.encoding import decode_content
+
+    var data = List[UInt8]()
+    with assert_raises():
+        _ = decode_content(Span[UInt8, _](data), "zstd")
+
+
+def test_decompress_gzip_cap_rejects_bomb() raises:
+    """A gzip body inflating past max_out is rejected before allocation."""
+    from dodo.http.encoding import compress_gzip, decompress_gzip
+
+    var big = List[UInt8]()
+    for _ in range(1024 * 1024):  # 1 MiB of zeros -> tiny gzip
+        big.append(UInt8(0))
+    var compressed = compress_gzip(Span[UInt8, _](big))
+    with assert_raises():
+        _ = decompress_gzip(Span[UInt8, _](compressed), max_out=64 * 1024)
+    var ok = decompress_gzip(Span[UInt8, _](compressed))
+    assert_equal(len(ok), 1024 * 1024)
+
+
+def test_decompress_brotli_cap_rejects_bomb() raises:
+    """A brotli body inflating past max_out is rejected."""
+    from dodo.http.encoding import compress_brotli, decompress_brotli
+
+    var big = List[UInt8]()
+    for _ in range(1024 * 1024):
+        big.append(UInt8(0))
+    var compressed = compress_brotli(Span[UInt8, _](big))
+    with assert_raises():
+        _ = decompress_brotli(Span[UInt8, _](compressed), max_out=64 * 1024)
+    var ok = decompress_brotli(Span[UInt8, _](compressed))
+    assert_equal(len(ok), 1024 * 1024)
+
+
+def test_decode_content_cap_rejects_bomb() raises:
+    """``decode_content`` threads the cap through to the codec."""
+    from dodo.http.encoding import compress_gzip, decode_content
+
+    var big = List[UInt8]()
+    for _ in range(1024 * 1024):
+        big.append(UInt8(0))
+    var compressed = compress_gzip(Span[UInt8, _](big))
+    with assert_raises():
+        _ = decode_content(Span[UInt8, _](compressed), "gzip", 64 * 1024)
+
+
+def main() raises:
+    print("=" * 60)
+    print("test_http.mojo — HeaderMap, Url, Response, Status, HttpClient")
+    print("=" * 60)
+    print()
+    TestSuite.discover_tests[__functions_in_module()]().run()

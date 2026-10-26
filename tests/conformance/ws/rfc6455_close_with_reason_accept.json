@@ -1,0 +1,11 @@
+{
+  "name": "7.7.1_close_normal_with_reason",
+  "spec": "RFC 6455 §5.5.1 (Close frame; 2-byte status + UTF-8 reason)",
+  "input_hex": "88 09 03 e8 67 6f 6f 64 62 79 65",
+  "expect": "accept",
+  "expect_reason": "FIN=1 OP=CLOSE len=9 status=1000 reason='goodbye' (UTF-8)",
+  "expected_opcode": 8,
+  "expected_fin": true,
+  "expected_close_code": 1000,
+  "expected_payload_hex": "03 e8 67 6f 6f 64 62 79 65"
+}

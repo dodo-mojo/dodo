@@ -1,0 +1,22 @@
+# pixi (pixi.lock is tracked)
+.pixi/*
+!.pixi/config.toml
+
+# Build output (FFI wrappers, test binaries, certs)
+build/
+
+# Mojo
+*.mojopkg
+.mojo_cache/
+__pycache__/
+*.pyc
+
+# Fuzzing
+.mozz_crashes/
+fuzz/corpus/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,444 @@
+"""Server-Sent Events (W3C SSE / RFC 9110 ``text/event-stream``).
+
+This module promotes the ``ChunkSource`` SSE pattern that example 24
+demonstrated to a first-class dodo primitive:
+
+- :class:`SseEvent` — a single SSE record (data + optional id +
+  optional event-type + optional retry interval).
+- :func:`format_sse_event` — serialise an event to the wire bytes
+  prescribed by `WHATWG HTML §9.2.6
+  <https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream>`__.
+- :class:`SseChannel` — a small in-memory FIFO + cancel-aware
+  ``ChunkSource`` wrapper. The handler ``push``-es events; the
+  reactor drains buffered events on each writable edge and gets an
+  empty chunk once the FIFO runs dry.
+- :func:`sse_response` — the canonical "give me a Response with
+  the right headers wired up" helper, paired with
+  :class:`SseStreamingResponse[B]` for the streaming-body variant.
+
+What this fixes vs example 24:
+
+1. The handler doesn't have to roll its own ``ChunkSource`` for
+   every endpoint — :class:`SseChannel` is the 80% case (a queue
+   that real systems push events into).
+2. Wire serialisation is centralised and spec-conformant: each
+   ``data`` field that contains ``\\n`` is split into multiple
+   ``data:`` lines per WHATWG §9.2.4; trailing ``\\n\\n`` is
+   always emitted as the event terminator; ``id:`` /
+   ``event:`` / ``retry:`` lines are emitted only when set.
+3. Response headers are spec-correct out of the box:
+   ``Content-Type: text/event-stream``, ``Cache-Control: no-cache``,
+   ``Connection: keep-alive``, ``X-Accel-Buffering: no`` (the
+   nginx-specific knob that disables proxy-side buffering, which
+   would otherwise trickle events to the client in 4 KiB lumps).
+
+Example:
+
+```mojo
+from dodo.http import (
+    SseChannel, SseEvent, SseStreamingResponse, sse_response,
+)
+
+def stream(req: Request) raises -> Response:
+    # Bounded source: emit 5 events then close.
+    var ch = SseChannel()
+    for i in range(5):
+        ch.push(SseEvent.data("tick=" + String(i)))
+    ch.close()
+    return sse_response(ch)
+```
+
+Reactor adoption: same as example 24 — wires through the existing
+``ChunkedBody[SseChannel]`` path; no new reactor surface.
+"""
+
+from std.collections import Optional
+
+from ._reactor.keepalive_scan import _monotonic_ms
+from .body import Body, ChunkSource, ChunkedBody, InlineBody
+from .cancel import Cancel
+from .response import Response, stream_response
+
+comptime SSE_HEARTBEAT_MS: Int = 15_000
+"""Minimum gap between ``: keep-alive`` comments on an idle channel."""
+
+
+# ── SseEvent ────────────────────────────────────────────────────────────────
+
+
+@fieldwise_init
+struct SseEvent(Copyable):
+    """A single Server-Sent Event.
+
+    Fields:
+        data: Event payload. May contain newlines — they're split
+            into multiple ``data:`` lines on the wire per
+            WHATWG §9.2.4.
+        event_type: Optional event-type name. Default empty (the
+            client default of ``"message"`` applies).
+        id: Optional event id (for ``Last-Event-Id`` resumption).
+            Default empty.
+        retry_ms: Optional reconnection backoff hint, in
+            milliseconds. Default ``-1`` (don't emit a ``retry:``
+            line).
+
+    Constructors:
+        - :meth:`SseEvent.data` — the 80% case (just data).
+        - :meth:`SseEvent.named` — typed event with explicit
+          event-type.
+    """
+
+    var data: String
+    var event_type: String
+    var id: String
+    var retry_ms: Int
+
+    @staticmethod
+    def message(payload: String) -> SseEvent:
+        """Construct an event with just a ``data`` payload (no
+        explicit event-type — the client default ``"message"``
+        applies)."""
+        return SseEvent(payload, String(""), String(""), -1)
+
+    @staticmethod
+    def named(event_type: String, payload: String) -> SseEvent:
+        """Construct an event with a named ``event:`` type."""
+        return SseEvent(payload, event_type, String(""), -1)
+
+
+def _single_line(s: String, drop_nul: Bool) -> String:
+    """``s`` without CR, LF (and optionally NUL). Byte-exact otherwise."""
+    var bytes = List[UInt8](capacity=s.byte_length())
+    var p = s.unsafe_ptr()
+    for i in range(s.byte_length()):
+        var c = p[unsafe_offset=i]
+        if c == 13 or c == 10 or (drop_nul and c == 0):
+            continue
+        bytes.append(c)
+    return String(unsafe_from_utf8=Span[UInt8, _](bytes))
+
+
+def format_sse_event(event: SseEvent) -> List[UInt8]:
+    """Serialise ``event`` to its on-wire byte representation.
+
+    Wire shape (terminated by ``\\n\\n``):
+
+        ``[id: <id>\\n][event: <event_type>\\n][retry: <ms>\\n]
+        data: <line0>\\n[data: <line1>\\n]...\\n``
+
+    A ``data`` field containing ``\\n`` is split into multiple
+    ``data:`` lines (the WHATWG §9.2.4 parser concatenates them
+    back with a single ``\\n`` separator on the receiving side).
+    A trailing ``\\n`` inside ``data`` produces a final empty
+    ``data:`` line — that is intentional and matches what every
+    other SSE library does (Tornado, Sanic, axum-extra).
+    """
+    var out = String(capacity_bytes=event.data.byte_length() + 64)
+
+    # ``id`` and ``event`` are single-line fields: a CR or LF in either
+    # ends the line early and starts a field of the sender's choosing,
+    # so both are dropped (and NUL from ``id``, which WHATWG ignores).
+    var id = _single_line(event.id, True)
+    if id.byte_length() > 0:
+        out += "id: "
+        out += id
+        out += "\n"
+
+    var event_type = _single_line(event.event_type, False)
+    if event_type.byte_length() > 0:
+        out += "event: "
+        out += event_type
+        out += "\n"
+
+    if event.retry_ms >= 0:
+        out += "retry: "
+        out += String(event.retry_ms)
+        out += "\n"
+
+    # Split data into lines the way the WHATWG parser does -- at CRLF,
+    # LF, *and a lone CR* -- and give each its own "data:" prefix.
+    # Splitting on LF only left a lone CR in the output, which the
+    # client treats as a line break: "hi\revent: admin" injected an
+    # event field. Lines are cut at ASCII bytes, so each slice is
+    # whole UTF-8.
+    var n = event.data.byte_length()
+    var p = event.data.unsafe_ptr()
+    var line_start = 0
+    var i = 0
+    while i <= n:
+        var c = Int(p[unsafe_offset=i]) if i < n else -1
+        if i == n or c == ord("\n") or c == ord("\r"):
+            out += "data: "
+            out += String(unsafe_from_utf8=event.data.as_bytes()[line_start:i])
+            out += "\n"
+            if (
+                c == ord("\r")
+                and i + 1 < n
+                and Int(p[unsafe_offset=i + 1]) == ord("\n")
+            ):
+                i += 1
+            line_start = i + 1
+        i += 1
+
+    out += "\n"  # event terminator
+
+    var bytes = List[UInt8](capacity=out.byte_length())
+    var op = out.unsafe_ptr()
+    for k in range(out.byte_length()):
+        bytes.append(op[unsafe_offset=k])
+    return bytes^
+
+
+# ── SseChannel ──────────────────────────────────────────────────────────────
+
+
+struct SseChannel(ChunkSource, Copyable):
+    """An in-memory FIFO of :class:`SseEvent` values + a closed flag.
+
+    Pattern:
+
+    1. Handler creates an :class:`SseChannel`.
+    2. Handler ``push``-es events (synchronously or from a
+       background pthread; the channel itself is **not**
+       thread-safe — wrap with a mutex if you cross threads).
+    3. Handler ``close``-s the channel when the stream ends.
+    4. Reactor drains buffered events via :meth:`next` on each
+       writable edge; when the buffer is empty AND the channel is
+       closed, ``next`` returns ``None`` to signal end-of-stream.
+
+    For an open-ended stream (heartbeat / metric tap / ...), don't
+    call ``close`` — the connection lives until either the client
+    disconnects (peer FIN ⇒ reactor flips ``cancel``) or the
+    request-deadline fires.
+
+    Known ceiling -- an idle open channel still wakes the reactor.
+        ``next`` no longer emits bytes on every writable edge (see the
+        ``SSE_HEARTBEAT_MS`` gate), but the connection keeps write
+        interest armed, epoll is level-triggered, and the socket stays
+        writable, so the reactor re-dispatches it and gets an empty
+        chunk back. That costs CPU on an otherwise idle stream.
+
+        Fixing it needs a way to park a live-but-idle source, which
+        dodo does not have yet, by either of two routes. (1) Teach the
+        timer wheel to wake rather than reap: today every fired timer
+        goes to ``_cleanup_conn_unified``, which closes the connection,
+        so there is no "call me back in N ms" timer to drop write
+        interest against. (2) Back the channel with an eventfd and drive
+        it through ``AsyncChunkSource`` / ``ChunkPoll.pending(fd)`` in
+        ``dodo.http.async_body``, which is built for exactly this and
+        is not yet wired into the reactor.
+
+    Thread safety:
+        Not thread-safe. Push from the reactor's pthread or
+        synchronise externally.
+    """
+
+    var _events: List[SseEvent]
+    var _next_idx: Int
+    """Index of the next event to yield. Drains in FIFO order."""
+
+    var _closed: Bool
+
+    var _last_beat_ms: Int
+    """Monotonic ms of the last heartbeat; ``-1`` before the first."""
+
+    def __init__(out self):
+        self._events = List[SseEvent]()
+        self._next_idx = 0
+        self._closed = False
+        self._last_beat_ms = -1
+
+    def push(mut self, var event: SseEvent):
+        """Append an event to the FIFO."""
+        self._events.append(event^)
+
+    def close(mut self):
+        """Mark the channel closed. The reactor's :meth:`next`
+        call will return ``None`` once the buffer is drained."""
+        self._closed = True
+
+    def is_closed(self) -> Bool:
+        return self._closed
+
+    def pending(self) -> Int:
+        """Return the count of events buffered but not yet
+        yielded."""
+        return len(self._events) - self._next_idx
+
+    def next(mut self, cancel: Cancel) raises -> Optional[List[UInt8]]:
+        """Yield the next event's wire bytes, an empty chunk when the
+        channel is open but idle, or ``None`` to signal end-of-stream.
+
+        Returns ``None`` immediately if cancel is set OR the
+        channel is closed AND the buffer is drained.
+
+        An idle open channel yields a comment-line heartbeat
+        (``": keep-alive\\n\\n"``, ignored by the WHATWG parser because
+        it starts with ``:``) at most once per ``SSE_HEARTBEAT_MS``, and
+        an empty chunk in between. Reactors read the empty chunk as
+        "nothing right now" and stop draining, so an idle stream costs no
+        bandwidth: without the gate, the reactor's coalescing loop would
+        pull a full batch of heartbeats on every writable edge.
+        """
+        if cancel.cancelled():
+            return Optional[List[UInt8]]()
+        if self._next_idx >= len(self._events):
+            if self._closed:
+                return Optional[List[UInt8]]()
+            var now = _monotonic_ms()
+            if (
+                self._last_beat_ms >= 0
+                and now - self._last_beat_ms < SSE_HEARTBEAT_MS
+            ):
+                return Optional[List[UInt8]](List[UInt8]())
+            self._last_beat_ms = now
+            var heartbeat = String(": keep-alive\n\n")
+            var bytes = List[UInt8](capacity=heartbeat.byte_length())
+            var p = heartbeat.unsafe_ptr()
+            for k in range(heartbeat.byte_length()):
+                bytes.append(p[unsafe_offset=k])
+            return Optional[List[UInt8]](bytes^)
+
+        var event = self._events[self._next_idx].copy()
+        self._next_idx += 1
+        # Drop what has been sent. The list used to keep every event
+        # for the life of the channel, so a long-lived stream grew
+        # without bound.
+        if self._next_idx == len(self._events):
+            self._events.clear()
+            self._next_idx = 0
+        elif self._next_idx >= 256:
+            var rest = List[SseEvent](
+                capacity=len(self._events) - self._next_idx
+            )
+            for k in range(self._next_idx, len(self._events)):
+                rest.append(self._events[k].copy())
+            self._events = rest^
+            self._next_idx = 0
+        return Optional[List[UInt8]](format_sse_event(event))
+
+
+# ── Response helpers ────────────────────────────────────────────────────────
+
+
+def _set_sse_headers(mut resp: Response) raises:
+    """Apply the spec-correct SSE response headers in place.
+
+    - ``Content-Type: text/event-stream`` (W3C SSE).
+    - ``Cache-Control: no-cache`` (caches must not stash the
+      half-open stream — RFC 9111 doesn't define a sane shape
+      for ``text/event-stream`` revalidation).
+    - ``Connection: keep-alive`` (HTTP/1.1 default but SSE
+      explicitly requires the connection stays open).
+    - ``X-Accel-Buffering: no`` (nginx-specific; tells nginx to
+      disable proxy-side buffering, otherwise events trickle in
+      4 KiB lumps which defeats the streaming property).
+    """
+    resp.headers.set("Content-Type", "text/event-stream")
+    resp.headers.set("Cache-Control", "no-cache")
+    resp.headers.set("Connection", "keep-alive")
+    resp.headers.set("X-Accel-Buffering", "no")
+
+
+def sse_response(channel: SseChannel) raises -> Response:
+    """Build a :class:`Response` whose body is a one-shot snapshot
+    of every event currently buffered in ``channel``.
+
+    Use this when the handler can produce all events synchronously
+    before returning (the typical "metrics endpoint" /
+    "history-replay" / "test fixture" shape). For an open-ended
+    stream that lives past the handler return, build a
+    :class:`SseStreamingResponse` instead.
+
+    Drains the channel synchronously; returns a :class:`Response`
+    with the SSE wire bytes inline + the spec-correct headers.
+    """
+    var resp = Response(status=200)
+    _set_sse_headers(resp)
+    var snapshot = channel.copy()
+    var body = List[UInt8]()
+    var sentinel = Cancel.never()
+    while True:
+        var maybe = snapshot.next(sentinel)
+        if not maybe:
+            break
+        var chunk = maybe.value().copy()
+        for i in range(len(chunk)):
+            body.append(chunk[i])
+        # Bounded by the channel's own end-of-stream signal: an
+        # open (un-closed) channel will heartbeat forever, so we
+        # only iterate this path when the channel is closed —
+        # see assertion below.
+        if not snapshot.is_closed() and snapshot.pending() == 0:
+            # Caller passed an open-ended channel into the
+            # synchronous helper — we'd loop forever on heartbeats.
+            # Bail with a clear diagnostic; they want
+            # SseStreamingResponse instead.
+            raise Error(
+                "sse_response: open-ended SseChannel; close the channel"
+                " before calling sse_response, or use SseStreamingResponse"
+                " for a streaming-body variant."
+            )
+    resp.body = body^
+    resp.headers.set("Content-Length", String(len(resp.body)))
+    return resp^
+
+
+def stream_sse_response(
+    var channel: SseChannel, status: Int = 200
+) raises -> Response:
+    """Build a streaming (K1) SSE :class:`Response` from ``channel``.
+
+    This is the canonical way to serve SSE through the normal
+    ``Handler`` / ``Router`` path: the returned ``Response`` carries the
+    channel on ``body_stream`` plus the spec-correct SSE headers, and
+    streams over both HTTP/1.1 (chunked transfer-encoding) and HTTP/2
+    (DATA frames) with no SSE-specific reactor code.
+
+    Unlike :func:`sse_response` (a synchronous, ``Content-Length``
+    snapshot that requires a closed channel), the channel may stay open:
+    the reactor drains whatever is buffered on each writable edge and
+    keeps the connection warm with a ``": keep-alive"`` comment at most
+    once per ``SSE_HEARTBEAT_MS`` while idle, until the channel is
+    closed or the peer disconnects. Prefer this over the legacy
+    :class:`SseStreamingResponse`, which only fed the ``serve_streaming``
+    entry point.
+    """
+    var resp = stream_response[SseChannel](channel^, status)
+    _set_sse_headers(resp)
+    return resp^
+
+
+@fieldwise_init
+struct SseStreamingResponse(Movable):
+    """A streaming-body :class:`Response` analogue for an
+    open-ended SSE channel.
+
+    Pairs ``response`` (status + headers) with ``body``
+    (:class:`ChunkedBody[SseChannel]`) so the reactor's streaming
+    code path can drain buffered events on a writable edge. Unlike
+    :func:`sse_response`, this never blocks the handler — it
+    captures the channel and returns immediately; events pushed
+    to the channel after the handler returns are flushed by the
+    reactor on the next writable edge.
+
+    Reactor adoption: a Router/Handler can stream SSE by returning
+    ``stream_response(channel)`` -- the reactor pulls framed chunks in
+    bounded batches via ``Response.body_stream``, on HTTP/1.1, HTTP/2
+    and TLS alike. This ``SseStreamingResponse`` wrapper remains
+    for the ``serve_streaming`` entry point.
+    """
+
+    var response: Response
+    var body: ChunkedBody[SseChannel]
+
+    @staticmethod
+    def of(channel: SseChannel) raises -> SseStreamingResponse:
+        """Construct a :class:`SseStreamingResponse` carrying
+        ``channel`` as its ChunkedBody source."""
+        var resp = Response(status=200)
+        _set_sse_headers(resp)
+        return SseStreamingResponse(
+            response=resp^,
+            body=ChunkedBody[SseChannel](source=channel.copy()),
+        )

@@ -1,0 +1,1971 @@
+"""Per-connection state machine for the reactor-backed HTTP server.
+
+This module owns ``ConnHandle`` -- the per-connection state machine
+that walks each H1 connection through ``STATE_READING`` ->
+``STATE_WRITING`` -> ``STATE_CLOSING`` driven by readable / writable
+/ timeout events from the reactor.
+
+Byte-fast-path / keep-alive helpers (the ``STATE_*`` constants, the
+``StepResult`` return shape, the byte-level ``Connection``-header
+matchers, the HTTP/1.0 ``_wants_close`` raw-bytes scanner, the
+read-buffer compaction helper, and the h2c upgrade detection
+wrapper) live in :mod:`dodo.http._reactor.keepalive_scan` and are
+re-exported here so existing import sites in ``dodo.http``,
+``dodo.http2``, ``dodo.runtime``, the tests, and the fuzz corpus
+keep working unchanged.
+
+The five reader entry points (default, bufring, cancel-aware,
+view-based, static) dispatch through a shared set of helpers
+parameterised on a comptime :class:`DispatchConfig` so the H1 hot
+path stays straight-line and the byte-source-step duplication that
+the previous shape carried collapses into a single helper.
+
+State transitions::
+
+    STATE_READING ─ handler returned ─> STATE_WRITING ─ flushed ─┬─> STATE_READING (keep-alive)
+                                                                └─> STATE_CLOSING (should_close)
+    STATE_READING / STATE_WRITING ─ peer close / error / timeout ─> STATE_CLOSING
+
+The sister module ``dodo/http/_server_reactor_impl.mojo`` owns the
+I/O-bearing pieces -- reactor entry-point loops, ``Pool[ConnHandle]``
+allocation glue, io_uring buffer-ring glue -- and re-exports
+every public symbol below for back-compat with existing imports
+across ``dodo/http/``, ``dodo/http2/``, ``dodo/runtime/``, tests,
+and the fuzz corpus.
+
+The parse-and-dispatch step of each ``on_readable_*`` reader (minimal,
+view, cancel-aware, static) could move to its own module if this file
+grows further.
+"""
+
+from std.collections import List, Optional
+from std.ffi import c_int, c_size_t, ErrNo, get_errno
+from std.memory import unsafe_memcpy, stack_allocation
+
+from dodo.crypto.hmac import base64url_decode
+from dodo.errors import map_handler_error, log_handler_error
+from dodo.http.cancel import CancelCell, CancelReason
+from dodo.http.handler import Handler, CancelHandler, ViewHandler
+from dodo.http.headers import HeaderMap
+from dodo.http.request import Request
+from dodo.http.response import Response
+from dodo.http.response_stream import (
+    ChunkSourceBox,
+    STREAM_BATCH_BYTES,
+    STREAM_BATCH_CHUNKS,
+    frame_chunk_into,
+    frame_terminator_into,
+)
+from dodo.http.server import (
+    ServerConfig,
+    _find_crlfcrlf,
+    _parse_http_request_bytes,
+    _parse_http_request_bytes_minimal,
+    _scan_content_length,
+)
+from dodo.http.static_response import StaticResponse
+from dodo.net import SocketAddr
+from dodo.net._libc import _recv, _send, MSG_NOSIGNAL
+from dodo.tcp import TcpStream
+from dodo.runtime import DateCache
+
+from .keepalive_scan import (
+    STATE_CLOSING,
+    STATE_READING,
+    STATE_WRITING,
+    StepResult,
+    _compact_read_buf_drop_prefix,
+    _compute_close_after,
+    _connection_is_close,
+    _connection_is_keepalive,
+    _detect_h2c_upgrade_inline,
+    _is_connection,
+    _is_content_length,
+    _is_date,
+    _has_header_line,
+    _monotonic_ms,
+    _wants_close,
+)
+from dodo.http.proto.chunked import (
+    CHUNKED_INCOMPLETE,
+    CHUNKED_MALFORMED,
+    TE_ABSENT,
+    TE_CHUNKED,
+    TE_UNSUPPORTED,
+    decode_chunked_body,
+    decode_chunked_trailers,
+    request_te_framing,
+    scan_chunked_resume,
+)
+
+from .tls_transport import TlsTransport
+from .write_path import (
+    build_error_response,
+    queue_h2c_upgrade_101,
+    serialize_response_into,
+    serialize_response_headers_chunked_into,
+    serialize_static_into,
+)
+from dodo.tls._server_ffi import (
+    SSL_IO_WANT_READ,
+    SSL_IO_WANT_WRITE,
+)
+
+
+# ── Dispatch-config comptime tags ─────────────────────────────────────────────
+
+comptime BYTE_SOURCE_RECV: Int = 0
+"""Drain the non-blocking socket via ``_recv`` until EAGAIN."""
+comptime BYTE_SOURCE_BUFRING: Int = 1
+"""Use kernel-provided bytes (io_uring buffer-ring path); skip
+``_recv``."""
+
+
+# ── Streaming coalescing budget ───────────────────────────────────────────────
+
+comptime STREAM_EDGE_PASSES: Int = 4
+"""Max refill+flush passes inside one ``on_writable``.
+
+The batch caps bound bytes per pass; this bounds passes per writable
+edge, so one connection with an endless source cannot hold the worker.
+``STREAM_EDGE_PASSES x STREAM_BATCH_CHUNKS`` chunks is the per-edge
+ceiling, after which the connection re-arms and yields to its peers."""
+
+comptime _WS_NOT_HANDSHAKE: Int = 0
+comptime _WS_UPGRADED: Int = 1
+comptime _WS_REFUSED: Int = 2
+comptime _WS_ON_REACTOR: Int = 3
+
+comptime PIPELINE_BATCH_REQUESTS: Int = 32
+"""Pipelined requests already in ``read_buf`` served before one flush."""
+comptime PIPELINE_BATCH_BYTES: Int = 64 * 1024
+"""Response bytes a pipelined batch may hold before it is flushed."""
+
+
+# ── Connection handle ─────────────────────────────────────────────────────────
+
+
+def _is_ws_version_mismatch(req: Request) -> Bool:
+    """A WebSocket handshake (GET, ``Upgrade: websocket``, a key) whose
+    ``Sec-WebSocket-Version`` is not 13."""
+    if req.method != "GET":
+        return False
+    if req.headers.get("upgrade").lower() != "websocket":
+        return False
+    if req.headers.get("sec-websocket-key").byte_length() == 0:
+        return False
+    return String(req.headers.get("sec-websocket-version").strip()) != "13"
+
+
+def _starts_with_head(buf: List[UInt8]) -> Bool:
+    """True when ``buf`` starts with the request-line method ``HEAD ``."""
+    return (
+        len(buf) >= 5
+        and buf[0] == 72  # H
+        and buf[1] == 69  # E
+        and buf[2] == 65  # A
+        and buf[3] == 68  # D
+        and buf[4] == 32  # SP
+    )
+
+
+def _head_expects_continue(buf: Span[UInt8, _], headers_end: Int) -> Bool:
+    """The request line says HTTP/1.1 and a header line is
+    ``Expect: 100-continue`` (names anchored at a line start, value
+    compared case-insensitively)."""
+    var n = headers_end
+    var i = 0
+    while i + 1 < n and not (buf[i] == 13 and buf[i + 1] == 10):
+        i += 1
+    if i < 8:
+        return False
+    var v = String("HTTP/1.1").as_bytes()
+    for k in range(8):
+        if buf[i - 8 + k] != v[k]:
+            return False
+    i += 2
+    var name = String("expect:").as_bytes()
+    var want = String("100-continue").as_bytes()
+    while i < n:
+        var e = i
+        while e + 1 < n and not (buf[e] == 13 and buf[e + 1] == 10):
+            e += 1
+        if e - i >= len(name):
+            var hit = True
+            for k in range(len(name)):
+                var c = buf[i + k]
+                if c >= 65 and c <= 90:
+                    c += 32
+                if c != name[k]:
+                    hit = False
+                    break
+            if hit:
+                var p = i + len(name)
+                while p < e and (buf[p] == 32 or buf[p] == 9):
+                    p += 1
+                var q = e
+                while q > p and (buf[q - 1] == 32 or buf[q - 1] == 9):
+                    q -= 1
+                if q - p != len(want):
+                    return False
+                for k in range(len(want)):
+                    var c = buf[p + k]
+                    if c >= 65 and c <= 90:
+                        c += 32
+                    if c != want[k]:
+                        return False
+                return True
+        i = e + 2
+    return False
+
+
+struct ConnHandle(Movable):
+    """State + buffers for a single reactor-managed HTTP connection.
+
+    **Takes ownership** of the accepted ``TcpStream`` (which owns the
+    socket's fd). The stream is moved into ``_stream`` at construction
+    and closed on destruction. This avoids the ASAP-destruction hazard
+    that arises from passing just an ``Int32`` fd: Mojo's ownership
+    model would drop the originating ``TcpStream`` as soon as its last
+    explicit reference went out of scope, closing the fd out from under
+    the reactor.
+    """
+
+    var _stream: TcpStream
+    """Underlying connection; this struct is the sole owner. ``self.fd``
+    is a fast accessor for ``self._stream._socket.fd``."""
+    var peer: SocketAddr
+    """Kernel-reported peer address captured from
+    ``TcpStream.peer_addr()`` at construction time. Threaded into every
+    parsed ``Request`` for the connection so handlers can read
+    ``req.peer``. Stored here (not just on each ``Request``) because
+    keep-alive connections re-parse multiple requests across a single
+    ``ConnHandle`` lifetime, and the peer is identical for all of them."""
+    var cancel_cell: CancelCell
+    """Per-connection cancel cell. The reactor flips its ``Int`` to a
+    non-zero ``CancelReason`` on peer FIN, deadline expiry, or drain
+    signal; the cancel-aware reader hands a ``Cancel`` handle bound to
+    this cell into ``CancelHandler.serve(req, cancel)``. Reset between
+    pipelined requests so a cancel reason on one request doesn't leak
+    into the next."""
+    var state: Int
+    var read_buf: List[UInt8]
+    """Incoming request bytes accumulated across partial reads."""
+    var headers_end: Int
+    """Byte offset just past the ``\\r\\n\\r\\n`` header terminator; -1
+    while headers are still being read."""
+    var content_length: Int
+    """Value of the Content-Length header for the current request."""
+    var body_total: Int
+    """Total bytes needed to have the full request: headers_end + content_length.
+    """
+    var write_buf: List[UInt8]
+    """Serialised response bytes; drained by successive send calls."""
+    var write_pos: Int
+    """Number of bytes of ``write_buf`` already sent."""
+    var batch_out: List[UInt8]
+    """Responses to earlier pipelined requests of the current batch, sent
+    ahead of ``write_buf`` in the same flush."""
+    var keepalive_count: Int
+    """Number of requests already served on this keep-alive connection."""
+    var idle_timer_id: UInt64
+    """ID of the currently-armed idle timer, 0 if none. The caller (reactor
+    wrapper) manages the actual TimerWheel entry."""
+    var should_close: Bool
+    """True once we've decided this connection must close after writing."""
+    var last_interest: Int
+    """Last reactor interest bits for this conn. Used by the orchestrator
+    to skip redundant ``reactor.modify`` syscalls when the wanted interest
+    hasn't actually changed since the previous event."""
+    var send_in_flight: Bool
+    """``True`` iff a ``IORING_OP_SEND`` SQE for this conn's
+    ``write_buf`` has been submitted but the corresponding CQE
+    hasn't been observed yet. While True, recv CQEs for this conn
+    are buffered into ``read_buf`` but NOT parsed -- the next
+    request can't be processed until the in-flight ``write_buf``
+    has been released by the kernel. Always ``False`` on the
+    epoll path (which does synchronous send + frees write_buf in
+    ``on_writable``)."""
+
+    var _h2c_upgrade_pending: Bool
+    var _ws_upgrade_pending: Bool
+    """A WebSocket 101 is queued; once it flushes the unified reactor
+    moves the connection to a ``WsConnHandle``."""
+    var _ws_prebuf: List[UInt8]
+    var _ws_origin: String
+    """``True`` iff this h1 connection has received a valid
+    ``Upgrade: h2c`` request (RFC 7540 §3.2), queued the
+    ``101 Switching Protocols`` response into ``write_buf``, and
+    is now waiting for that response to flush before the unified
+    reactor migrates the conn-dict entry from ``KIND_H1`` to
+    ``KIND_H2``."""
+    var _h2c_upgrade_request: Optional[Request]
+    """The original h1 request that triggered the h2c upgrade.
+    The unified reactor's migration helper consumes this to seed
+    stream id 1 on the new :class:`Http2ConnHandle`."""
+    var _h2c_upgrade_settings: List[UInt8]
+    """Base64url-decoded raw bytes of the inbound ``HTTP2-Settings``
+    header (a SETTINGS frame body per RFC 7540 §3.2.1). Applied
+    to the new HTTP/2 connection state during migration."""
+
+    var _date_cache: DateCache
+    """Per-connection cached ``Date:`` header (RFC 9110 §6.6.1).
+    The ``clock_gettime`` call on Linux x86_64 is vDSO-fast (no
+    syscall) and the 29-byte formatter only runs when the
+    wall-clock second has rolled over since the previous response
+    on this connection."""
+
+    var body_src: Optional[ChunkSourceBox]
+    """Active streaming body source (K1), ``None`` for the buffered
+    path. Set from ``Response.body_stream`` at response completion; the
+    ``on_writable`` refill loop pulls a bounded batch of chunks per
+    writable edge, frames them as ``Transfer-Encoding: chunked``, and
+    clears this after the terminator flushes. Freed with the ConnHandle
+    if the peer disconnects mid-stream."""
+
+    var tls: Optional[TlsTransport]
+    """``SSL*`` for a TLS-terminated connection, moved in from the
+    ``TlsConnHandle`` that ran the handshake; ``None`` for cleartext.
+    When set, the recv / send loops go through ``SSL_read`` /
+    ``SSL_write`` instead of the raw ``_recv`` / ``_send`` syscalls.
+    A single ``Optional`` test guards each -- the cleartext path is
+    one predictable branch away from what it was."""
+
+    var is_chunked: Bool
+    """The current request declared ``Transfer-Encoding: chunked``, so
+    its length comes from the chunk framing rather than
+    ``Content-Length`` and the body needs decoding before dispatch."""
+
+    var chunk_scan_pos: Int
+    """Where the chunk-framing scan resumes for the current request:
+    the first chunk that has not fully arrived yet."""
+
+    var chunk_decoded: Int
+    """Payload bytes in the chunks before ``chunk_scan_pos``."""
+
+    var head_request: Bool
+    """The request being answered is HEAD, so its response carries a
+    head and no content."""
+
+    var h2c_upgrade_allowed: Bool
+    """This connection may be upgraded to h2c. Only the unified loop can
+    migrate a connection to an ``Http2ConnHandle``, and only for
+    cleartext, so it alone sets this -- when it promotes a cleartext
+    pending connection to HTTP/1.1. Every other loop, and every TLS
+    connection, serves ``Upgrade: h2c`` requests as plain HTTP/1.1."""
+
+    var continue_sent: Bool
+    """``100 Continue`` has been written for the request being read."""
+
+    var continue_pending: List[UInt8]
+    """The part of the interim ``100 Continue`` the socket did not take.
+
+    Cleartext: the unsent tail of a short ``send``; it goes out in front
+    of the response (``_transition_to_writing``), so the client never
+    sees a truncated status line followed by the next message. TLS: the
+    whole interim record, kept in this connection-owned buffer because
+    ``SSL_write`` must be retried with the same buffer after WANT_WRITE;
+    ``_flush_write_buf_tls`` retries it before any response byte.
+    Empty when nothing is owed."""
+
+    var peer_eof: Bool
+    """The peer has half-closed (FIN / close_notify) with a request still
+    buffered. That request is served, with ``Connection: close``."""
+
+    var short_read_ok: Bool
+    """Set by a driver whose readiness event carried no HUP: a ``recv``
+    that does not fill the chunk then ends the drain without an extra
+    probe. Left False (full drain to EAGAIN) by every other driver."""
+
+    var request_started_ms: Int
+    """Monotonic ms at which the first byte of the request being read
+    was seen; 0 between requests. Bounds the whole read phase (head and
+    body) by ``ServerConfig.request_timeout_ms``."""
+
+    var tls_cross_interest: Bool
+    """Set when the TLS session asked for the *opposite* readiness to
+    the direction being driven -- ``SSL_read`` returning ``WANT_WRITE``
+    or ``SSL_write`` returning ``WANT_READ``, which OpenSSL does during
+    a TLS 1.2 renegotiation or a TLS 1.3 KeyUpdate. The step arms both
+    interests and the reactor re-enters the *other* drive function on
+    the next edge. Always False for cleartext."""
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def __init__(
+        out self, var stream: TcpStream, read_buffer_size: Int = 8192
+    ) raises:
+        """Construct a ConnHandle that owns ``stream`` in STATE_READING.
+
+        Args:
+            stream: Accepted ``TcpStream`` (non-blocking mode must already
+                be set by the caller). Ownership transfers into the
+                ``ConnHandle``.
+            read_buffer_size: Initial capacity for the read buffer.
+        """
+        # Capture the peer address before moving the stream — ``peer_addr``
+        # reads from the stream's internal field, which becomes
+        # inaccessible once we transfer ownership into ``self._stream``.
+        self.peer = stream.peer_addr()
+        self._stream = stream^
+        self.cancel_cell = CancelCell()
+        self.state = STATE_READING
+        self.read_buf = List[UInt8](capacity=read_buffer_size)
+        self.headers_end = -1
+        self.content_length = 0
+        self.body_total = -1
+        self.chunk_scan_pos = 0
+        self.chunk_decoded = 0
+        self.head_request = False
+        self.request_started_ms = 0
+        self.peer_eof = False
+        self.short_read_ok = False
+        self.h2c_upgrade_allowed = False
+        self.continue_sent = False
+        self.continue_pending = List[UInt8]()
+        self.write_buf = List[UInt8]()
+        self.write_pos = 0
+        self.batch_out = List[UInt8]()
+        self.keepalive_count = 0
+        self.idle_timer_id = UInt64(0)
+        self.should_close = False
+        # Accept registers with INTEREST_READ only.
+        self.last_interest = 1  # INTEREST_READ
+        self.send_in_flight = False
+        self._h2c_upgrade_pending = False
+        self._ws_upgrade_pending = False
+        self._ws_prebuf = List[UInt8]()
+        self._ws_origin = String("")
+        self._h2c_upgrade_request = Optional[Request]()
+        self._h2c_upgrade_settings = List[UInt8]()
+        self._date_cache = DateCache()
+        self.body_src = Optional[ChunkSourceBox]()
+        self.tls = Optional[TlsTransport]()
+        self.is_chunked = False
+        self.tls_cross_interest = False
+
+    def attach_tls(mut self, var transport: TlsTransport):
+        """Adopt the ``SSL*`` of an already-handshaken connection.
+
+        Called by the reactor when a ``TlsConnHandle`` promotes to h1
+        after ALPN selected ``http/1.1`` (or offered nothing). From
+        here on every read and write on this connection is ciphertext.
+        """
+        self.tls = Optional[TlsTransport](transport^)
+
+    @always_inline
+    def is_tls(self) -> Bool:
+        """True when this connection is TLS-terminated."""
+        return Bool(self.tls)
+
+    @always_inline
+    def fd(self) -> c_int:
+        """Return the underlying fd. Fast accessor; does not check state."""
+        return self._stream._socket.fd
+
+    # ── Shared step helpers ───────────────────────────────────────────────────
+
+    @always_inline
+    def _drain_recv[
+        flips_cancel_on_close: Bool
+    ](mut self, config: ServerConfig) raises -> Optional[StepResult]:
+        """Drain the non-blocking socket via ``_recv`` into
+        ``self.read_buf`` until a short read or EAGAIN. Returns ``Some(StepResult)``
+        when the state machine should bail (peer-close, oversize,
+        hard error); ``None`` when the buffer is up-to-date and the
+        caller should fall through to the parse step.
+
+        The ``flips_cancel_on_close`` comptime flag selects whether
+        a peer-close (``recv == 0``) flips this connection's
+        ``CancelCell`` to ``PEER_CLOSED`` before returning the
+        done-result; only the cancel- and view-aware reader paths
+        request the flip.
+        """
+        if self.tls:
+            return self._drain_recv_tls[flips_cancel_on_close](config)
+        var chunk = stack_allocation[8192, UInt8]()
+        while True:
+            var got = _recv(self.fd(), chunk, c_size_t(8192), c_int(0))
+            if got > 0:
+                var old_len = len(self.read_buf)
+                var got_int = Int(got)
+                self.read_buf.resize(old_len + got_int, UInt8(0))
+                var dst = self.read_buf.unsafe_ptr().unsafe_offset(old_len)
+                unsafe_memcpy(dest=dst, src=chunk, count=got_int)
+                # Compare without the sum: ``max_header_size +
+                # max_body_size`` wraps for an "unlimited" body cap such
+                # as ``Int.MAX`` (APP-06). ``len`` and ``max_header_size``
+                # are non-negative, so the subtraction cannot overflow.
+                if (
+                    len(self.read_buf) - config.max_header_size
+                    > config.max_body_size
+                ):
+                    self._note_head_from_buf()
+                    self._queue_error(413, "Content Too Large")
+                    return Optional[StepResult](self._transition_to_writing())
+                # A read that did not fill the chunk emptied the socket
+                # (``recv`` returns what is queued, up to the chunk), so
+                # another call would only report EAGAIN. Registration is
+                # level-triggered: anything that arrives later raises
+                # the next event. A peer shutdown is the exception to
+                # skipping the probe: the response to a request that came
+                # with the FIN must announce ``close``, so a driver sets
+                # ``short_read_ok`` only for an event without HUP.
+                if self.short_read_ok and got_int < 8192:
+                    break
+            elif got == 0:
+                self.should_close = True
+                # A FIN after a complete request is a half-close: the
+                # peer (``nc -N``, ``shutdown(SHUT_WR)``) is done sending
+                # and still reading. Serve what is buffered, then close.
+                if self.has_buffered_request():
+                    self.peer_eof = True
+                    break
+                comptime if flips_cancel_on_close:
+                    self.cancel_cell.flip(CancelReason.PEER_CLOSED)
+                return Optional[StepResult](
+                    StepResult(want_read=False, want_write=False, done=True)
+                )
+            else:
+                var e = get_errno()
+                if e == ErrNo.EINTR:
+                    continue
+                if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                    break
+                self.should_close = True
+                return Optional[StepResult](
+                    StepResult(want_read=False, want_write=False, done=True)
+                )
+        return Optional[StepResult]()
+
+    def _drain_recv_tls[
+        flips_cancel_on_close: Bool
+    ](mut self, config: ServerConfig) raises -> Optional[StepResult]:
+        """TLS twin of :meth:`_drain_recv`: pull plaintext through
+        ``SSL_read`` until the record layer needs more ciphertext.
+
+        Same return contract. ``SSL_IO_CLOSED`` is a ``close_notify``
+        and is treated exactly like a cleartext peer FIN, so keep-alive
+        teardown and cancel semantics are identical on both transports.
+        """
+        while True:
+            var got = self.tls.value().recv(self.read_buf, 8192)
+            if got > 0:
+                if (
+                    len(self.read_buf) - config.max_header_size
+                    > config.max_body_size
+                ):
+                    self._note_head_from_buf()
+                    self._queue_error(413, "Content Too Large")
+                    return Optional[StepResult](self._transition_to_writing())
+                continue
+            if got == SSL_IO_WANT_READ:
+                break
+            if got == SSL_IO_WANT_WRITE:
+                # Renegotiation / KeyUpdate: no more plaintext until the
+                # session gets to write. Arm both; the reactor re-enters
+                # the read path on the writable edge.
+                self.tls_cross_interest = True
+                return Optional[StepResult](
+                    StepResult(want_read=True, want_write=True)
+                )
+            self.should_close = True
+            # close_notify after a complete request: serve it first,
+            # exactly as the cleartext half-close path does.
+            if self.has_buffered_request():
+                self.peer_eof = True
+                break
+            comptime if flips_cancel_on_close:
+                self.cancel_cell.flip(CancelReason.PEER_CLOSED)
+            return Optional[StepResult](
+                StepResult(want_read=False, want_write=False, done=True)
+            )
+        return Optional[StepResult]()
+
+    @always_inline
+    def _append_pre_recv_bytes(
+        mut self, bytes: Span[UInt8, _], config: ServerConfig
+    ) raises -> Optional[StepResult]:
+        """Append kernel-pre-delivered ``bytes`` (io_uring buffer-ring
+        path) into ``self.read_buf``. Mirror of :meth:`_drain_recv`
+        for the BUFRING byte source; identical body-size cap check.
+        """
+        if len(bytes) > 0:
+            var old_len = len(self.read_buf)
+            var add = len(bytes)
+            self.read_buf.resize(old_len + add, UInt8(0))
+            var dst = self.read_buf.unsafe_ptr().unsafe_offset(old_len)
+            unsafe_memcpy(dest=dst, src=bytes.unsafe_ptr(), count=add)
+            if (
+                len(self.read_buf) - config.max_header_size
+                > config.max_body_size
+            ):
+                self._note_head_from_buf()
+                self._queue_error(413, "Content Too Large")
+                return Optional[StepResult](self._transition_to_writing())
+        return Optional[StepResult]()
+
+    def _maybe_send_continue(mut self):
+        """Write ``HTTP/1.1 100 Continue`` once for a request that asked
+        for it and whose head is in but whose body is not.
+
+        curl and most other clients send ``Expect: 100-continue`` for
+        larger uploads and hold the body until they see the interim
+        response, falling back after about a second. Without one, the
+        default 500 ms idle timer won that race and the upload failed.
+        RFC 9110 sec 10.1.1: never sent to an HTTP/1.0 client.
+
+        An interim the socket does not take at all is dropped (the
+        client's own fallback covers that). One the socket takes only
+        partly is completed: a half-written status line followed by the
+        final response would corrupt the stream. See
+        :attr:`continue_pending`.
+        """
+        if self.continue_sent or self.headers_end < 0:
+            return
+        if not _head_expects_continue(
+            Span[UInt8, _](self.read_buf), self.headers_end
+        ):
+            return
+        self.continue_sent = True
+        var interim = String("HTTP/1.1 100 Continue\r\n\r\n")
+        var bytes = interim.as_bytes()
+        if self.tls:
+            # Send from a buffer this connection owns: after WANT_WRITE
+            # OpenSSL holds the record and insists the retry uses the
+            # same buffer.
+            self.continue_pending = List[UInt8](bytes)
+            try:
+                var n = self.tls.value().send(
+                    Span[UInt8, _](self.continue_pending), 0
+                )
+                if n > 0 or (n != SSL_IO_WANT_WRITE and n != SSL_IO_WANT_READ):
+                    # Written whole (SSL_write is all-or-nothing without
+                    # partial-write mode), or the session failed and the
+                    # next write will report it.
+                    self.continue_pending.clear()
+            except:
+                self.continue_pending.clear()
+        else:
+            var n = _send(
+                self.fd(),
+                bytes.unsafe_ptr(),
+                c_size_t(len(bytes)),
+                c_int(MSG_NOSIGNAL),
+            )
+            self._keep_unsent_interim(Int(n) if n > 0 else 0)
+
+    def _keep_unsent_interim(mut self, sent: Int):
+        """Remember the tail of the interim after a cleartext send took
+        ``sent`` of its bytes. Nothing is kept when none or all of it
+        went out."""
+        var interim = String("HTTP/1.1 100 Continue\r\n\r\n")
+        var bytes = interim.as_bytes()
+        var total = len(bytes)
+        if sent <= 0 or sent >= total:
+            return
+        self.continue_pending = List[UInt8]()
+        for i in range(sent, total):
+            self.continue_pending.append(bytes[i])
+
+    @always_inline
+    def _check_request_complete(
+        mut self, config: ServerConfig, body_timeout_ms: Int = -1
+    ) raises -> Optional[StepResult]:
+        """Return ``Some(StepResult)`` while the buffered bytes do not
+        yet form a complete request; ``None`` when the request is
+        fully buffered and ready to dispatch.
+
+        Sets ``self.headers_end``, ``self.content_length``, and
+        ``self.body_total`` as a side effect on the first scan of the
+        header block; subsequent calls re-use those values.
+
+        ``body_timeout_ms`` is honoured only while the body is still
+        arriving; a negative value falls back to
+        ``config.idle_timeout_ms``.
+        """
+        # The idle timer is re-armed by every readable event, so a peer
+        # that sends one byte just inside it could keep a request open
+        # forever. request_timeout_ms is an absolute budget for reading
+        # the whole request, head and body, from its first byte.
+        # An error queued while the request is still incomplete must know
+        # whether it answers a HEAD (no content, RFC 9110 sec 9.3.2); the
+        # parsed ``req.method`` is not available yet (APP-05).
+        self._note_head_from_buf()
+        if len(self.read_buf) > 0 and config.request_timeout_ms > 0:
+            var now = _monotonic_ms()
+            if self.request_started_ms == 0:
+                self.request_started_ms = now
+            elif now - self.request_started_ms > config.request_timeout_ms:
+                self.request_started_ms = 0
+                self._queue_error(408, "Request Timeout")
+                return Optional[StepResult](self._transition_to_writing())
+        if self.headers_end < 0:
+            self.continue_sent = False
+            var end = _find_crlfcrlf(self.read_buf, 0)
+            if end < 0:
+                if len(self.read_buf) > config.max_header_size:
+                    self._queue_error(431, "Request Header Fields Too Large")
+                    return Optional[StepResult](self._transition_to_writing())
+                return Optional[StepResult](
+                    StepResult(
+                        want_read=True,
+                        want_write=False,
+                        idle_timeout_ms=config.idle_timeout_ms,
+                    )
+                )
+            self.headers_end = end
+            var te = request_te_framing(
+                Span[UInt8, _](self.read_buf),
+                self.headers_end,
+                config.h1_leniency.allow_te_chunked_when_cl_present,
+            )
+            if te == TE_UNSUPPORTED:
+                self._queue_error(501, "Not Implemented")
+                return Optional[StepResult](self._transition_to_writing())
+            if te != TE_ABSENT and te != TE_CHUNKED:
+                self._queue_error(400, "Bad Request")
+                return Optional[StepResult](self._transition_to_writing())
+            self.is_chunked = te == TE_CHUNKED
+            if self.is_chunked:
+                # RFC 9112 sec 7.1: chunked framing supersedes any
+                # Content-Length. Length is not known up front, so the
+                # completeness signal is the terminating chunk. Without
+                # this the reactor sized the request at headers_end and
+                # dispatched a chunked upload as an empty body.
+                self.content_length = 0
+                self.body_total = -1
+                self.chunk_scan_pos = self.headers_end
+                self.chunk_decoded = 0
+            else:
+                self.content_length = _scan_content_length(
+                    self.read_buf, self.headers_end
+                )
+                if self.content_length < 0:
+                    self._queue_error(400, "Bad Request")
+                    return Optional[StepResult](self._transition_to_writing())
+                if self.content_length > config.max_body_size:
+                    self._queue_error(413, "Content Too Large")
+                    return Optional[StepResult](self._transition_to_writing())
+                self.body_total = self.headers_end + self.content_length
+        if self.is_chunked and self.body_total < 0:
+            var cend = scan_chunked_resume(
+                Span[UInt8, _](self.read_buf),
+                self.chunk_scan_pos,
+                self.chunk_decoded,
+                config.max_body_size,
+            )
+            if cend == CHUNKED_MALFORMED:
+                self._queue_error(400, "Bad Request")
+                return Optional[StepResult](self._transition_to_writing())
+            if cend == CHUNKED_INCOMPLETE:
+                self._maybe_send_continue()
+                var t2 = (
+                    body_timeout_ms if body_timeout_ms
+                    > 0 else config.idle_timeout_ms
+                )
+                return Optional[StepResult](
+                    StepResult(
+                        want_read=True,
+                        want_write=False,
+                        idle_timeout_ms=t2,
+                    )
+                )
+            self.body_total = cend
+        if len(self.read_buf) < self.body_total:
+            self._maybe_send_continue()
+            var timeout = (
+                body_timeout_ms if body_timeout_ms
+                > 0 else config.idle_timeout_ms
+            )
+            return Optional[StepResult](
+                StepResult(
+                    want_read=True,
+                    want_write=False,
+                    idle_timeout_ms=timeout,
+                )
+            )
+        # Complete: the next request's clock starts at its first byte.
+        self.request_started_ms = 0
+        return Optional[StepResult]()
+
+    @always_inline
+    def _apply_keepalive_policy(
+        mut self, config: ServerConfig, close_after: Bool
+    ) -> Bool:
+        """Roll the per-request keep-alive book-keeping (request count
+        cap, server-policy override) into the final close decision
+        and store it on ``self.should_close``. Returns the same value
+        so the caller can use it for the ``Connection:`` response
+        header.
+        """
+        self.keepalive_count += 1
+        var final = close_after
+        if self.keepalive_count >= config.max_keepalive_requests:
+            final = True
+        if not config.keep_alive:
+            final = True
+        if self.peer_eof:
+            final = True
+        self.should_close = final
+        return final
+
+    @always_inline
+    def _finalise_response(
+        mut self, var resp: Response, close_after: Bool
+    ) -> StepResult:
+        """Compact the read buffer, reset the per-request offsets,
+        serialise ``resp`` into ``self.write_buf``, and transition
+        into ``STATE_WRITING``.
+        """
+        if self.body_total > 0 and self.body_total <= len(self.read_buf):
+            _compact_read_buf_drop_prefix(self.read_buf, self.body_total)
+        self.headers_end = -1
+        self.content_length = 0
+        self.body_total = -1
+        self.is_chunked = False
+        # Streaming path (K1): a handler that returned a streaming
+        # Response carries a chunk source. Take it onto the connection,
+        # emit chunked-framed headers, and let ``on_writable`` pull the
+        # body chunk-by-chunk. The buffered path is unchanged.
+        var bodyless = (
+            self.head_request
+            or resp.status < 200
+            or resp.status == 204
+            or resp.status == 304
+        )
+        if resp.body_stream and not bodyless:
+            self.body_src = resp.body_stream.take()
+            self._serialize_response_chunked(resp, not close_after)
+        else:
+            # A bodyless answer to a streaming handler sends its head
+            # only; the chunk source is dropped with ``resp``, unread.
+            serialize_response_into(
+                self.write_buf,
+                self._date_cache,
+                resp,
+                not close_after,
+                self.head_request,
+                not resp.body_stream,
+            )
+            self.write_pos = 0
+        return self._transition_to_writing()
+
+    # ── Event handlers ────────────────────────────────────────────────────────
+
+    def on_readable[
+        H: Handler
+    ](mut self, ref handler: H, config: ServerConfig,) raises -> StepResult:
+        """Drive the state machine on a readable event.
+
+        Serves the request just read, then every further whole request
+        already buffered behind it (HTTP/1.1 pipelining), up to the batch
+        caps, so the responses leave in one flush.
+        """
+        var step = self._serve_next(handler, config, True)
+        var served = 1
+        while served < PIPELINE_BATCH_REQUESTS and self._batch_continues():
+            step = self._serve_next(handler, config, False)
+            served += 1
+        self._merge_batch()
+        return step
+
+    def _serve_next[
+        H: Handler
+    ](
+        mut self, ref handler: H, config: ServerConfig, drain: Bool
+    ) raises -> StepResult:
+        """Read (when ``drain``), parse and serve one request.
+
+        Consumes as much as the non-blocking socket makes available per
+        call. Transitions to ``STATE_WRITING`` when the full request is
+        parsed and the handler has returned.
+
+        Args:
+            handler: Request -> Response callback.
+            config: Server configuration (limits + timeouts).
+            drain: Read from the socket first; False for a request
+                already buffered behind the previous one.
+
+        Returns:
+            A ``StepResult`` describing the new reactor-interest state.
+        """
+        if self.state != STATE_READING:
+            return StepResult(
+                want_read=False, want_write=self.state == STATE_WRITING
+            )
+
+        if drain:
+            var drained = self._drain_recv[flips_cancel_on_close=False](config)
+            if drained:
+                return drained.value()
+        var pending = self._check_request_complete(
+            config, body_timeout_ms=config.read_body_timeout_ms
+        )
+        if pending:
+            return pending.value()
+
+        # Parse the request. ``skip_header_decode_for_short_requests``
+        # picks the minimal parser that skips HeaderMap construction.
+        var req: Request
+        var close_after: Bool
+        try:
+            if config.skip_header_decode_for_short_requests:
+                req = _parse_http_request_bytes_minimal(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    self.content_length,
+                    config.max_body_size,
+                    config.max_uri_length,
+                    self.peer,
+                    config.expose_error_messages,
+                )
+                close_after = _wants_close(self.read_buf, self.headers_end)
+            else:
+                req = _parse_http_request_bytes(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    config.max_header_size,
+                    config.max_body_size,
+                    config.max_uri_length,
+                    self.peer,
+                    config.expose_error_messages,
+                    config.h1_leniency,
+                )
+                close_after = _compute_close_after(req.headers, req.version)
+            self.head_request = req.method == "HEAD"
+            if self.is_chunked:
+                # The parsers deliberately do not decode chunked bodies
+                # (they only use TE to resolve the CL/TE ambiguity), so
+                # the framed bytes are decoded here into the body the
+                # handler sees.
+                req.body = List[UInt8]()
+                _ = decode_chunked_body(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    req.body,
+                )
+                decode_chunked_trailers(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    req.trailers,
+                )
+        except:
+            self._queue_error(400, "Bad Request")
+            return self._transition_to_writing()
+
+        # h2c upgrade detection (RFC 7540 §3.2). Hot-path-aware: 99.99 %
+        # of inbound requests don't carry ``Upgrade: h2c`` so we
+        # short-circuit on the first cheap header lookup -- a single
+        # ``HeaderMap.get("upgrade")`` returning the empty string skips
+        # the entire upgrade-handling branch.
+        if req.headers.get("upgrade").byte_length() != 0:
+            # WebSocket upgrade (RFC 6455), opt-in via
+            # ``config.ws.handler``. Checked inside the same guard the
+            # h2c path already pays for, so non-upgrade traffic is
+            # unaffected. On success the fd belongs to the
+            # WsConnection, so the reactor is told to drop this
+            # connection -- with `ws_offload` set that happens while
+            # the handler is still running on its own thread.
+            #
+            # Never on a TLS connection: ``_handle_ws_upgrade`` detaches
+            # the raw fd and writes the 101 and every frame in cleartext,
+            # and a TLS connection has no upgrade seam (a ``wss://``
+            # handshake is served as plain HTTP/1.1 inside TLS instead).
+            var ws_here = (
+                config.ws.handler or config.ws.reactor
+            ) and not self.tls
+            if ws_here and _is_ws_version_mismatch(req):
+                # RFC 6455 sec 4.4: a handshake for a version we do not
+                # speak gets 426 with the version we do, rather than
+                # falling through to the HTTP handler as if it were a
+                # plain GET.
+                var r426 = build_error_response(426, "Upgrade Required")
+                try:
+                    r426.headers.set("Sec-WebSocket-Version", "13")
+                except:
+                    pass
+                # The 426 says ``Connection: close``, so the connection
+                # must close after it (RFC 9112 sec 9.6): without this
+                # a pipelined request behind it would still be served.
+                self.should_close = True
+                return self._finalise_response(r426^, True)
+            if ws_here:
+                var upgraded: Int
+                try:
+                    upgraded = self._handle_ws_upgrade(req, config)
+                except:
+                    # The handshake or the handler failed after the fd
+                    # may already have been detached; there is nothing
+                    # left to write to, so tear the connection down.
+                    self.should_close = True
+                    return StepResult(
+                        want_read=False, want_write=False, done=True
+                    )
+                if upgraded == _WS_ON_REACTOR:
+                    return self._transition_to_writing()
+                if upgraded == _WS_REFUSED:
+                    self.should_close = True
+                    return self._finalise_response(
+                        build_error_response(503, "Service Unavailable"), True
+                    )
+                if upgraded == _WS_UPGRADED:
+                    return StepResult(
+                        want_read=False,
+                        want_write=False,
+                        done=True,
+                        idle_timeout_ms=0,
+                    )
+            # RFC 9113 sec 3.1: h2c is never used over TLS. A loop that
+            # cannot migrate the connection would leave it write-armed
+            # forever re-announcing the upgrade (a busy spin), so both
+            # cases serve the request as HTTP/1.1 and ignore Upgrade.
+            var settings_payload = Optional[List[UInt8]]()
+            if self.h2c_upgrade_allowed and not self.tls:
+                try:
+                    settings_payload = self._h2c_upgrade_decode_settings(
+                        req.headers
+                    )
+                except:
+                    settings_payload = Optional[List[UInt8]]()
+            if settings_payload:
+                self._start_h2c_upgrade(req^, settings_payload.value().copy())
+                if self.body_total > 0 and self.body_total <= len(
+                    self.read_buf
+                ):
+                    _compact_read_buf_drop_prefix(
+                        self.read_buf, self.body_total
+                    )
+                self.headers_end = -1
+                self.content_length = 0
+                self.body_total = -1
+                self.is_chunked = False
+                self.state = STATE_WRITING
+                return StepResult(
+                    want_read=False,
+                    want_write=True,
+                    idle_timeout_ms=0,
+                )
+
+        var final_close = self._apply_keepalive_policy(config, close_after)
+        var expose_errors = req.expose_errors
+        var request_id = req.headers.get("x-request-id")
+        var resp: Response
+        try:
+            resp = handler.serve(req).lower()
+        except e:
+            log_handler_error(request_id, String(e))
+            var mapped = map_handler_error(String(e), expose_errors)
+            self._queue_error(mapped.status, mapped.reason)
+            return self._transition_to_writing()
+        return self._finalise_response(resp^, final_close)
+
+    def on_readable_from_buf[
+        H: Handler
+    ](
+        mut self,
+        bytes: Span[UInt8, _],
+        ref handler: H,
+        config: ServerConfig,
+    ) raises -> StepResult:
+        """``on_readable[H]`` variant for the io_uring recv-multishot
+        path: takes pre-recv'd bytes from a kernel-delivered buffer
+        instead of looping on ``_recv()`` itself.
+
+        The ``IORING_OP_RECV`` CQE with ``res == 0`` (peer closed)
+        is handled by the caller, not here -- this method only
+        runs when there are real bytes to feed.
+
+        Args:
+            bytes: New bytes to feed into the read pipeline. May be
+                empty (legitimate when the kernel re-issues a
+                multishot completion immediately after re-arm; we
+                skip the parse step in that case).
+            handler: Request -> Response callback.
+            config: Server configuration.
+
+        Returns:
+            A ``StepResult`` describing the new reactor-interest
+            state.
+        """
+        if self.state != STATE_READING:
+            return StepResult(
+                want_read=False, want_write=self.state == STATE_WRITING
+            )
+
+        var appended = self._append_pre_recv_bytes(bytes, config)
+        if appended:
+            return appended.value()
+        var pending = self._check_request_complete(
+            config, body_timeout_ms=config.read_body_timeout_ms
+        )
+        if pending:
+            return pending.value()
+
+        var req: Request
+        var close_after: Bool
+        try:
+            if config.skip_header_decode_for_short_requests:
+                req = _parse_http_request_bytes_minimal(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    self.content_length,
+                    config.max_body_size,
+                    config.max_uri_length,
+                    self.peer,
+                    config.expose_error_messages,
+                )
+                close_after = _wants_close(self.read_buf, self.headers_end)
+            else:
+                req = _parse_http_request_bytes(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    config.max_header_size,
+                    config.max_body_size,
+                    config.max_uri_length,
+                    self.peer,
+                    config.expose_error_messages,
+                    config.h1_leniency,
+                )
+                close_after = _compute_close_after(req.headers, req.version)
+            self.head_request = req.method == "HEAD"
+            if self.is_chunked:
+                # The parsers deliberately do not decode chunked bodies
+                # (they only use TE to resolve the CL/TE ambiguity), so
+                # the framed bytes are decoded here into the body the
+                # handler sees.
+                req.body = List[UInt8]()
+                _ = decode_chunked_body(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    req.body,
+                )
+                decode_chunked_trailers(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    req.trailers,
+                )
+        except:
+            self._queue_error(400, "Bad Request")
+            return self._transition_to_writing()
+
+        var final_close = self._apply_keepalive_policy(config, close_after)
+        var expose_errors = req.expose_errors
+        var request_id = req.headers.get("x-request-id")
+        var resp: Response
+        try:
+            resp = handler.serve(req).lower()
+        except e:
+            log_handler_error(request_id, String(e))
+            var mapped = map_handler_error(String(e), expose_errors)
+            self._queue_error(mapped.status, mapped.reason)
+            return self._transition_to_writing()
+        return self._finalise_response(resp^, final_close)
+
+    def on_readable_cancel[
+        CH: CancelHandler
+    ](mut self, ref handler: CH, config: ServerConfig,) raises -> StepResult:
+        """Cancel-aware variant of ``on_readable``.
+
+        Identical to ``on_readable`` except the per-connection
+        ``CancelCell`` is reset to ``NONE`` at the top of each
+        request, flipped to ``PEER_CLOSED`` on ``recv == 0``
+        observed before the handler runs, and a ``Cancel`` handle
+        bound to the cell is passed to ``CH.serve(req, cancel)``.
+        """
+        if self.state != STATE_READING:
+            return StepResult(
+                want_read=False, want_write=self.state == STATE_WRITING
+            )
+
+        # Reset the cancel cell at the start of each request so a
+        # cancellation observed on a previous pipelined request does
+        # not leak into this one. Idempotent on the first request of
+        # a connection because the cell is already ``NONE`` from
+        # construction.
+        self.cancel_cell.reset()
+
+        var drained = self._drain_recv[flips_cancel_on_close=True](config)
+        if drained:
+            return drained.value()
+        var pending = self._check_request_complete(
+            config, body_timeout_ms=config.read_body_timeout_ms
+        )
+        if pending:
+            return pending.value()
+
+        # The handler takes an owned ``Request``, so this path parses
+        # with the same validating parser as ``on_readable`` and decodes
+        # a chunked body the same way. It used the view parser and then
+        # copied out, which skipped chunked decoding altogether: a
+        # chunked upload reached a CancelHandler as an empty body, or as
+        # the raw chunk framing.
+        var req: Request
+        try:
+            req = _parse_http_request_bytes(
+                Span[UInt8, _](self.read_buf)[: self.body_total],
+                config.max_header_size,
+                config.max_body_size,
+                config.max_uri_length,
+                self.peer,
+                config.expose_error_messages,
+                config.h1_leniency,
+            )
+            self.head_request = req.method == "HEAD"
+            if self.is_chunked:
+                req.body = List[UInt8]()
+                _ = decode_chunked_body(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    req.body,
+                )
+                decode_chunked_trailers(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    req.trailers,
+                )
+        except:
+            self._queue_error(400, "Bad Request")
+            return self._transition_to_writing()
+
+        var close_after = _compute_close_after(req.headers, req.version)
+        var final_close = self._apply_keepalive_policy(config, close_after)
+        var expose_errors = req.expose_errors
+        var request_id = req.headers.get("x-request-id")
+        var resp: Response
+        try:
+            # Hand the handler a cancel handle bound to this
+            # connection's cancel cell. The cell outlives the handler
+            # call (it's owned by ``self``).
+            resp = handler.serve(req, self.cancel_cell.handle())
+        except e:
+            log_handler_error(request_id, String(e))
+            var mapped = map_handler_error(String(e), expose_errors)
+            self._queue_error(mapped.status, mapped.reason)
+            return self._transition_to_writing()
+        return self._finalise_response(resp^, final_close)
+
+    def on_readable_view[
+        VH: ViewHandler
+    ](mut self, ref handler: VH, config: ServerConfig) raises -> StepResult:
+        """View-aware variant of ``on_readable_cancel``.
+
+        Same control flow as ``on_readable_cancel`` but dispatches
+        the parsed ``RequestView`` directly into
+        ``VH.serve_view(view, cancel)`` -- the body slice borrows
+        from ``self.read_buf`` and the handler reads it without
+        a copy. The owned ``Request`` materialisation that the
+        ``Handler.serve`` requires is skipped entirely.
+        """
+        if self.state != STATE_READING:
+            return StepResult(
+                want_read=False, want_write=self.state == STATE_WRITING
+            )
+
+        self.cancel_cell.reset()
+
+        var drained = self._drain_recv[flips_cancel_on_close=True](config)
+        if drained:
+            return drained.value()
+        var pending = self._check_request_complete(
+            config, body_timeout_ms=config.read_body_timeout_ms
+        )
+        if pending:
+            return pending.value()
+
+        from dodo.http.request_view import parse_request_view
+        from dodo.http.server import _ascii_lower
+
+        var resp: Response
+        try:
+            # A chunked body is decoded in place: the decoded bytes are
+            # never longer than the framing they came from, so they fit
+            # at ``headers_end`` and the view borrows them from there.
+            var body_override = -1
+            if self.is_chunked:
+                var decoded = List[UInt8]()
+                _ = decode_chunked_body(
+                    Span[UInt8, _](self.read_buf)[: self.body_total],
+                    self.headers_end,
+                    decoded,
+                )
+                for i in range(len(decoded)):
+                    self.read_buf[self.headers_end + i] = decoded[i]
+                body_override = len(decoded)
+            var view = parse_request_view(
+                Span[UInt8, _](self.read_buf)[: self.body_total],
+                config.max_header_size,
+                config.max_body_size,
+                config.max_uri_length,
+                self.peer,
+                config.expose_error_messages,
+                body_override,
+            )
+            self.head_request = view.method == "HEAD"
+
+            # Connection-disposition from the borrowed header view --
+            # no allocation, just an offsets-based lookup.
+            var hv = view.headers()
+            var conn_hdr = _ascii_lower(String(hv.get("connection")))
+            var is_http10 = view.version == "HTTP/1.0"
+            var close_after = False
+            if conn_hdr == "close":
+                close_after = True
+            elif is_http10 and conn_hdr != "keep-alive":
+                close_after = True
+
+            var _final_close = self._apply_keepalive_policy(config, close_after)
+
+            try:
+                resp = handler.serve_view(view, self.cancel_cell.handle())
+            except e:
+                log_handler_error(String(hv.get("x-request-id")), String(e))
+                var mapped = map_handler_error(
+                    String(e), config.expose_error_messages
+                )
+                self._queue_error(mapped.status, mapped.reason)
+                return self._transition_to_writing()
+        except:
+            self._queue_error(400, "Bad Request")
+            return self._transition_to_writing()
+
+        var keepalive = not self.should_close
+        return self._finalise_response(resp^, not keepalive)
+
+    def on_readable_static(
+        mut self, resp: StaticResponse, config: ServerConfig
+    ) raises -> StepResult:
+        """Static-response variant of ``on_readable``.
+
+        Reads as much as the non-blocking socket makes available per
+        call, scans for the end-of-headers marker, discards the
+        declared body bytes (if any), and queues the pre-encoded
+        ``StaticResponse`` bytes into ``write_buf``. The parser never
+        constructs a ``Request``; no handler is called. Pipelined
+        requests already buffered are answered in the same flush, as on
+        the handler path.
+        """
+        var step = self._serve_static_next(resp, config, True)
+        var served = 1
+        while served < PIPELINE_BATCH_REQUESTS and self._batch_continues():
+            step = self._serve_static_next(resp, config, False)
+            served += 1
+        self._merge_batch()
+        return step
+
+    def _serve_static_next(
+        mut self, resp: StaticResponse, config: ServerConfig, drain: Bool
+    ) raises -> StepResult:
+        if self.state != STATE_READING:
+            return StepResult(
+                want_read=False, want_write=self.state == STATE_WRITING
+            )
+
+        if drain:
+            var drained = self._drain_recv[flips_cancel_on_close=False](config)
+            if drained:
+                return drained.value()
+        var pending = self._check_request_complete(config)
+        if pending:
+            return pending.value()
+
+        # Inspect Connection header + HTTP/1.0 semantics on the raw
+        # header bytes without building a Request object. Cheap scan
+        # over the header region only.
+        var close_after = _wants_close(self.read_buf, self.headers_end)
+        var final_close = self._apply_keepalive_policy(config, close_after)
+        # A response to HEAD carries no content (RFC 9110 §9.3.2), so
+        # queue only the head of the pre-encoded bytes (APP-04).
+        var is_head = _starts_with_head(self.read_buf)
+
+        if self.body_total > 0 and self.body_total <= len(self.read_buf):
+            _compact_read_buf_drop_prefix(self.read_buf, self.body_total)
+        self.headers_end = -1
+        self.content_length = 0
+        self.body_total = -1
+        self.is_chunked = False
+
+        self._serialize_static(resp, not final_close, is_head)
+        return self._transition_to_writing()
+
+    def _flush_write_buf_tls(mut self) raises -> Optional[StepResult]:
+        """TLS twin of the ``on_writable`` send loop.
+
+        Returns ``Some(StepResult)`` when the caller must bail (fatal
+        error, or the session needs readability to make progress);
+        ``None`` when ``write_pos`` is as far along as the socket
+        allows and the caller should fall through to its normal
+        flushed / partial-write handling.
+        """
+        if len(self.continue_pending) > 0:
+            # The interim record OpenSSL could not write earlier: retry
+            # from the same buffer, and send no response byte before it
+            # (a write from `write_buf` would fail with BAD_WRITE_RETRY).
+            var rn = self.tls.value().send(
+                Span[UInt8, _](self.continue_pending), 0
+            )
+            if rn > 0:
+                self.continue_pending.clear()
+            elif rn == SSL_IO_WANT_WRITE:
+                return Optional[StepResult]()
+            elif rn == SSL_IO_WANT_READ:
+                self.tls_cross_interest = True
+                return Optional[StepResult](
+                    StepResult(want_read=True, want_write=True)
+                )
+            else:
+                self.continue_pending.clear()
+                self.should_close = True
+                return Optional[StepResult](
+                    StepResult(want_read=False, want_write=False, done=True)
+                )
+        while self.write_pos < len(self.write_buf):
+            var n = self.tls.value().send(
+                Span[UInt8, _](self.write_buf), self.write_pos
+            )
+            if n > 0:
+                self.write_pos += n
+                continue
+            if n == SSL_IO_WANT_WRITE:
+                break
+            if n == SSL_IO_WANT_READ:
+                self.tls_cross_interest = True
+                return Optional[StepResult](
+                    StepResult(want_read=True, want_write=True)
+                )
+            self.should_close = True
+            return Optional[StepResult](
+                StepResult(want_read=False, want_write=False, done=True)
+            )
+        return Optional[StepResult]()
+
+    def _batch_continues(mut self) -> Bool:
+        """Whether the response just queued may wait for the next buffered
+        request's, and if so set it aside in ``batch_out``.
+
+        Only a plain buffered response qualifies: not one that closes the
+        connection, streams, or is still to finish an interim write, and
+        the next request must be whole and carry no ``Upgrade`` (a
+        WebSocket handshake writes on the socket itself, ahead of anything
+        still queued here).
+        """
+        if (
+            self.state != STATE_WRITING
+            or self.write_pos != 0
+            or self.should_close
+            or self.body_src
+            or self._h2c_upgrade_pending
+            or self._ws_upgrade_pending
+            or len(self.continue_pending) > 0
+            or len(self.batch_out) + len(self.write_buf) > PIPELINE_BATCH_BYTES
+        ):
+            return False
+        self.state = STATE_READING
+        if not self.has_buffered_request():
+            self.state = STATE_WRITING
+            return False
+        var end = self.headers_end
+        if end < 0:
+            end = _find_crlfcrlf(self.read_buf, 0)
+        if _has_header_line(self.read_buf, end, "upgrade:"):
+            self.state = STATE_WRITING
+            return False
+        self.batch_out.extend(Span[UInt8, _](self.write_buf))
+        self.write_buf.clear()
+        return True
+
+    def _merge_batch(mut self):
+        """Put the batch's earlier responses ahead of the last one."""
+        if len(self.batch_out) == 0:
+            return
+        self.batch_out.extend(
+            Span[UInt8, _](self.write_buf)[self.write_pos : len(self.write_buf)]
+        )
+        swap(self.write_buf, self.batch_out)
+        self.write_pos = 0
+        self.batch_out.clear()
+
+    def take_ws_upgrade(mut self, mut prebuf: List[UInt8], mut origin: String):
+        """Hand the bytes past the handshake and its ``Origin`` to the
+        ``WsConnHandle`` that takes over the connection."""
+        self._ws_upgrade_pending = False
+        swap(prebuf, self._ws_prebuf)
+        swap(origin, self._ws_origin)
+
+    def has_buffered_request(self) -> Bool:
+        """True when ``read_buf`` already holds a whole request that has
+        not been dispatched.
+
+        The reactor is level-triggered on readability, and pipelined
+        requests that arrived in one segment raise no further readable
+        event once they are in ``read_buf``. The loops use this to drive
+        the connection again after the inline cycle cap or after a
+        response finishes flushing, instead of leaving those requests to
+        the idle timer. A partial request is never "buffered", so this
+        cannot make a loop spin while it waits for bytes.
+        """
+        if self.state != STATE_READING or len(self.read_buf) == 0:
+            return False
+        if self.headers_end < 0:
+            return _find_crlfcrlf(self.read_buf, 0) >= 0
+        if self.body_total < 0:
+            return False
+        return len(self.read_buf) >= self.body_total
+
+    def on_writable(mut self, config: ServerConfig) raises -> StepResult:
+        """Drive the state machine on a writable event.
+
+        Sends as much of ``write_buf`` as the non-blocking socket accepts.
+        When the buffer is fully flushed, transitions back to
+        ``STATE_READING`` (keep-alive) or ``STATE_CLOSING`` based on
+        ``should_close``.
+
+        Args:
+            config: Server configuration (used to compute the new idle timer
+                after a successful flush).
+
+        Returns:
+            A ``StepResult`` describing the new reactor-interest state.
+        """
+        if self.state != STATE_WRITING:
+            return StepResult(
+                want_read=self.state == STATE_READING, want_write=False
+            )
+
+        # Flush, and while a chunk source is attached, refill and flush
+        # again. Buffered responses have ``body_src == None`` and leave
+        # the loop on the first pass after a single Optional check.
+        var passes = 0
+        while True:
+            if self.tls:
+                var tls_step = self._flush_write_buf_tls()
+                if tls_step:
+                    return tls_step.value()
+            else:
+                while self.write_pos < len(self.write_buf):
+                    var remaining = len(self.write_buf) - self.write_pos
+                    var ptr = self.write_buf.unsafe_ptr().unsafe_offset(
+                        self.write_pos
+                    )
+                    var n = _send(
+                        self.fd(), ptr, c_size_t(remaining), c_int(MSG_NOSIGNAL)
+                    )
+                    if n > 0:
+                        self.write_pos += Int(n)
+                    else:
+                        var e = get_errno()
+                        if e == ErrNo.EINTR:
+                            continue
+                        if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                            break
+                        # Hard write error — close.
+                        self.should_close = True
+                        return StepResult(
+                            want_read=False, want_write=False, done=True
+                        )
+
+            if self.write_pos < len(self.write_buf):
+                # Partial write — the socket is full. Re-arm on writable.
+                return StepResult(
+                    want_read=False,
+                    want_write=True,
+                    idle_timeout_ms=config.write_timeout_ms,
+                )
+
+            # Everything queued has been sent.
+            self.write_buf.clear()
+            self.write_pos = 0
+
+            if not self.body_src:
+                break
+
+            passes += 1
+            if passes >= STREAM_EDGE_PASSES:
+                # Per-edge budget spent; yield so peers on this worker
+                # make progress, and finish the stream on the next edge.
+                return StepResult(
+                    want_read=False,
+                    want_write=True,
+                    idle_timeout_ms=config.write_timeout_ms,
+                )
+
+            var queued: Bool
+            try:
+                queued = self._stream_refill()
+            except:
+                self.should_close = True
+                return StepResult(want_read=False, want_write=False, done=True)
+            if not queued:
+                # Source is alive but had nothing to give this pass.
+                return StepResult(
+                    want_read=False,
+                    want_write=True,
+                    idle_timeout_ms=config.write_timeout_ms,
+                )
+
+        if self._ws_upgrade_pending:
+            return StepResult(idle_timeout_ms=0, ws_upgrade=True)
+
+        # h2c upgrade migration cue: the 101 Switching Protocols response
+        # has just flushed. Tell the unified reactor to swap the conn-dict
+        # entry from KIND_H1 to KIND_H2.
+        if self._h2c_upgrade_pending:
+            return StepResult(
+                want_read=False,
+                want_write=False,
+                done=False,
+                idle_timeout_ms=0,
+                h2c_upgrade=True,
+            )
+
+        if self.should_close:
+            return StepResult(want_read=False, want_write=False, done=True)
+
+        # Keep-alive: back to reading, possibly on already-buffered next
+        # request (pipelining — data may already be in read_buf).
+        self.state = STATE_READING
+        return StepResult(
+            want_read=True,
+            want_write=False,
+            idle_timeout_ms=config.idle_timeout_ms,
+        )
+
+    def take_h2c_upgrade_request(mut self) raises -> Request:
+        """Move the saved h2c upgrade ``Request`` out of this handle.
+
+        Companion to :meth:`take_h2c_upgrade_settings`; callers
+        invoke both to extract the migration payload before freeing
+        the h1 handle. Setting the in-flight flag to ``False`` here
+        is deferred to :meth:`take_h2c_upgrade_settings` so a partial
+        take doesn't silently leave the settings buffer behind.
+        """
+        if not self._h2c_upgrade_pending:
+            raise Error("take_h2c_upgrade_request: not pending")
+        if not self._h2c_upgrade_request:
+            raise Error("take_h2c_upgrade_request: payload missing")
+        return self._h2c_upgrade_request.take()
+
+    def take_h2c_upgrade_settings(mut self) -> List[UInt8]:
+        """Move the saved decoded ``HTTP2-Settings`` payload out
+        of this handle. Resets the in-flight flag so a subsequent
+        migration attempt raises rather than silently re-using the
+        same buffer.
+        """
+        var settings = self._h2c_upgrade_settings^
+        self._h2c_upgrade_settings = List[UInt8]()
+        self._h2c_upgrade_pending = False
+        return settings^
+
+    def on_timeout(mut self) -> StepResult:
+        """Handle an idle / write timer firing.
+
+        Returns a StepResult with ``done=True``. The caller should
+        unregister and close the fd.
+        """
+        self.state = STATE_CLOSING
+        self.should_close = True
+        return StepResult(want_read=False, want_write=False, done=True)
+
+    def close(mut self) -> None:
+        """Explicitly close the underlying stream. Idempotent.
+
+        Normally the caller does not need to call this: the stream's
+        destructor closes the fd when the ``ConnHandle`` is dropped.
+        """
+        self._stream.close()
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _transition_to_writing(mut self) -> StepResult:
+        """Move into STATE_WRITING and tell the caller to watch for write."""
+        self.state = STATE_WRITING
+        # A cleartext interim the kernel took only partly: finish it
+        # before the response bytes already queued in ``write_buf``. (TLS
+        # retries from ``continue_pending`` in ``_flush_write_buf_tls``.)
+        if len(self.continue_pending) > 0 and not self.tls:
+            var framed = List[UInt8](
+                capacity=len(self.continue_pending)
+                + len(self.write_buf)
+                - self.write_pos
+            )
+            for i in range(len(self.continue_pending)):
+                framed.append(self.continue_pending[i])
+            for i in range(self.write_pos, len(self.write_buf)):
+                framed.append(self.write_buf[i])
+            self.write_buf = framed^
+            self.write_pos = 0
+            self.continue_pending.clear()
+        # Reset any stale read state: the next state-machine step is
+        # flushing the response, not reading more bytes.
+        return StepResult(
+            want_read=False,
+            want_write=True,
+            # Clear the idle timer; the write_timeout (if any) arms
+            # separately via StepResult idle_timeout_ms on the first
+            # writable step.
+            idle_timeout_ms=0,
+        )
+
+    def _h2c_upgrade_decode_settings(
+        self, headers: HeaderMap
+    ) raises -> Optional[List[UInt8]]:
+        """Inspect a parsed h1 request's headers and return the decoded
+        ``HTTP2-Settings`` payload iff this is a valid h2c upgrade.
+
+        Returns ``None`` when:
+
+        * The request lacks ``Upgrade: h2c`` + ``HTTP2-Settings``.
+        * The ``HTTP2-Settings`` value isn't valid base64url.
+        * The decoded payload's length isn't a multiple of 6 (an
+          ill-formed SETTINGS body per RFC 7540 §3.2.1).
+        """
+        if not _detect_h2c_upgrade_inline(headers):
+            return Optional[List[UInt8]]()
+        var s = headers.get("http2-settings")
+        if s.byte_length() == 0:
+            return Optional[List[UInt8]]()
+        var decoded: List[UInt8]
+        try:
+            decoded = base64url_decode(s)
+        except:
+            return Optional[List[UInt8]]()
+        if (len(decoded) % 6) != 0:
+            return Optional[List[UInt8]]()
+        return Optional[List[UInt8]](decoded^)
+
+    def _start_h2c_upgrade(
+        mut self, var req: Request, var settings_payload: List[UInt8]
+    ) -> None:
+        """Save the migration payload + queue the ``101 Switching Protocols``
+        response. Caller must have already verified the upgrade is valid via
+        :meth:`_h2c_upgrade_decode_settings`."""
+        self._h2c_upgrade_settings = settings_payload^
+        self._h2c_upgrade_request = Optional[Request](req^)
+        self._h2c_upgrade_pending = True
+        queue_h2c_upgrade_101(self.write_buf)
+        self.write_pos = 0
+
+    def _handle_ws_upgrade(
+        mut self, req: Request, config: ServerConfig
+    ) raises -> Int:
+        """Perform an RFC 6455 upgrade on this connection, if it is one.
+
+        Returns ``False`` -- cheaply and with no side effects -- when
+        the request is not a WebSocket handshake, so the caller falls
+        through to the ordinary unary handler path.
+
+        Returns ``True`` once the handshake has been answered. By then
+        this method has:
+
+        1. Computed ``Sec-WebSocket-Accept`` and written ``101
+           Switching Protocols`` straight to the socket.
+        2. **Detached** the fd from ``self._stream`` -- its ``fd`` is
+           set to ``-1`` so this handle's destructor will not close a
+           socket it no longer owns -- and handed it to a
+           :class:`dodo.ws.WsConnection`, seeded with any frame bytes
+           the reactor had already read past the handshake request.
+        3. Put the socket back into blocking mode, because the WS
+           handler uses blocking ``recv`` exactly as
+           :class:`dodo.ws.WsServer` does.
+        4. With ``config.ws.offload`` unset, run the handler
+           to completion on this thread. With it set, moved the
+           connection onto a detached thread and returned while the
+           handler is still running.
+
+        The caller then returns ``done=True`` so the reactor
+        unregisters the fd; closing it is the ``WsConnection``'s job.
+
+        Cleartext only. A TLS-terminated connection (``self.tls``) has
+        no equivalent seam: ``on_readable`` never calls this method for
+        it and serves the handshake as plain HTTP/1.1 inside TLS, so a
+        TLS-terminated server still needs a separate ``WsServer``.
+        """
+        from dodo.ws.server import (
+            WsConnection,
+            _compute_accept_srv,
+            _send_upgrade_response,
+            _spawn_ws_offload,
+            _upgrade_response,
+            _ws_handshake_problem,
+            ws_offload_try_acquire,
+        )
+        from dodo.net.socket import RawSocket
+        from dodo.net._libc import AF_INET, SOCK_STREAM
+
+        # RFC 6455 4.2.1 qualification: the same rule the standalone
+        # ``WsServer`` applies (``_ws_handshake_problem``), so the two
+        # cannot disagree on what a handshake is. A request that fails it
+        # is served as ordinary HTTP.
+        if (
+            _ws_handshake_problem(
+                req.method,
+                req.version,
+                req.headers.get_all("upgrade"),
+                req.headers.get_all("connection"),
+                req.headers.get_all("sec-websocket-key"),
+                req.headers.get_all("sec-websocket-version"),
+            ).byte_length()
+            != 0
+        ):
+            return _WS_NOT_HANDSHAKE
+        if config.ws.reactor and self.h2c_upgrade_allowed:
+            self._ws_prebuf = List[UInt8]()
+            if self.body_total >= 0 and self.body_total < len(self.read_buf):
+                self._ws_prebuf.extend(
+                    Span[UInt8, _](self.read_buf)[
+                        self.body_total : len(self.read_buf)
+                    ]
+                )
+            self.read_buf.clear()
+            var reactor_origins = req.headers.get_all("origin")
+            self._ws_origin = String("")
+            if len(reactor_origins) > 0:
+                self._ws_origin = reactor_origins[
+                    len(reactor_origins) - 1
+                ].copy()
+            self.write_buf.clear()
+            self.write_buf.extend(
+                _upgrade_response(
+                    _compute_accept_srv(req.headers.get("sec-websocket-key"))
+                ).as_bytes()
+            )
+            self.write_pos = 0
+            self._ws_upgrade_pending = True
+            return _WS_ON_REACTOR
+        if not config.ws.handler:
+            return _WS_NOT_HANDSHAKE
+        if config.ws.offload and not ws_offload_try_acquire(
+            config.ws.max_offloaded
+        ):
+            return _WS_REFUSED
+        var ws_key = req.headers.get("sec-websocket-key")
+
+        var accept = _compute_accept_srv(ws_key)
+
+        # A client is allowed to send its first frame in the same
+        # segment as the handshake. Those bytes are already sitting in
+        # ``read_buf`` past the request, and the reactor is about to
+        # stop reading this fd, so they have to travel with the
+        # connection or they are lost.
+        var prebuf = List[UInt8]()
+        if self.body_total >= 0 and self.body_total < len(self.read_buf):
+            for i in range(self.body_total, len(self.read_buf)):
+                prebuf.append(self.read_buf[i])
+
+        # Hand over the fd. Zeroing it here is what stops this handle's
+        # destructor from closing the socket the WsConnection owns.
+        var fd = self._stream._socket.fd
+        var peer = self.peer
+        self._stream._socket.fd = c_int(-1)
+
+        var raw = RawSocket(fd, AF_INET, SOCK_STREAM, _wrap=True)
+        raw.set_nonblocking(False)
+        var stream = TcpStream(raw^, peer)
+
+        _send_upgrade_response(stream, accept)
+        # Same rule as WsServer's handshake reader: a repeated Origin
+        # keeps the last value. This path used to pass nothing, so an
+        # allow-list check in the handler saw "" for every client.
+        var origins = req.headers.get_all("origin")
+        var origin = String("")
+        if len(origins) > 0:
+            origin = origins[len(origins) - 1].copy()
+        var conn = WsConnection(stream^, peer, prebuf^, origin^)
+        if config.ws.offload:
+            # Off-reactor: the connection gets its own detached thread so
+            # this worker returns now and keeps serving every other fd,
+            # instead of parking for the WebSocket's whole lifetime. The
+            # fd is already detached from the reactor and back in
+            # blocking mode, so that thread owns it end to end.
+            _spawn_ws_offload(conn^, config.ws.handler.value())
+            return _WS_UPGRADED
+        config.ws.handler.value()(conn)
+        return _WS_UPGRADED
+
+    def _note_head_from_buf(mut self):
+        """While the request head has not been fully scanned
+        (``headers_end < 0``) the method is read off the buffered request
+        line, so an error queued now (431 / 408 / 413 ...) is answered
+        without content when it replies to a HEAD (APP-05). Once the head
+        is scanned the flag is left alone: after dispatch ``read_buf`` may
+        already start with the next pipelined request."""
+        if self.headers_end < 0:
+            self.head_request = _starts_with_head(self.read_buf)
+
+    def _queue_error(mut self, status: Int, reason: String) -> None:
+        """Build a minimal error response into ``write_buf`` and mark close.
+
+        The response is serialised with ``self.head_request`` so an error
+        answering a HEAD request carries no content (APP-05)."""
+        self.should_close = True
+        var resp = build_error_response(status, reason)
+        self._serialize_response(resp, False)
+
+    def _serialize_static(
+        mut self,
+        resp: StaticResponse,
+        keep_alive: Bool,
+        head_request: Bool = False,
+    ) -> None:
+        """Queue a pre-encoded static response into ``write_buf``."""
+        serialize_static_into(
+            self.write_buf, self.write_pos, resp, keep_alive, head_request
+        )
+        self.write_pos = 0
+
+    def _serialize_response(mut self, resp: Response, keep_alive: Bool) -> None:
+        """Serialise ``resp`` into ``write_buf`` ready to be sent."""
+        serialize_response_into(
+            self.write_buf,
+            self._date_cache,
+            resp,
+            keep_alive,
+            self.head_request,
+        )
+        self.write_pos = 0
+
+    def _serialize_response_chunked(
+        mut self, resp: Response, keep_alive: Bool
+    ) -> None:
+        """Serialise ``resp``'s chunked headers (K1 streaming path)."""
+        serialize_response_headers_chunked_into(
+            self.write_buf, self._date_cache, resp, keep_alive
+        )
+        self.write_pos = 0
+
+    def _stream_refill(mut self) raises -> Bool:
+        """Refill ``write_buf`` with up to ``STREAM_BATCH_CHUNKS`` framed
+        chunks (or the terminator) from ``body_src``. Returns ``True``
+        when bytes were queued, ``False`` when nothing could be queued.
+
+        Called only when ``write_buf`` is fully flushed and ``body_src``
+        is set. Framing several chunks per call is what keeps a response
+        of N small chunks from costing N reactor turns and N sends; the
+        batch ends at ``STREAM_BATCH_CHUNKS``, at ``STREAM_BATCH_BYTES``,
+        at end-of-stream, or at the first empty chunk.
+
+        An empty chunk ends the batch rather than being skipped: a source
+        with nothing to hand over right now must not be re-polled in a
+        tight loop. A ``False`` return therefore means "alive but idle"
+        whenever ``body_src`` is still set, and the caller re-arms.
+        """
+        if not self.body_src:
+            return False
+        var cancel = self.cancel_cell.handle()
+        self.write_buf.clear()
+        self.write_pos = 0
+        var framed = 0
+        while (
+            framed < STREAM_BATCH_CHUNKS
+            and len(self.write_buf) < STREAM_BATCH_BYTES
+        ):
+            var chunk_opt = self.body_src.value().next(cancel)
+            if not chunk_opt:
+                # End-of-stream: queue the terminator and drop the
+                # source so the next flush-complete transitions normally.
+                frame_terminator_into(self.write_buf)
+                self.body_src = Optional[ChunkSourceBox]()
+                return True
+            if len(chunk_opt.value()) == 0:
+                break
+            frame_chunk_into(self.write_buf, chunk_opt.value())
+            framed += 1
+        return len(self.write_buf) > 0

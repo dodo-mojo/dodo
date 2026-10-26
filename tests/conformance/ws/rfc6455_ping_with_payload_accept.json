@@ -1,0 +1,10 @@
+{
+  "name": "2.1.1_ping_with_payload",
+  "spec": "RFC 6455 §5.5.2 (Ping control frame)",
+  "input_hex": "89 05 48 65 6c 6c 6f",
+  "expect": "accept",
+  "expect_reason": "FIN=1 OP=PING (0x9) len=5 payload='Hello' -- control frame payload <= 125 bytes per §5.5",
+  "expected_opcode": 9,
+  "expected_fin": true,
+  "expected_payload_hex": "48 65 6c 6c 6f"
+}

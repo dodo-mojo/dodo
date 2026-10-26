@@ -1,0 +1,948 @@
+"""HTTP/2 server glue (RFC 9113).
+
+Connects :mod:`dodo.http2.frame` + :mod:`dodo.http2.hpack` +
+:mod:`dodo.http2.state` to dodo's existing ``Handler`` interface.
+
+The high-level surface:
+
+- :class:`Http2Connection` — a synchronous, buffer-driven driver. The
+  caller feeds it inbound bytes (``feed``) and pulls outbound bytes
+  (``drain``). When a stream's request is complete, :meth:`take_request`
+  yields a :class:`dodo.http.Request` ready for a normal Handler.
+  After the handler produces a :class:`dodo.http.Response`,
+  :meth:`emit_response` schedules the appropriate ``HEADERS [+ DATA]``
+  frames.
+
+- :func:`detect_h2c_upgrade` — sniff an inbound HTTP/1.1 request for
+  ``Connection: Upgrade, HTTP2-Settings`` + ``Upgrade: h2c`` and
+  return ``True`` when the connection should switch protocols. The
+  caller is responsible for emitting the 101 response and then
+  driving the connection through :class:`Http2Connection`.
+
+- :func:`is_h2_alpn` — string match for ``"h2"`` so TLS code paths
+  can dispatch from ALPN.
+
+This is enough to ship a working server today while preserving the
+plumbing for a future async / reactor integration: the driver does
+not own its sockets, so the same code works in a unit test that
+shoves bytes through it directly *and* in the reactor's per-fd
+callback.
+"""
+
+from std.collections import Dict, Optional
+
+from dodo.http.wire import (
+    HeaderMap,
+    Method,
+    Request,
+    Response,
+    trailer_field_allowed,
+)
+
+from .frame import (
+    Frame,
+    FrameFlags,
+    FrameType,
+    H2_DEFAULT_FRAME_SIZE,
+    H2_PREFACE,
+    encode_frame,
+    encode_frame_header_into,
+    encode_frame_into,
+    parse_frame,
+)
+from .hpack import HpackHeader
+from dodo.http.proto.h2_config import (
+    Http2Config,
+    _H2_DEFAULT_HEADER_TABLE_SIZE,
+    _H2_DEFAULT_INITIAL_WINDOW_SIZE,
+    _H2_DEFAULT_MAX_CONCURRENT_STREAMS,
+    _H2_DEFAULT_MAX_FRAME_SIZE,
+    _H2_DEFAULT_MAX_HEADER_LIST_SIZE,
+)
+from .state import (
+    Connection,
+    Http2ErrorCode,
+    Stream,
+    StreamState,
+    h2_setting_error,
+)
+
+
+def _lower_ascii(k: String) -> String:
+    """Lowercase ASCII ``A-Z`` in a header name (HTTP/2 requires
+    lowercase field names, RFC 9113 8.2.1)."""
+    var out = String(capacity_bytes=k.byte_length() + 1)
+    var kp = k.unsafe_ptr()
+    for j in range(k.byte_length()):
+        var c = Int(kp[unsafe_offset=j])
+        if c >= 65 and c <= 90:
+            out += chr(c + 32)
+        else:
+            out += chr(c)
+    return out^
+
+
+# ── ALPN / h2c detection ────────────────────────────────────────────────
+
+
+def is_h2_alpn(alpn: String) -> Bool:
+    """Return True when the negotiated ALPN protocol is HTTP/2."""
+    return alpn == "h2"
+
+
+def detect_h2c_upgrade(headers: HeaderMap) -> Bool:
+    """RFC 7540 §3.2 — detect inbound ``Upgrade: h2c`` request.
+
+    Delegates to :func:`dodo.http.proto.h2c_upgrade.detect_h2c_upgrade`,
+    the canonical sans-I/O implementation. The decoded
+    ``HTTP2-Settings`` payload is fed into the connection during
+    initialisation by the caller via
+    :meth:`Http2Connection.feed_settings_payload` — that step is the
+    reactor-bound side of the upgrade and does not happen here.
+    """
+    from dodo.http.proto.h2c_upgrade import (
+        detect_h2c_upgrade as _proto_detect_h2c_upgrade,
+    )
+
+    return _proto_detect_h2c_upgrade(headers)
+
+
+# ── Http2Connection driver ─────────────────────────────────────────────────
+
+
+struct Http2Connection(Defaultable, Movable):
+    """Synchronous HTTP/2 driver with separate I/O sides.
+
+    A pure state object: the caller drives I/O. It exposes:
+
+    - :meth:`feed` — push inbound bytes; returns any reply frames
+      (already encoded) that the state machine generated.
+    - :meth:`drain` — pull queued outbound frames as bytes.
+    - :meth:`take_completed_streams` — pop ids whose request is
+      ready for handler dispatch.
+    - :meth:`take_request` — convert one stream into a plain
+      ``Request`` (a :class:`dodo.http.Request`).
+    - :meth:`emit_response` — schedule the response frames for a
+      finished handler invocation.
+    """
+
+    var conn: Connection
+    var inbox: List[UInt8]
+    var outbox: List[UInt8]
+    var greeted: Bool
+    var peer_settings_seen: Bool
+    """True once the peer's first frame, a non-ACK SETTINGS, has arrived.
+
+    RFC 9113 sec 3.4: the client preface "MUST be followed by a SETTINGS
+    frame"; any other first frame is a connection error of type
+    PROTOCOL_ERROR."""
+    var config: Http2Config
+    """The :class:`Http2Config` the driver was constructed with.
+    Kept on the driver so the reactor wiring can re-read
+    individual fields per-stream (e.g. the
+    ``max_header_list_size`` cap when applying inbound HEADERS)
+    without threading it through every per-frame call site."""
+    var pending_body: Dict[Int, List[UInt8]]
+    """Response bytes for a stream that the send window would not take.
+
+    RFC 9113 sec 6.9: a peer that advertises a small window must not be
+    handed more than it asked for. Whatever does not fit waits here and
+    is re-pumped when a WINDOW_UPDATE arrives."""
+    var pending_pos: Dict[Int, Int]
+    """Offset already flushed out of the matching ``pending_body``."""
+    var pending_trailers_k: Dict[Int, List[String]]
+    """Trailer names to send once the matching ``pending_body`` drains."""
+    var pending_trailers_v: Dict[Int, List[String]]
+    """Trailer values, parallel to ``pending_trailers_k``."""
+
+    def __init__(out self):
+        """Default-construct with :class:`Http2Config` defaults.
+
+        Equivalent to ``Http2Connection.with_config(Http2Config())``;
+        kept as a separate ``__init__`` so callers (``Http2Connection()``
+        in tests + the inline driver) work byte-for-byte without
+        an explicit config argument.
+        """
+        self.conn = Connection()
+        self.inbox = List[UInt8]()
+        self.outbox = List[UInt8]()
+        self.greeted = False
+        self.peer_settings_seen = False
+        self.config = Http2Config()
+        self.pending_body = Dict[Int, List[UInt8]]()
+        self.pending_pos = Dict[Int, Int]()
+        self.pending_trailers_k = Dict[Int, List[String]]()
+        self.pending_trailers_v = Dict[Int, List[String]]()
+
+    @staticmethod
+    def with_config(var config: Http2Config) raises -> Http2Connection:
+        """Construct an :class:`Http2Connection` whose underlying
+        :class:`Connection` SETTINGS are populated from ``config``.
+
+        Validates ``config`` first (RFC 9113 / RFC 7541 bounds);
+        raises if any field is out of range. The resulting driver's
+        first-emitted SETTINGS frame advertises
+        ``max_concurrent_streams`` per the config; later inbound
+        SETTINGS from the peer can lower the negotiated values per
+        RFC 9113 §6.5.
+
+        The HPACK dynamic-table size budget is propagated to the
+        decoder. The ``allow_huffman_decode`` flag is plumbed
+        into ``conn.hpack_decoder.allow_huffman``; the
+        ``allow_huffman_encode`` flag into
+        ``conn.hpack_encoder.allow_huffman``. Both default to
+        ``False`` so the wire format stays byte-identical to the
+        legacy default unless the user opts in.
+        """
+        config.validate()
+        var out = Http2Connection()
+        out.config = config^
+        out.conn.max_concurrent_streams = out.config.max_concurrent_streams
+        out.conn.max_request_body_size = out.config.max_body_size
+        out.conn.initial_window_size = out.config.initial_window_size
+        # RFC 9113 sec 6.9.2: the connection-level windows start at
+        # 65535 whatever SETTINGS say; only WINDOW_UPDATE on stream 0
+        # moves them. Seeding the send window from *our* setting let us
+        # overrun a peer that advertised the default.
+        out.conn.send_window = 65535
+        out.conn.recv_window = 65535
+        # What we advertise is the largest frame we accept. The largest we
+        # send is the peer's to set (RFC 9113 sec 4.2): it stays at 16384
+        # until the peer's SETTINGS_MAX_FRAME_SIZE raises it.
+        out.conn.local_max_frame_size = out.config.max_frame_size
+        out.conn.max_header_list_size = out.config.max_header_list_size
+        # What we advertise is the ceiling for a peer size update
+        # (RFC 7541 sec 6.3). The decoder's *current* size stays at the
+        # 4096 default: the peer's encoder keeps that table until it has
+        # received our SETTINGS and sent a size update (sec 4.2), so
+        # shrinking now would drop entries it still indexes (HPACK-03).
+        out.conn.hpack_decoder.settings_max_size = out.config.header_table_size
+        out.conn.hpack_decoder.allow_huffman = out.config.allow_huffman_decode
+        out.conn.hpack_encoder.allow_huffman = out.config.allow_huffman_encode
+        out.conn.enable_connect_protocol = out.config.enable_connect_protocol
+        # The ``HpackEncoder`` does not maintain a dynamic table
+        # (always Literal-without-Indexing per RFC 7541 §6.2.2);
+        # the ``header_table_size`` field on ``Http2Config`` is
+        # consumed by the decoder side only until the encoder
+        # grows a dynamic table. The peer's announced
+        # HEADER_TABLE_SIZE is still honoured on inbound
+        # SETTINGS via ``Connection.handle_frame``.
+        return out^
+
+    def _emit_initial_settings(mut self):
+        """Server-side handshake: send our SETTINGS once."""
+        if self.greeted:
+            return
+        var f = self.conn.initial_settings()
+        encode_frame_into(f, self.outbox)
+        self.greeted = True
+
+    @staticmethod
+    def from_h2c_upgrade(
+        var config: Http2Config,
+        req: Request,
+        settings_payload: List[UInt8],
+    ) raises -> Http2Connection:
+        """Build a server-side :class:`Http2Connection` seeded for an h2c upgrade.
+
+        Per RFC 7540 §3.2 ("Starting HTTP/2 for HTTP URIs"), the original
+        HTTP/1.1 request becomes stream id 1 (implicitly half-closed from
+        the client side), and the ``HTTP2-Settings`` header value (the
+        raw SETTINGS payload, base64url-decoded) is applied to the
+        connection immediately. The server emits its initial SETTINGS
+        frame as the server connection preface; the client's connection
+        preface (``PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n`` + a SETTINGS
+        frame) still arrives over the same TCP fd and is processed by
+        :meth:`feed` as usual.
+
+        Args:
+            config: Server SETTINGS to advertise. Validated by
+                :meth:`with_config`.
+            req: The original HTTP/1.1 request that triggered the
+                upgrade. Becomes stream id 1 in
+                ``HALF_CLOSED_REMOTE`` state with
+                ``headers_complete = data_complete = True`` so the
+                handler dispatch loop picks it up immediately.
+            settings_payload: Raw bytes of the
+                ``HTTP2-Settings`` header value (base64url-decoded).
+                Format is identical to a SETTINGS frame body
+                (repeated 6-byte ``(id, value)`` pairs). Applied
+                directly to the connection state without emitting a
+                SETTINGS_ACK -- the ACK on the wire is reserved for
+                the proper SETTINGS frame the client sends inside
+                its connection preface.
+
+        Returns:
+            An :class:`Http2Connection` whose ``outbox`` already holds
+            the server's initial SETTINGS frame and whose ``conn.streams``
+            already contains stream 1 ready for handler dispatch via
+            :meth:`take_completed_streams`.
+        """
+        var out = Http2Connection.with_config(config^)
+        # Apply the upgrade-time SETTINGS payload manually so the
+        # subsequent ``handle_frame`` loop doesn't auto-emit a
+        # SETTINGS_ACK for these (RFC 7540 §3.2.1: the client expects
+        # an ACK only for the SETTINGS frame in its connection
+        # preface, not for the ``HTTP2-Settings`` header).
+        if (len(settings_payload) % 6) != 0:
+            raise Error("h2c upgrade: HTTP2-Settings payload not multiple of 6")
+        var i = 0
+        while i + 6 <= len(settings_payload):
+            var id = (Int(settings_payload[i]) << 8) | Int(
+                settings_payload[i + 1]
+            )
+            var v = (
+                (Int(settings_payload[i + 2]) << 24)
+                | (Int(settings_payload[i + 3]) << 16)
+                | (Int(settings_payload[i + 4]) << 8)
+                | Int(settings_payload[i + 5])
+            )
+            # Same bounds as a SETTINGS frame. This path applied the
+            # header's values unchecked, and MAX_FRAME_SIZE=0 then made
+            # every response body loop forever emitting empty DATA
+            # frames.
+            if h2_setting_error(id, v) != 0:
+                raise Error(
+                    "h2c upgrade: invalid HTTP2-Settings value for setting "
+                    + String(id)
+                )
+            if id == 0x1:
+                out.conn.peer_header_table_size = v
+            elif id == 0x4:
+                out.conn.peer_initial_window_size = v
+            elif id == 0x5:
+                out.conn.max_frame_size = v
+            elif id == 0x8:
+                out.conn.peer_enable_connect_protocol = v != 0
+            i += 6
+
+        # Pre-create stream 1 with the original request, half-closed
+        # from the client side (RFC 7540 §3.2: the upgrade request is
+        # implicitly END_STREAM-ed on stream 1).
+        var s = Stream()
+        s.id = 1
+        s.state = StreamState.HALF_CLOSED_REMOTE()
+        s.send_window = out.conn.peer_initial_window_size
+        s.recv_window = out.conn.initial_window_size
+        s.headers.append(HpackHeader(":method", req.method))
+        s.headers.append(HpackHeader(":scheme", "http"))
+        var path = req.url
+        s.headers.append(HpackHeader(":path", path))
+        var host = req.headers.get("host")
+        if host.byte_length() == 0:
+            host = req.headers.get("Host")
+        if host.byte_length() > 0:
+            s.headers.append(HpackHeader(":authority", host))
+        # Carry over the user headers, skipping the connection-level
+        # ones that don't apply on h2 (RFC 9113 §8.2.2).
+        for j in range(len(req.headers._keys)):
+            var k = req.headers._keys[j]
+            var lk = String("")
+            for c in range(k.byte_length()):
+                var ch = Int(k.unsafe_ptr()[unsafe_offset=c])
+                if ch >= 65 and ch <= 90:
+                    lk += chr(ch + 32)
+                else:
+                    lk += chr(ch)
+            if (
+                lk == "host"
+                or lk == "connection"
+                or lk == "upgrade"
+                or lk == "http2-settings"
+                or lk == "transfer-encoding"
+                or lk == "keep-alive"
+                or lk == "proxy-connection"
+            ):
+                continue
+            s.headers.append(HpackHeader(lk, req.headers._values[j]))
+        s.data.extend(Span(req.body))
+        s.initial_header_count = len(s.headers)
+        s.headers_complete = True
+        s.data_complete = True
+        out.conn.streams[1] = s^
+
+        # Emit the server's initial SETTINGS frame as the server
+        # connection preface so the client sees it before its own
+        # connection preface arrives. ``greeted = True`` afterwards
+        # means a subsequent ``feed`` won't double-emit.
+        out._emit_initial_settings()
+
+        return out^
+
+    def feed(mut self, data: Span[UInt8, _]) raises:
+        """Push ``data`` (bytes from the socket) into the driver."""
+        self.inbox.extend(data)
+
+        # Strip the 24-byte preface once.
+        if not self.conn.preface_seen:
+            if len(self.inbox) < 24:
+                return
+            var preface = String(H2_PREFACE)
+            var pp = preface.unsafe_ptr()
+            for i in range(24):
+                if self.inbox[i] != pp[unsafe_offset=i]:
+                    # RFC 9113 sec 3.4: answer a bad preface with
+                    # GOAWAY(PROTOCOL_ERROR) and close. Raising instead
+                    # dropped the connection with no frame, leaving the
+                    # peer to time out rather than learn why.
+                    if not self.conn.goaway_sent:
+                        self.conn.goaway_sent = True
+                        var ga = self.conn._goaway_frame(
+                            0, Http2ErrorCode.PROTOCOL_ERROR().value
+                        )
+                        encode_frame_into(ga, self.outbox)
+                    self.inbox = List[UInt8]()
+                    return
+            # Drop the preface from the inbox.
+            var rest = List[UInt8](capacity=len(self.inbox) - 24)
+            rest.extend(Span(self.inbox)[24:])
+            self.inbox = rest^
+            self.conn.preface_seen = True
+            self._emit_initial_settings()
+
+        # Drain frames until we run out of complete ones. Frames are
+        # read from a cursor and the inbox is compacted once at the end:
+        # copying the rest of the inbox after every frame made a burst of
+        # small frames quadratic (1 MiB of 9-byte frames is ~60 GiB of
+        # copying).
+        var off = 0
+        while True:
+            # A connection error ends the connection (RFC 9113 sec
+            # 5.4.1). Frames after the GOAWAY used to keep being applied,
+            # so streams above its last-stream-id were still dispatched
+            # -- work the peer will retry elsewhere -- and a flood the
+            # GOAWAY answered was still being processed.
+            if self.conn.goaway_sent:
+                self.inbox = List[UInt8]()
+                return
+            var avail = len(self.inbox) - off
+            # sec 4.2: refuse an oversized frame from its header, before
+            # buffering up to 16 MiB of payload we will reject anyway.
+            if avail >= 9:
+                var declared = (
+                    (Int(self.inbox[off]) << 16)
+                    | (Int(self.inbox[off + 1]) << 8)
+                    | Int(self.inbox[off + 2])
+                )
+                if declared > self.conn.local_max_frame_size:
+                    var gerr = self.conn._conn_error(
+                        Http2ErrorCode.FRAME_SIZE_ERROR().value
+                    )
+                    for gi in range(len(gerr)):
+                        encode_frame_into(gerr[gi], self.outbox)
+                    self.inbox = List[UInt8]()
+                    return
+            var span = Span[UInt8, _](self.inbox)[off:]
+            var got = parse_frame(span)
+            if not got:
+                break
+            var frame = got.take()
+            off += 9 + frame.header.length
+            var reply: List[Frame]
+            if not self.peer_settings_seen and not (
+                frame.header.type.value == FrameType.SETTINGS().value
+                and not frame.header.flags.has(FrameFlags.ACK())
+            ):
+                # sec 3.4: the preface must be followed by a SETTINGS
+                # frame (an ACK answers ours, which the peer cannot have
+                # seen yet); anything else first is an invalid preface.
+                reply = self.conn._conn_error(
+                    Http2ErrorCode.PROTOCOL_ERROR().value
+                )
+            else:
+                self.peer_settings_seen = True
+                reply = self.conn.handle_frame(frame^)
+            for i in range(len(reply)):
+                encode_frame_into(reply[i], self.outbox)
+            # A WINDOW_UPDATE in that frame may have unparked response
+            # bytes; nothing else re-drives them.
+            self.pump_pending()
+        if off > 0:
+            var rest = List[UInt8](capacity=len(self.inbox) - off)
+            rest.extend(Span[UInt8, _](self.inbox)[off:])
+            self.inbox = rest^
+
+    def drain(mut self) -> List[UInt8]:
+        """Return all queued outbound bytes and clear the buffer.
+
+        The buffer is handed over rather than copied: it holds whatever was
+        framed since the last drain, which for a streaming response is a
+        window's worth of body.
+        """
+        var out = self.outbox^
+        self.outbox = List[UInt8]()
+        return out^
+
+    def _mark_response_started(mut self, sid: Int) raises:
+        """Record that ``sid`` has had a response scheduled.
+
+        Called by both response paths. Idempotent, and a no-op on a
+        stream that is already gone.
+        """
+        if sid not in self.conn.streams:
+            return
+        var s = self.conn.streams[sid].copy()
+        s.response_started = True
+        self.conn.streams[sid] = s^
+
+    def take_completed_streams(self) -> List[Int]:
+        """Return stream ids whose request is fully buffered.
+
+        A stream already dispatched is excluded by ``Stream.slab_ready``:
+        ``emit_response`` moves a fully written one to ``CLOSED``, and
+        ``response_started`` covers a response parked in ``pending_body``
+        whose stream stays open until the window drains, so a
+        WINDOW_UPDATE never re-runs the handler (RFC 9113 sec 8.1).
+        """
+        return self.conn.streams.ready_ids()
+
+    def take_reset_streams(mut self) -> List[Int]:
+        """Pop the list of stream ids reset by the peer since the
+        last call.
+
+        Each id corresponds to an inbound RST_STREAM frame
+        (RFC 9113 §6.4) processed by :class:`Connection.handle_frame`.
+        Used by :class:`dodo.http._h2_conn_handle.Http2ConnHandle` to
+        flip the matching per-stream :class:`CancelCell` so the
+        in-flight handler can short-circuit cooperatively. The list
+        is drained -- a second call returns an empty list unless a
+        new RST_STREAM has arrived in the meantime.
+        """
+        var out = self.conn.reset_streams^
+        self.conn.reset_streams = List[Int]()
+        return out^
+
+    def goaway_received_flag(self) -> Bool:
+        """Return ``True`` once the peer has sent a GOAWAY frame
+        (RFC 9113 §6.8). The reactor checks this between dispatches
+        to flip the per-stream cancel cells before draining the
+        connection."""
+        return self.conn.goaway_received
+
+    def take_request(mut self, sid: Int) raises -> Request:
+        """Convert stream ``sid`` into a :class:`dodo.http.Request`."""
+        if sid not in self.conn.streams:
+            raise Error("h2: take_request on unknown stream")
+        # The request takes the stream's header list and body, which the
+        # stream no longer needs once dispatched.
+        var s = self.conn.streams.pop(sid)
+        var fields = List[HpackHeader]()
+        swap(fields, s.headers)
+        var req = Request(method="GET", url="/", version="HTTP/2")
+        swap(req.body, s.data)
+        var initial = s.initial_header_count
+        self.conn.streams[sid] = s^
+        req.headers.reserve(initial)
+        # Fields are appended, not set: a repeated field keeps every
+        # value, as on HTTP/1.1. ``set`` kept only the last, and browsers
+        # send cookies as one field per crumb (RFC 9113 sec 8.2.3), so a
+        # handler behind h2 saw only the last cookie.
+        var cookie = String("")
+        for i in range(initial, len(fields)):
+            if trailer_field_allowed(fields[i].name):
+                req.trailers.append(fields[i].name, fields[i].value)
+        for i in range(initial):
+            ref n = fields[i].name
+            ref v = fields[i].value
+            if n == ":method":
+                req.method = v
+            elif n == ":path":
+                req.url = v
+            elif n == ":authority":
+                req.headers.set("Host", v)
+            elif n == ":scheme":
+                pass  # the reactor knows the scheme already
+            elif n == "cookie":
+                # sec 8.2.3: concatenate crumbs with "; " before handing
+                # them to an HTTP/1.1-shaped consumer.
+                if cookie.byte_length() > 0:
+                    cookie += "; "
+                cookie += v
+            elif n == "host" and req.headers.contains("Host"):
+                pass  # :authority wins (sec 8.3.1)
+            else:
+                req.headers.append(n, v)
+        if cookie.byte_length() > 0:
+            req.headers.append("cookie", cookie)
+        # The body counted against the connection's buffered-request
+        # budget.
+        var credit = self.conn.release_request_credit(len(req.body))
+        for i in range(len(credit)):
+            self.outbox.extend(Span(encode_frame(credit[i])))
+        return req^
+
+    def emit_response(mut self, sid: Int, var resp: Response) raises:
+        """Encode + queue the response for ``sid``.
+
+        The connection's stream state is advanced to ``CLOSED`` after
+        the response is queued, mirroring HTTP/1.1's per-request
+        lifetime in the server. When ``resp.trailers`` is non-empty the
+        response is framed as HEADERS [+ DATA] + trailing HEADERS with
+        END_STREAM on the trailing block (the gRPC-over-HTTP/2 shape);
+        otherwise it frames as a single buffered response.
+
+        There are still no streaming-response bodies on h2 here (one
+        buffered DATA frame per stream). Chunked/flow-controlled h2
+        response bodies come with the streaming reactor wiring.
+        """
+        if sid not in self.conn.streams:
+            raise Error("h2: emit_response on unknown stream")
+        self._mark_response_started(sid)
+        # Window-aware buffered response (RFC 9113 sec 6.9 / sec 4.2): a
+        # peer that advertised a 1-byte window gets 1 byte now and the
+        # rest on its WINDOW_UPDATE, and a body past max_frame_size is
+        # split rather than sent as one oversized frame.
+        #
+        # Only taken when the body does not fit; the common case keeps
+        # the one-shot framing below, END_STREAM riding the single DATA
+        # frame, so the wire shape is unchanged for ordinary responses.
+        #
+        # Trailers ride the same path, sent once the body has drained.
+        # They used to force the one-shot framing whatever the body size,
+        # and every gRPC response has trailers, so a gRPC body over 16 KiB
+        # went out as one oversized DATA frame (FRAME_SIZE_ERROR) and
+        # ignored the peer's window (FLOW_CONTROL_ERROR).
+        if len(resp.body) > 0:
+            var st = self.conn.streams[sid].copy()
+            var budget = (
+                self.conn.send_window if self.conn.send_window
+                < st.send_window else st.send_window
+            )
+            var too_big = (
+                len(resp.body) > budget
+                or len(resp.body) > self.conn.max_frame_size
+            )
+            if too_big:
+                var body = List[UInt8]()
+                swap(body, resp.body)
+                var tk = resp.trailers._keys.copy()
+                var tv = resp.trailers._values.copy()
+                self.begin_stream_response(sid, resp^)
+                var n = self.queue_stream_data(sid, Span[UInt8, _](body))
+                if n < len(body):
+                    self.pending_body[sid] = body^
+                    self.pending_pos[sid] = n
+                    if len(tk) > 0:
+                        self.pending_trailers_k[sid] = tk^
+                        self.pending_trailers_v[sid] = tv^
+                    return  # open until the remainder drains
+                self.end_stream_response(sid, tk, tv)
+                return
+        # Build HpackHeader list from the response's HeaderMap.
+        # HTTP/2 forbids ``Connection`` / ``Transfer-Encoding`` / ``Keep-Alive``
+        # / ``Proxy-Connection`` / ``Upgrade`` per RFC 9113 §8.2.2.
+        var hdrs = List[HpackHeader](capacity=len(resp.headers._keys))
+        for i in range(len(resp.headers._keys)):
+            var k = resp.headers._keys[i]
+            var v = resp.headers._values[i]
+            var lk = String(capacity_bytes=k.byte_length() + 1)
+            var kp = k.unsafe_ptr()
+            for j in range(k.byte_length()):
+                var c = Int(kp[unsafe_offset=j])
+                if c >= 65 and c <= 90:
+                    lk += chr(c + 32)
+                else:
+                    lk += chr(c)
+            if (
+                lk == "connection"
+                or lk == "transfer-encoding"
+                or lk == "keep-alive"
+                or lk == "proxy-connection"
+                or lk == "upgrade"
+            ):
+                continue
+            hdrs.append(HpackHeader(lk, v))
+        # Trailing HEADERS (e.g. gRPC ``grpc-status``): only regular
+        # field names are legal after the leading block, and the
+        # forbidden-connection-header filter is unnecessary because
+        # trailers never carry hop-by-hop fields in practice.
+        var trailers = List[HpackHeader]()
+        for i in range(len(resp.trailers._keys)):
+            var tk = resp.trailers._keys[i]
+            var tv = resp.trailers._values[i]
+            var ltk = String(capacity_bytes=tk.byte_length() + 1)
+            var tkp = tk.unsafe_ptr()
+            for j in range(tk.byte_length()):
+                var tc = Int(tkp[unsafe_offset=j])
+                if tc >= 65 and tc <= 90:
+                    ltk += chr(tc + 32)
+                else:
+                    ltk += chr(tc)
+            trailers.append(HpackHeader(ltk, tv))
+        var frames = self.conn.make_response_with_trailers(
+            sid,
+            resp.status,
+            Span[HpackHeader, _](hdrs),
+            Span[UInt8, _](resp.body),
+            Span[HpackHeader, _](trailers),
+        )
+        for i in range(len(frames)):
+            encode_frame_into(frames[i], self.outbox)
+        var s = self.conn.streams[sid].copy()
+        s.state = StreamState.CLOSED()
+        # The body fit the window, and it still spends it: without this
+        # the windows never shrank, so concurrent small responses each
+        # passed the check against the same stale budget, and after ~2
+        # GiB the peer's WINDOW_UPDATEs pushed the counter past 2^31-1
+        # and we sent GOAWAY to a healthy peer.
+        s.send_window -= len(resp.body)
+        self.conn.send_window -= len(resp.body)
+        self.conn.streams[sid] = s^
+
+    def _stream_still_sendable(self, sid: Int) raises -> Bool:
+        """``sid`` exists and is not CLOSED, so response frames for it
+        can still go out."""
+        if sid not in self.conn.streams:
+            return False
+        return self.conn.streams[sid].state.value != StreamState.CLOSED().value
+
+    def pump_pending(mut self) raises:
+        """Flush response bytes parked by a closed send window.
+
+        Called after every inbound frame: a WINDOW_UPDATE is what
+        unblocks them, and nothing else re-drives the stream."""
+        if len(self.pending_body) == 0:
+            return
+        var sids = List[Int]()
+        for entry in self.pending_body.items():
+            sids.append(entry.key)
+        for i in range(len(sids)):
+            var sid = sids[i]
+            if not self._stream_still_sendable(sid):
+                # The peer reset it (or it closed some other way): the
+                # parked bytes can never be sent. Holding them kept the
+                # whole body in memory for the life of the connection,
+                # and closed streams do not count against the
+                # concurrency limit, so a client could pile them up.
+                _ = self.pending_body.pop(sid)
+                _ = self.pending_pos.pop(sid)
+                if sid in self.pending_trailers_k:
+                    _ = self.pending_trailers_k.pop(sid)
+                    _ = self.pending_trailers_v.pop(sid)
+                continue
+            var pos = self.pending_pos[sid]
+            # Moved out and back rather than borrowed: the body lives in
+            # `self` and the call below takes `self` mutably. A `List` move is
+            # a pointer transfer, so this costs nothing per pump.
+            var body = self.pending_body.pop(sid)
+            var total = len(body)
+            var n = self.queue_parked_body(sid, Span(body), pos)
+            if pos + n >= total:
+                _ = self.pending_pos.pop(sid)
+                var tk = List[String]()
+                var tv = List[String]()
+                if sid in self.pending_trailers_k:
+                    tk = self.pending_trailers_k.pop(sid)
+                    tv = self.pending_trailers_v.pop(sid)
+                self.end_stream_response(sid, tk, tv)
+            else:
+                self.pending_body[sid] = body^
+                self.pending_pos[sid] = pos + n
+
+    # ── WebSocket-over-HTTP/2 bridge (RFC 8441) ────────────────────────────
+
+    def take_extended_connect_streams(self) raises -> List[Int]:
+        """Return stream ids of open Extended CONNECT tunnels awaiting
+        acceptance: ``:method=CONNECT`` + ``:protocol=websocket``, headers
+        complete, not yet END_STREAM'd, still OPEN (RFC 8441). The
+        ``:protocol`` marker is cleared by :meth:`accept_ws_over_h2`, so an
+        accepted tunnel is not re-returned."""
+        var ids = List[Int]()
+        for sid in self.conn.streams.ids():
+            ref s = self.conn.streams[sid]
+            if (
+                s.headers_complete
+                and not s.data_complete
+                and s.extended_connect_protocol == "websocket"
+                and s.state.value == StreamState.OPEN().value
+            ):
+                ids.append(sid)
+        return ids^
+
+    def accept_ws_over_h2(mut self, sid: Int) raises:
+        """Accept a WebSocket Extended CONNECT tunnel on ``sid``: emit a
+        ``:status=200`` HEADERS block WITHOUT END_STREAM (RFC 8441 5.2)
+        so the stream stays open for bidirectional WS DATA. Clears the
+        ``:protocol`` marker so the tunnel is not re-surfaced."""
+        if sid not in self.conn.streams:
+            raise Error("h2: accept_ws_over_h2 on unknown stream")
+        self.begin_stream_response(sid, Response(200))
+        var s = self.conn.streams[sid].copy()
+        s.extended_connect_protocol = String("")
+        self.conn.streams[sid] = s^
+
+    def stream_is_open(self, sid: Int) raises -> Bool:
+        """True while ``sid`` exists and is still OPEN (bidirectional).
+
+        The WS-over-h2 reactor path uses this to detect peer teardown
+        (RST_STREAM / END_STREAM moves the stream off OPEN) so it can run
+        the sidecar handler's ``on_close`` and drop the tunnel."""
+        if sid not in self.conn.streams:
+            return False
+        return self.conn.streams[sid].state.value == StreamState.OPEN().value
+
+    def drain_stream_data(mut self, sid: Int) raises -> List[UInt8]:
+        """Move any inbound DATA accumulated for ``sid`` out of the stream
+        record (the WS-over-h2 read path pulls client frames from here)."""
+        if sid not in self.conn.streams:
+            return List[UInt8]()
+        var s = self.conn.streams[sid].copy()
+        var out = s.data^
+        s.data = List[UInt8]()
+        self.conn.streams[sid] = s^
+        return out^
+
+    def begin_stream_response(mut self, sid: Int, var resp: Response) raises:
+        """Queue the leading HEADERS of an incremental streaming response.
+
+        Filters hop-by-hop fields (RFC 9113 8.2.2) and encodes a
+        no-END_STREAM HEADERS block into the outbox. The stream is left
+        open; :meth:`queue_stream_data` sends the body and
+        :meth:`end_stream_response` closes it (trailers captured by the
+        caller from ``resp.trailers`` before this move).
+        """
+        if sid not in self.conn.streams:
+            raise Error("h2: begin_stream_response on unknown stream")
+        self._mark_response_started(sid)
+        var hdrs = List[HpackHeader]()
+        for i in range(len(resp.headers._keys)):
+            var lk = _lower_ascii(resp.headers._keys[i])
+            if (
+                lk == "connection"
+                or lk == "transfer-encoding"
+                or lk == "keep-alive"
+                or lk == "proxy-connection"
+                or lk == "upgrade"
+            ):
+                continue
+            hdrs.append(HpackHeader(lk, resp.headers._values[i]))
+        var hf = self.conn.make_stream_headers(
+            sid, resp.status, Span[HpackHeader, _](hdrs)
+        )
+        encode_frame_into(hf, self.outbox)
+
+    def _send_budget(self, sid: Int) raises -> Int:
+        """How many body bytes may go out on `sid` right now.
+
+        The min of the connection and stream send windows — the same bound
+        `queue_stream_data` applies, asked before the copy rather than after.
+        """
+        if sid not in self.conn.streams:
+            return 0
+        var s = self.conn.streams[sid].copy()
+        return (
+            self.conn.send_window if self.conn.send_window
+            < s.send_window else s.send_window
+        )
+
+    def queue_parked_body(
+        mut self, sid: Int, body: Span[UInt8, _], pos: Int
+    ) raises -> Int:
+        """Frame as much of `body[pos:]` as the send windows will take.
+
+        The point of it is what it does *not* copy. A body too large for the
+        window is parked and re-pumped on every WINDOW_UPDATE, so handing the
+        whole remainder over each time and letting `queue_stream_data` use a
+        window's worth of it is quadratic in the body: at a 64 KiB window a
+        28 MiB response copies about 6 GB to send 28 MB. Asking the window
+        first makes each pump cost a window, not a body.
+
+        Returns the bytes consumed, which the caller adds to its own offset.
+        Both pump paths — a buffered response here and a streaming one in
+        `Http2ConnHandle` — go through this rather than repeating it.
+        """
+        var budget = self._send_budget(sid)
+        if budget <= 0:
+            return 0
+        var take = len(body) - pos
+        if take > budget:
+            take = budget
+        if take <= 0:
+            return 0
+        # A copy rather than a span of the caller's buffer, because
+        # `queue_stream_data` takes `self` mutably and the parked body may
+        # live in it. Bounded by the window, which is what makes it cheap.
+        var chunk = List[UInt8]()
+        chunk.extend(body[pos : pos + take])
+        return self.queue_stream_data(sid, Span(chunk))
+
+    def queue_stream_data(
+        mut self, sid: Int, data: Span[UInt8, _]
+    ) raises -> Int:
+        """Frame as much of ``data`` as the send windows allow.
+
+        Emits DATA frames (each <= ``max_frame_size``) bounded by the
+        min of the connection and per-stream send windows, decrements
+        both, and returns the number of bytes consumed. Returns 0 when
+        the window is exhausted -- the caller stashes the remainder and
+        re-pumps on the next WINDOW_UPDATE.
+        """
+        if sid not in self.conn.streams:
+            return 0
+        var s = self.conn.streams[sid].copy()
+        var budget = (
+            self.conn.send_window if self.conn.send_window
+            < s.send_window else s.send_window
+        )
+        if budget <= 0:
+            return 0
+        var mfs = self.conn.max_frame_size
+        if mfs < H2_DEFAULT_FRAME_SIZE:
+            # Settings are validated on the way in; this only keeps a
+            # bad value from turning the loop below into a spin.
+            mfs = H2_DEFAULT_FRAME_SIZE
+        var total = len(data)
+        var sent = 0
+        while sent < total and budget > 0:
+            var take = total - sent
+            if take > mfs:
+                take = mfs
+            if take > budget:
+                take = budget
+            # The payload is copied once, straight into the outbox.
+            encode_frame_header_into(
+                FrameType.DATA(), FrameFlags(), sid, take, self.outbox
+            )
+            self.outbox.extend(data[sent : sent + take])
+            sent += take
+            budget -= take
+        self.conn.send_window -= sent
+        s.send_window -= sent
+        self.conn.streams[sid] = s^
+        return sent
+
+    def end_stream_response(
+        mut self,
+        sid: Int,
+        trailers_k: List[String],
+        trailers_v: List[String],
+    ) raises:
+        """Close a streaming response.
+
+        Emits trailing HEADERS with END_STREAM when trailers are present,
+        otherwise an empty DATA frame with END_STREAM, and advances the
+        stream to CLOSED.
+        """
+        if sid not in self.conn.streams:
+            return
+        if len(trailers_k) > 0:
+            var trailers = List[HpackHeader]()
+            for i in range(len(trailers_k)):
+                trailers.append(
+                    HpackHeader(_lower_ascii(trailers_k[i]), trailers_v[i])
+                )
+            var tf = self.conn.make_stream_trailers(
+                sid, Span[HpackHeader, _](trailers)
+            )
+            encode_frame_into(tf, self.outbox)
+        else:
+            encode_frame_header_into(
+                FrameType.DATA(),
+                FrameFlags(FrameFlags.END_STREAM()),
+                sid,
+                0,
+                self.outbox,
+            )
+        var s = self.conn.streams[sid].copy()
+        s.state = StreamState.CLOSED()
+        self.conn.streams[sid] = s^

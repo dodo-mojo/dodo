@@ -1,0 +1,38 @@
+################ load, workers=1
+start rss_kb=14204 fds=7
+--- c=1
+     50%   75.00us
+     99%  176.00us
+Requests/sec:  12263.91
+--- c=10
+     50%  210.00us
+     99%  482.00us
+Requests/sec:  32385.77
+--- c=50
+     50%    0.97ms
+     99%    1.69s 
+Requests/sec:  38319.58
+--- c=1000
+     50%   22.60ms
+     99%   28.64ms
+Requests/sec:  42545.14
+end alive=yes rss_kb=31736 fds=7
+################ load, workers=4
+start rss_kb=14468 fds=16
+--- c=1
+     50%   77.00us
+     99%  174.00us
+Requests/sec:  12024.83
+--- c=10
+     50%   83.00us
+     99%    1.65s 
+Requests/sec:  66721.33
+--- c=50
+     50%  199.00us
+     99%  527.00us
+Requests/sec: 217097.41
+--- c=1000
+     50%    2.37ms
+     99%    3.97ms
+Requests/sec: 412289.56
+end alive=yes rss_kb=103776 fds=16

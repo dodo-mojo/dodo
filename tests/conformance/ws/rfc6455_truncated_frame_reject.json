@@ -1,0 +1,7 @@
+{
+  "name": "1.1.7_truncated_frame",
+  "spec": "RFC 6455 §5.2 (length-field MUST match payload byte count)",
+  "input_hex": "81 05 48 65 6c",
+  "expect": "reject",
+  "expect_reason": "Header declares len=5 but only 3 payload bytes are present; decoder must report 'need more bytes' or 'truncated payload'"
+}

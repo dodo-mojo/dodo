@@ -1,0 +1,62 @@
+"""``dodo.runtime`` — event-loop primitives for the Stage 1 reactor.
+
+Public exports, by area:
+
+- Reactor: ``Reactor``, ``Event``, ``INTEREST_READ``,
+  ``INTEREST_WRITE``, ``EVENT_READABLE``, ``EVENT_WRITABLE``,
+  ``EVENT_ERROR``, ``EVENT_HUP``, ``WAKEUP_TOKEN``, ``LISTENER_TOKEN``.
+- Scheduling: ``Scheduler``, ``Frontend``, ``TimerWheel``,
+  ``num_cpus``, ``default_worker_count``, ``block_in_pool``.
+- Buffers and memory: ``Pool``, ``BufferPool``, ``BufferHandle``,
+  ``IoVecBuf``, ``writev_buf``.
+- Cross-worker handoff: ``HandoffQueue``, ``WorkerHandoffPool``,
+  ``HandoffPolicy``.
+- Misc: ``DateCache``, the io_uring block, and the time helpers.
+
+Read the module source for the authoritative list; names here that are
+not re-exported from this barrel carry no stability guarantee.
+
+``Reactor`` wraps ``epoll`` (Linux) and ``kqueue`` (macOS) behind a uniform
+API. Use it to build single-threaded servers that handle many concurrent
+connections from one OS thread. See the module docstring on ``Reactor`` for
+an end-to-end example.
+
+For multicore servers, use ``HttpServer.serve(handler, num_workers=N)``
+with ``N >= 2`` and size ``N`` with ``num_cpus()`` (total logical CPUs) or
+``default_worker_count()`` (sensible default for IO-bound handlers).
+"""
+
+from .event import (
+    Event,
+    INTEREST_READ,
+    INTEREST_WRITE,
+    EVENT_READABLE,
+    EVENT_WRITABLE,
+    EVENT_ERROR,
+    EVENT_HUP,
+    WAKEUP_TOKEN,
+    LISTENER_TOKEN,
+)
+from .reactor import Reactor
+from .timer_wheel import TimerWheel
+from ._thread import num_cpus
+from .frontend import Frontend
+from .scheduler import Scheduler, default_worker_count
+from .pool import Pool, PoolableConn
+from .buffer_pool import BufferHandle, BufferPool
+from .iovec import IoVecBuf, writev_buf, writev_buf_all
+from .io_uring import (
+    IoUringRing,
+    IoUringParams,
+    is_io_uring_available,
+    io_uring_setup,
+    io_uring_enter,
+    io_uring_register,
+    SYS_IO_URING_SETUP,
+    SYS_IO_URING_ENTER,
+    SYS_IO_URING_REGISTER,
+)
+from .blocking import block_in_pool, MAX_POOL_SIZE
+from ._libc_time import libc_usleep, libc_nanosleep_ms, monotonic_now_ms
+from .handoff import HandoffPolicy, HandoffQueue, WorkerHandoffPool
+from .date_cache import DateCache
