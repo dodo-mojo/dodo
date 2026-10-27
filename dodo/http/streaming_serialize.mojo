@@ -5,25 +5,14 @@ RFC 7230 §3 (status line + headers) + RFC 7230 §4.1 (chunked
 transfer-coding) when ``B.content_length()`` is unknown, or
 plain Content-Length framing when it's known.
 
-The reactor's view-aware write loop (a focused follow-up) calls
-this serializer per writable edge to pull-and-write one chunk
-at a time. Callers that don't need the streaming benefit
-(every existing handler that returns a ``Response``)
-keep the buffer-then-send path through the existing
-``_serialize_response`` in ``dodo/http/_server_reactor_impl``.
+The reactor does not call it: a handler streams by returning a
+``Response`` with ``body_stream`` (see ``dodo/http/response_stream.mojo``).
+This serializer is for callers that write a ``StreamingResponse``
+themselves.
 
-Why a standalone serializer rather than a parallel reactor:
-
-C3's experience showed that adding a parallel reactor entry
-parametric over a trait-method-with-origin is currently slow to
-specialise in Mojo. The streaming serializer here is a plain
-function — no parametric trait dispatch, no per-handler
-specialization explosion — so it compiles fast and is easy to
-test independently. The reactor adoption that calls this
-serializer is a small follow-up commit (~30 lines of glue) that
-the user can review separately once Mojo's specialization
-slowness is resolved or the team commits to the slower compile
-times.
+It is a plain function, with no parametric trait dispatch and no
+per-handler specialization, so it compiles fast and is easy to test
+on its own.
 
 Wire-framing semantics:
 

@@ -1,4 +1,4 @@
-"""Accept-path admission cap for the plain HTTP/1.1 Handler path (D8).
+"""Accept-path admission cap for the plain HTTP/1.1 Handler path.
 
 A server runs the normal ``serve(handler)`` reactor with
 ``ServerConfig(max_connections=2)`` and a large idle timeout so the two

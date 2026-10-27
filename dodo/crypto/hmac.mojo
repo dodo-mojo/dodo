@@ -221,8 +221,8 @@ def base64url_decode(s: String) raises -> List[UInt8]:
     var n = s.byte_length()
     var src = s.unsafe_ptr()
     # Padding is optional, but when present it is one or two '=' that
-    # complete the last quantum. Any run of '=' used to be stripped, so
-    # "QQ=====" decoded like "QQ==".
+    # complete the last quantum. Stripping any run of '=' would decode
+    # "QQ=====" like "QQ==".
     var total = n
     while n > 0 and src[unsafe_offset=n - 1] == 61:
         n -= 1

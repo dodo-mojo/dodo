@@ -332,7 +332,7 @@ def test_te_chunked_then_identity_with_cl_is_refused() raises:
 
 # ── The reactor and the parser must read the same header lines ─────────────
 #
-# H1-03 / H1-04: with ``allow_ows_around_colon`` or
+# With ``allow_ows_around_colon`` or
 # ``allow_lf_only_line_endings`` the parser accepts ``Name : value`` and
 # bare-LF line ends. The reactor's raw-byte framing has to find the same
 # Transfer-Encoding / Content-Length lines, or the body is left in the read
@@ -748,7 +748,7 @@ def _obs_text_parse(raw: List[UInt8], fold: Bool) -> String:
 
 
 def test_obs_text_value_that_is_not_utf8_is_rejected() raises:
-    """H1-05: a header value must stay valid UTF-8 inside its ``String``.
+    """A header value must stay valid UTF-8 inside its ``String``.
 
     obs-text is admitted as opaque octets (RFC 9110 sec 5.5), but the value
     is stored as a Mojo ``String``, which holds UTF-8. A byte string that
@@ -816,7 +816,7 @@ def _fold_parse(raw: List[UInt8], obs_text: Bool) -> String:
 
 
 def test_obs_fold_continuation_gets_the_value_byte_check() raises:
-    """H1-10: a continuation line is field content like any other.
+    """A continuation line is field content like any other.
 
     The byte check ran on a field's first line only, so control bytes
     (0x01, DEL, ...) refused there reached the handler through a fold.
@@ -852,7 +852,7 @@ def test_obs_fold_continuation_gets_the_value_byte_check() raises:
 
 
 def test_valid_obs_fold_still_unfolds() raises:
-    """Guard for H1-10: valid continuations (including an inner HTAB) fold."""
+    """Valid continuations (including an inner HTAB) fold."""
     var tab = List[UInt8]()
     tab.append(UInt8(ord("b")))
     tab.append(0x09)

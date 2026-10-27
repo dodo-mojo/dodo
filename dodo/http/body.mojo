@@ -43,7 +43,7 @@ Pieces still open:
   return ``Response[ChunkedBody[MySource]]``). Today's ``Response``
   keeps its concrete ``List[UInt8]`` body plus the optional
   ``body_stream``; ``ResponseImpl[B]`` exists as an additive
-  authoring type, but migrating the hot-path alias is a follow-up.
+  authoring type, and the hot-path alias is not migrated.
 - ``serve_streaming`` across multiple listeners (multi-worker works;
   extra ``bind(List[SocketAddr])`` listeners do not).
 
@@ -227,8 +227,7 @@ def drain_body[B: Body](mut body: B, cancel: Cancel) raises -> List[UInt8]:
 
     Test / utility helper for users who want to assert against a
     body's full contents. Production callers go through the
-    reactor's per-edge pull loop (which lands with the reactor
-    adoption follow-up).
+    reactor's per-edge pull loop.
 
     Stops if ``cancel.cancelled()`` flips True between chunks.
     """

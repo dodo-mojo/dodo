@@ -66,9 +66,9 @@ def _ascii_strip_slice(span: Span[UInt8, _]) -> String:
     """Return an owned ``String`` equal to ``span`` with ASCII whitespace
     (SPACE and HTAB) trimmed from both ends.
 
-    Replaces the ``String(String(unsafe_from_utf8=...)).strip()`` triple
-    that previously allocated three ``String`` objects per header
-    half. The fast path does a single pointer-based construction of
+    The obvious ``String(String(unsafe_from_utf8=...)).strip()`` would
+    allocate three ``String`` objects per header half. This does a single
+    pointer-based construction of
     the final owned ``String`` from the trimmed sub-span via the
     ``_ascii_unchecked_string`` helper (no UTF-8 validation).
     """

@@ -16,9 +16,9 @@ Cookies are scoped as RFC 6265 sec 5 describes: each is stored with the
 domain it may be sent to (host-only unless a ``Domain`` attribute names
 the setting host or a parent of it), a path, and its ``Secure`` flag, and
 :meth:`CookieStore.request_header` returns only the cookies that match
-the request URL. The jar used to be origin-agnostic and replayed every
-cookie on every request, which a redirect to another origin turned into
-a session leak -- and let that origin plant cookies for this one.
+the request URL. A jar that replays every cookie on every request turns
+a redirect to another origin into a session leak, and lets that origin
+plant cookies for this one.
 """
 
 from std.memory import Pointer

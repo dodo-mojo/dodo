@@ -243,7 +243,7 @@ def test_h2_server_request_headers_visible() raises:
 
 def test_h2_server_streaming_response() raises:
     """A handler returning ``stream_response`` streams incremental DATA
-    frames on h2; the client reassembles them into the full body (K1)."""
+    frames on h2; the client reassembles them into the full body."""
     var srv = HttpServer.bind(SocketAddr.localhost(0))
     var port = UInt16(srv.local_addr().port)
 

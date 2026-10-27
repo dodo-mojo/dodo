@@ -1,12 +1,8 @@
 """libc time FFI.
 
-An older Mojo passed the argument of an inferred-signature
-``external_call["usleep"]`` wrongly: a 1 ms sleep took ~1.5 s and a
-50 ms one ~56 s. These bindings use explicit signatures from that
-time. Mojo 1.2.0 sleeps accurately either way, on its own or with
-thousands of threads in the process, and
+The bindings use explicit ``external_call`` signatures, and
 ``tests/runtime/test_libc_time.mojo`` checks the wall-clock semantics
-(a many-threads case included) so a regression shows up there first.
+(a many-threads case included).
 
 POSIX semantics:
 

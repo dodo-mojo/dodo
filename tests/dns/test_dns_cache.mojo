@@ -73,7 +73,7 @@ def test_cache_is_bounded() raises:
 
 
 def test_int_max_ttl_means_cache_forever() raises:
-    """NET-03: ``now + ttl_ms`` wrapped negative for ``ttl_ms = Int.MAX``,
+    """``now + ttl_ms`` wrapped negative for ``ttl_ms = Int.MAX``,
     so every entry was born expired and nothing was ever served."""
     var c = DnsCache(ttl_ms=Int.MAX)
     _ = c.resolve("localhost")
@@ -83,7 +83,7 @@ def test_int_max_ttl_means_cache_forever() raises:
 
 
 def test_ttl_that_overflows_the_expiry_still_caches() raises:
-    """NET-03: any TTL with ``now + ttl > Int.MAX`` must saturate rather
+    """Any TTL with ``now + ttl > Int.MAX`` must saturate rather
     than wrap (the monotonic clock is far above 1 ms)."""
     var c = DnsCache(ttl_ms=Int.MAX - 1)
     _ = c.resolve("localhost")
@@ -93,7 +93,7 @@ def test_ttl_that_overflows_the_expiry_still_caches() raises:
 
 
 def test_saturated_expiries_are_still_evicted() raises:
-    """NET-03: with saturated expiries (all equal to ``Int.MAX``) the
+    """With saturated expiries (all equal to ``Int.MAX``) the
     eviction scan must still pick a victim, or the cache outgrows
     ``max_entries``."""
     var c = DnsCache(ttl_ms=Int.MAX, max_entries=2)

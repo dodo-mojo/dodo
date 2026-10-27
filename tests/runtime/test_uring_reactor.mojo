@@ -140,7 +140,7 @@ def test_idle_poll_returns_zero() raises:
 
 
 def test_blocking_poll_with_a_timeout_returns_on_its_own() raises:
-    # CONC-07: with min_complete=1 and nothing ever completing, a bounded
+    # With min_complete=1 and nothing ever completing, a bounded
     # poll must come back after about timeout_ms (it used to block
     # forever), so an idle loop can re-read its stop flag.
     if not is_io_uring_available():
@@ -397,7 +397,7 @@ def test_wakeup_releases_blocking_poll() raises:
 
 
 def test_wakeup_rearmed_after_full_sq_flushed() raises:
-    """RT-03: when the SQ is full, the lazy wakeup arm in ``poll`` fails
+    """When the SQ is full, the lazy wakeup arm in ``poll`` fails
     (no SQE slot). Phase 1 then flushes the SQ; the read on the eventfd
     must be armed again before phase 3 may block, otherwise a
     cross-thread ``wakeup()`` cannot release the blocked poll."""
@@ -431,7 +431,7 @@ def test_arm_poll_readable_multishot_round_trip() raises:
     the peer write bytes; verify a ``URING_OP_POLL`` CQE comes
     back with ``POLLIN`` set in ``res`` and ``has_more = True``
     (multishot still armed). This is the substrate the upcoming
-    server-loop dispatch swap (B0 wire-in) uses to replace
+    server-loop dispatch swap uses to replace
     ``epoll_wait`` on the io_uring backend.
     """
     if not is_io_uring_available():

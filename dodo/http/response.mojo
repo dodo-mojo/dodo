@@ -94,7 +94,7 @@ struct ResponseImpl[B: Body = InlineBody](Movable):
     var version: String
     var trailers: HeaderMap
     var body_stream: Optional[ChunkSourceBox]
-    """Optional streaming body source (K1). ``None`` for the ordinary
+    """Optional streaming body source. ``None`` for the ordinary
     buffered response (the ``body`` field carries the bytes); ``Some``
     when a handler returns a streaming response, in which case the
     reactor emits ``Transfer-Encoding: chunked`` headers and pulls this
@@ -183,8 +183,7 @@ struct ResponseImpl[B: Body = InlineBody](Movable):
     def json(self) raises -> Value:
         """Parse the body as JSON and return a ``json.Value``.
 
-        Uses the pure-Mojo backend from
-        `json <https://github.com/ehsanmok/json>`_.
+        Uses the pure-Mojo backend of the ``json`` package.
 
         Returns:
             A ``Value`` representing the parsed JSON document.
@@ -305,7 +304,7 @@ unchanged. Handlers that want the typed authoring surface build a
 def stream_response[
     S: ChunkSource
 ](var source: S, status: Int = 200) raises -> Response:
-    """Build a streaming ``Response`` backed by ``source`` (K1).
+    """Build a streaming ``Response`` backed by ``source``.
 
     The reactor serves this with ``Transfer-Encoding: chunked``,
     pulling ``source.next(cancel)`` in bounded batches per writable edge

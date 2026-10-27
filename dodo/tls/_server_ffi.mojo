@@ -6,7 +6,7 @@ Exposes the C-side functions added to
 pattern: ``OwnedDLHandle`` to ``libdodo_tls.so``, individually
 typed ``get_function`` calls per FFI export.
 
-Minimum-friction surface for the C7 reactor state machine:
+The surface the TLS reactor state machine uses:
 
 - ``ServerCtx``: holds an ``SSL_CTX*`` (as ``Int``) plus the
   loaded ``OwnedDLHandle``.

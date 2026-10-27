@@ -236,9 +236,8 @@ struct HttpServer(Movable):
         accepted connection through the same handler. Useful for
         binding the same service on both IPv4 and IPv6, on
         multiple ports for split traffic classes (e.g. internal
-        admin port + public service port), or on a UNIX socket
-        plus a TCP socket sharing one process (after the upcoming
-        ``UdsListener`` integration).
+        admin port + public service port). UNIX sockets are not
+        accepted here.
 
         ``addrs`` must be non-empty. The first address is the
         "primary" listener (used by ``local_addr()`` and any

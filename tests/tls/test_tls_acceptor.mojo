@@ -1,15 +1,8 @@
-"""Tests for the server-side TLS acceptor scaffolding.
+"""Tests for the server-side TLS acceptor.
 
-Covers the API-surface portion landing in this commit:
-``TlsServerConfig`` value semantics, ``TlsInfo`` defaults,
-``TlsAcceptor`` construction + reload-as-no-op,
-``TlsServerError`` / ``TlsServerNotImplemented`` formatting.
-
-The reactor-side handshake state machine (non-blocking
-``SSL_accept`` driven by edge-triggered readable / writable
-events) lands in the follow-up; tests for the
-end-to-end TLS round-trip (``TlsAcceptor.serve(handler)`` ->
-``curl --cacert``) move with it.
+Covers ``TlsServerConfig`` value semantics, ``TlsInfo`` defaults,
+``TlsAcceptor`` construction and reload, and ``TlsServerError``
+formatting. The HTTPS round trip is in ``test_https_reactor.mojo``.
 
 Re-exports from ``dodo.tls`` and the root ``dodo`` package
 resolve.
@@ -28,7 +21,6 @@ from dodo.tls import (
     TlsServerConfig,
     TlsInfo,
     TlsServerError,
-    TlsServerNotImplemented,
     TLS_PROTOCOL_TLS12,
     TLS_PROTOCOL_TLS13,
 )
@@ -79,7 +71,7 @@ def test_protocol_constants_distinct() raises:
     assert_true(TLS_PROTOCOL_TLS12 < TLS_PROTOCOL_TLS13)
 
 
-# ── Handshake deadline (D4) ────────────────────────────────────────────────
+# ── Handshake deadline ────────────────────────────────────────────────
 
 
 def test_config_handshake_timeout_default_and_custom() raises:
@@ -274,13 +266,6 @@ def test_acceptor_reload_repeated_safe() raises:
         acc.reload()
 
 
-def test_acceptor_info_placeholder_returns_empty() raises:
-    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
-    var acc = TlsAcceptor(cfg^)
-    var info = acc.info_placeholder()
-    assert_equal(info.protocol, "")
-
-
 def test_acceptor_with_alpn_succeeds() raises:
     """Constructor wires the ALPN list through to the FFI."""
     var alpn = List[String]()
@@ -362,12 +347,7 @@ def test_tls_server_error_writes_message_and_code() raises:
     assert_equal(String(e), "TlsServerError(handshake failed code=42)")
 
 
-def test_tls_server_not_implemented_default_message() raises:
-    var e = TlsServerNotImplemented()
-    assert_true(e.message.find("blocking handshake_fd path") >= 0)
-
-
-# ── FFI path NUL-termination hardening (follow-up to the SNI fix) ──────────
+# ── FFI path NUL-termination ─────────────────────────────────────────────────
 #
 # Cert / key / CA paths reach OpenSSL through the same String -> char*
 # FFI hand-off that corrupted the SNI host: a path materialized from a

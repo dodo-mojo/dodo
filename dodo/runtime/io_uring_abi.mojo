@@ -262,10 +262,7 @@ userspace to re-arm. ``IORING_CQE_F_MORE`` in the CQE's
 
 This is the io_uring analog of edge-triggered ``epoll_wait``
 with ``EPOLLET`` — it lets a single SQE drive an arbitrary
-number of readiness notifications, which is the substrate
-that the upcoming server-loop dispatch swap (B0 wire-in)
-uses to replace the per-poll ``epoll_wait`` syscall on the
-io_uring backend."""
+number of readiness notifications."""
 
 comptime IORING_POLL_UPDATE_EVENTS: UInt32 = 0x02
 """5.13+. Set in the SQE ``len`` field on

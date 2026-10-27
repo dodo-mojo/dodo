@@ -60,12 +60,8 @@ What this module provides
   ``input[prev:offset]``.
 
 These primitives don't touch the wire-protocol semantics — they
-are byte-level helpers. Wiring into the multipart parser
-(``dodo.http.multipart``), the form decoder
-(``dodo.http.form``), and the cookie parser
-(``dodo.http.cookie.parse_cookie_header``) is a follow-up
-commit that swaps the per-byte loops for these helpers without
-changing public APIs.
+are byte-level helpers. The multipart parser, the form decoder and
+the cookie parser still use their own per-byte loops.
 """
 
 

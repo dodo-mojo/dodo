@@ -5,8 +5,8 @@ ring setup) and :mod:`dodo.runtime.io_uring_sqe` (SQE/CQE
 codec). Adds the **submission queue** + **completion queue**
 ring access via ``mmap(2)``, the atomic head/tail accessors
 the kernel-shared SPMC protocol requires, and the high-level
-``submit_sqe`` / ``reap_cqe`` API the upcoming ``UringReactor``
-calls every poll cycle.
+``submit_sqe`` / ``reap_cqe`` API ``UringReactor`` calls every
+poll cycle.
 
 What this module provides
 -------------------------
@@ -314,8 +314,7 @@ struct IoUringDriver(Movable):
 
     Owns one ``IoUringRing`` (closes ring fd on drop) and three
     ``mmap`` regions (``munmap``'d on drop). Exposes the
-    submit/reap API the upcoming ``UringReactor`` calls every
-    poll cycle.
+    submit/reap API ``UringReactor`` calls every poll cycle.
 
     Per-worker ownership: each pthread that runs a reactor loop
     owns exactly one ``IoUringDriver``. The kernel-shared rings

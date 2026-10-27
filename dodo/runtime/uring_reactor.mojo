@@ -3,8 +3,8 @@
 Sits on top of :mod:`dodo.runtime.io_uring_driver` (which owns
 the ``io_uring_setup`` + the three SQ/CQ/SQE-array mmaps, the
 atomic head/tail accessors, and the raw submit/reap surface) and
-adds the **operation-tagged** API that the upcoming uring-backed
-server reactor calls:
+adds the **operation-tagged** API that the buffer-ring server loop
+calls:
 
 * ``arm_listener_multishot(fd, conn_id)`` — submit one
   ``IORING_OP_ACCEPT`` SQE with ``IORING_ACCEPT_MULTISHOT`` so
@@ -669,9 +669,7 @@ struct UringReactor(Movable):
         Kernel posts a CQE every time the fd's readiness matches
         any bit in ``poll_mask``, without re-arming. This is the
         io_uring analog of ``epoll_ctl(EPOLL_CTL_ADD, fd, EPOLLIN
-        | EPOLLET)`` and is the substrate the upcoming server-loop
-        dispatch swap (B0 wire-in) uses to replace ``epoll_wait``
-        on the io_uring backend.
+        | EPOLLET)``.
 
         The CQE is tagged ``URING_OP_POLL`` so the dispatch loop
         can route it to the same code path that handles
@@ -803,7 +801,7 @@ struct UringReactor(Movable):
         # when ``enable_wakeup=False`` was passed at construction
         # (single-issuer bufring rings opt out -- they don't need
         # cross-thread wakeup). If the SQ is full the arm fails; it
-        # is retried after phase 1 has flushed the SQ (RT-03).
+        # is retried after phase 1 has flushed the SQ.
         self._try_arm_wakeup()
 
         # Phase 1: non-blocking submit + collect already-ready
@@ -818,7 +816,7 @@ struct UringReactor(Movable):
             )
 
         # Phase 1 emptied the SQ: retry a failed arm now so phase 3 never
-        # blocks with no read on the eventfd (RT-03).
+        # blocks with no read on the eventfd.
         self._try_arm_wakeup()
 
         # Phase 2: drain everything ready into ``out``. No

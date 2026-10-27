@@ -156,9 +156,8 @@ def test_negotiate_q_zero_rejects_encoding() raises:
 def test_negotiate_wildcard_alone_selects_best_available_coding() raises:
     """``*`` gives every coding without its own entry the wildcard weight
     (RFC 9110 sec 12.5.3), so a bare ``*`` is acceptable for gzip / br and
-    the usual tie-break (br > gzip > identity) picks the coding. It used to
-    be pinned to identity, which was the APP-20 wildcard bug (Decision:
-    expectation updated with the fix)."""
+    the usual tie-break (br > gzip > identity) picks the coding, not
+    identity."""
     var p = negotiate_encoding("*", False)
     assert_equal(p.encoding, "gzip")
     assert_equal(p.quality, 1000)
@@ -167,7 +166,7 @@ def test_negotiate_wildcard_alone_selects_best_available_coding() raises:
 
 
 def test_negotiate_wildcard_weight_applies_to_unlisted_codings() raises:
-    """APP-20: ``gzip;q=0.5, *`` gives br weight 1 through ``*``."""
+    """``gzip;q=0.5, *`` gives br weight 1 through ``*``."""
     var p = negotiate_encoding("gzip;q=0.5, *", True)
     assert_equal(p.encoding, "br")
     assert_equal(p.quality, 1000)
@@ -177,7 +176,7 @@ def test_negotiate_wildcard_weight_applies_to_unlisted_codings() raises:
 
 
 def test_negotiate_wildcard_is_order_independent() raises:
-    """APP-20: the same entries in another order give the same pick."""
+    """The same entries in another order give the same pick."""
     for brotli in [True, False]:
         var a = negotiate_encoding("gzip;q=0.5, *", brotli)
         var b = negotiate_encoding("*, gzip;q=0.5", brotli)
@@ -190,7 +189,7 @@ def test_negotiate_wildcard_is_order_independent() raises:
 
 
 def test_negotiate_identity_refused_with_wildcard() raises:
-    """APP-20: ``identity;q=0, *`` must not select the refused identity."""
+    """``identity;q=0, *`` must not select the refused identity."""
     var p = negotiate_encoding("identity;q=0, *", False)
     assert_equal(p.encoding, "gzip")
     assert_equal(p.quality, 1000)
@@ -278,7 +277,7 @@ def test_compress_already_encoded_skipped() raises:
 
 
 def test_compress_partial_content_passthrough() raises:
-    """APP-26: a 206 keeps its identity body, Content-Range and
+    """A 206 keeps its identity body, Content-Range and
     Content-Length; the offsets refer to the unencoded representation."""
     var c = Compress(_Partial(), min_size_bytes=1024)
     var req = Request(method=Method.GET, url="/big.bin")
@@ -293,7 +292,7 @@ def test_compress_partial_content_passthrough() raises:
 
 
 def test_compress_content_range_header_passthrough() raises:
-    """APP-26: any response carrying Content-Range is passed through, even
+    """Any response carrying Content-Range is passed through, even
     when its status is not 206."""
     var c = Compress(_Partial(status=200), min_size_bytes=1024)
     var req = Request(method=Method.GET, url="/big.bin")
@@ -313,7 +312,7 @@ def _vary_has_accept_encoding(resp: Response) -> Bool:
 
 
 def test_compress_identity_variant_has_vary() raises:
-    """APP-27: the identity response for a compressible body names
+    """The identity response for a compressible body names
     Accept-Encoding in Vary, so a shared cache cannot hand it to a gzip
     client."""
     var c = Compress(_BigEcho(), min_size_bytes=1024)
@@ -330,7 +329,7 @@ def test_compress_identity_variant_has_vary() raises:
 
 
 def test_compress_vary_on_every_negotiated_outcome() raises:
-    """APP-27: no header, identity preferred, a refused coding and a
+    """No header, identity preferred, a refused coding and a
     wildcard-less refusal all leave the body alone but still carry Vary,
     exactly once."""
     var c = Compress(_BigEcho(), min_size_bytes=1024)
@@ -352,7 +351,7 @@ def test_compress_vary_on_every_negotiated_outcome() raises:
 
 
 def test_compress_no_vary_when_passed_through() raises:
-    """APP-27: responses Compress never considers (small, already encoded,
+    """Responses Compress never considers (small, already encoded,
     partial) do not depend on Accept-Encoding and get no Vary."""
     var small = Compress(_Echo(status=200, body="hi"), min_size_bytes=1024)
     var req = Request(method=Method.GET, url="/")

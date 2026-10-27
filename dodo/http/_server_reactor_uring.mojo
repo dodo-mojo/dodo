@@ -145,8 +145,9 @@ comptime _URING_BR_BUF_SIZE: Int = 8192
 comptime _URING_BR_NBUFS: Int = 256
 comptime _URING_BR_BGID: UInt16 = 1
 
-# Generation-stamped conn_id encoding -- the fix for the
-# 9cf97d0 SIGSEGV under concurrent connections.
+# Generation-stamped conn_id encoding, which keeps a stale completion
+# from reaching a new connection on a reused fd (a SIGSEGV under
+# concurrent connections).
 #
 # When connection A on fd=8 closes, the kernel may have a
 # trailing recv CQE in flight (the final-no-more-events CQE
@@ -896,7 +897,7 @@ def run_uring_bufring_reactor_loop_shared[
             # A completion carrying IORING_CQE_F_BUFFER has already taken
             # buffer ``bid`` out of the ring, whatever happens to it next.
             # Every path must follow ``decision.return_buf`` or the pool
-            # shrinks for good (issue #37; proved in Kernels/BufLedger).
+            # shrinks for good.
             var decision = classify_recv(conn_id in conns, comp.res, has_buf)
             if decision.action != RECV_STAGE:
                 if decision.return_buf:

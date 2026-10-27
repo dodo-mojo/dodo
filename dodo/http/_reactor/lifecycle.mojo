@@ -35,7 +35,7 @@ from dodo.runtime._libc_time import monotonic_now_ms
 def _poll_timeout_ms(imm wheel: TimerWheel, cap_ms: Int = 100) -> Int:
     """Reactor poll timeout: time until the next timer fires, capped.
 
-    Replaces the fixed 100ms poll (D7). The ``cap_ms`` stays
+    Replaces the fixed 100ms poll. The ``cap_ms`` stays
     load-bearing for shutdown-flag responsiveness (the stop flag is
     re-read once per poll), so idle workers still wake at most every
     ``cap_ms``; when a timer is due sooner the reactor wakes just in
@@ -239,9 +239,9 @@ def _arm_accept_timer(
 ):
     """Arm the idle timer for a connection that has just been accepted.
 
-    Timers used to be armed only by the first readable event, so a
-    connection that never sent a byte was never timed out: enough of
-    them exhaust the fd table and the worker stops accepting. Shared by
+    Arming only on the first readable event would never time out a
+    connection that sends no byte: enough of them exhaust the fd table
+    and the worker stops accepting. Shared by
     every accept loop, HTTP/1.1 and unified.
     """
     if idle_timeout_ms <= 0:

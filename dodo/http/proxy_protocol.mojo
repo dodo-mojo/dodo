@@ -45,10 +45,8 @@ Public surface:
   parser. Returns ``None`` on a buffer that's too short to decide
   yet (keep reading).
 
-The reactor integration (``ServerConfig.trust_proxy_protocol``)
-opt-in is a follow-up; this module ships the parsers
-+ tests + fuzz harness independently so the wire shapes can be
-audited and reused.
+The server does not parse PROXY headers on accept; this module is the
+parsers alone, with tests and a fuzz harness.
 
 References:
 - HAProxy 2.8 PROXY protocol spec:

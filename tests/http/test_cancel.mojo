@@ -110,7 +110,7 @@ def test_slow_handler_short_circuits_on_pre_flip() raises:
     assert_equal(resp.text(), "partial:0")
 
 
-# ── Atomic cell round-trip (D5) ─────────────────────────────────────────────
+# ── Atomic cell round-trip ─────────────────────────────────────────────
 
 
 def test_cell_atomic_reason_roundtrip() raises:

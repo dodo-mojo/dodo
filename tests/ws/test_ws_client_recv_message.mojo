@@ -1,4 +1,4 @@
-"""``WsClient.recv_message`` returns whole messages (WS-02).
+"""``WsClient.recv_message`` returns whole messages.
 
 RFC 6455 sec 5.4: a message is a TEXT or BINARY frame followed by
 CONTINUATION frames up to one with FIN set, and its payload is their
@@ -193,7 +193,7 @@ def test_reassembled_message_is_bounded_by_max_frame_size() raises:
 
 
 def test_client_refuses_a_masked_server_frame() raises:
-    """WS-03: RFC 6455 sec 5.1 -- a client MUST close on a masked frame.
+    """RFC 6455 sec 5.1 -- a client MUST close on a masked frame.
 
     ``WsClient._recv_one`` unmasked the frame and returned it. Both
     ``recv()`` and ``recv_message()`` go through it.

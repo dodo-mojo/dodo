@@ -388,7 +388,7 @@ def sse_response(channel: SseChannel) raises -> Response:
 def stream_sse_response(
     var channel: SseChannel, status: Int = 200
 ) raises -> Response:
-    """Build a streaming (K1) SSE :class:`Response` from ``channel``.
+    """Build a streaming SSE :class:`Response` from ``channel``.
 
     This is the canonical way to serve SSE through the normal
     ``Handler`` / ``Router`` path: the returned ``Response`` carries the

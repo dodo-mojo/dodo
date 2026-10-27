@@ -345,7 +345,7 @@ struct ConnHandle(Movable):
     on this connection."""
 
     var body_src: Optional[ChunkSourceBox]
-    """Active streaming body source (K1), ``None`` for the buffered
+    """Active streaming body source, ``None`` for the buffered
     path. Set from ``Response.body_stream`` at response completion; the
     ``on_writable`` refill loop pulls a bounded batch of chunks per
     writable edge, frames them as ``Transfer-Encoding: chunked``, and
@@ -551,7 +551,7 @@ struct ConnHandle(Movable):
                 unsafe_memcpy(dest=dst, src=chunk, count=got_int)
                 # Compare without the sum: ``max_header_size +
                 # max_body_size`` wraps for an "unlimited" body cap such
-                # as ``Int.MAX`` (APP-06). ``len`` and ``max_header_size``
+                # as ``Int.MAX``. ``len`` and ``max_header_size``
                 # are non-negative, so the subtraction cannot overflow.
                 if (
                     len(self.read_buf) - config.max_header_size
@@ -747,7 +747,7 @@ struct ConnHandle(Movable):
         # the whole request, head and body, from its first byte.
         # An error queued while the request is still incomplete must know
         # whether it answers a HEAD (no content, RFC 9110 sec 9.3.2); the
-        # parsed ``req.method`` is not available yet (APP-05).
+        # parsed ``req.method`` is not available yet.
         self._note_head_from_buf()
         var timed = (
             config.request_timeout_ms > 0 or config.header_timeout_ms > 0
@@ -908,7 +908,7 @@ struct ConnHandle(Movable):
         into ``STATE_WRITING``.
         """
         self._consume_request()
-        # Streaming path (K1): a handler that returned a streaming
+        # Streaming path: a handler that returned a streaming
         # Response carries a chunk source. Take it onto the connection,
         # emit chunked-framed headers, and let ``on_writable`` pull the
         # body chunk-by-chunk. The buffered path is unchanged.
@@ -2080,7 +2080,7 @@ struct ConnHandle(Movable):
         """While the request head has not been fully scanned
         (``headers_end < 0``) the method is read off the buffered request
         line, so an error queued now (431 / 408 / 413 ...) is answered
-        without content when it replies to a HEAD (APP-05). Once the head
+        without content when it replies to a HEAD. Once the head
         is scanned the flag is left alone: after dispatch ``read_buf`` may
         already start with the next pipelined request."""
         if self.headers_end < 0:
@@ -2107,7 +2107,7 @@ struct ConnHandle(Movable):
         """Build a minimal error response into ``write_buf`` and mark close.
 
         The response is serialised with ``self.head_request`` so an error
-        answering a HEAD request carries no content (APP-05)."""
+        answering a HEAD request carries no content."""
         self.should_close = True
         # A client that timed out is slow by definition; lingering would
         # only let it hold the connection longer.

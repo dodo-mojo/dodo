@@ -603,11 +603,9 @@ struct Router(Copyable, Defaultable, Handler):
         destroy thunks, append to the route + struct-handler
         tables.
 
-        Per the follow-up cleanup, this routes through
-        ``Pool[H]`` rather than reaching into ``alloc[H]``
-        directly — keeps the unsafe-pointer plumbing confined to
-        ``dodo/runtime/`` and drops the ``_Boxed[H]``
-        1-byte phantom pad now that ``size_of`` is public.
+        This goes through ``Pool[H]`` rather than ``alloc[H]``
+        directly, which keeps the unsafe-pointer plumbing confined to
+        ``dodo/runtime/``.
         """
         var segs = _compile_segments(path)
         if handler.may_block():

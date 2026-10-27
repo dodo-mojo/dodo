@@ -267,7 +267,7 @@ def _month_len(y: Int, m: Int) -> Int:
 
 
 def test_civil_known_days_before_year_zero() raises:
-    """ENC-02: the era step used truncating-division semantics under
+    """The era step used truncating-division semantics under
     floor ``//``, so every day before 0000-03-01 was off by one."""
     var day = 86400
     # 0000-03-01 is 719468 days before the epoch (Hinnant); year 0 is
@@ -276,7 +276,7 @@ def test_civil_known_days_before_year_zero() raises:
     assert_equal(civil_to_unix_seconds(0, 2, 29, 0, 0, 0), -719469 * day)
     assert_equal(civil_to_unix_seconds(0, 1, 1, 0, 0, 0), -719528 * day)
     assert_equal(civil_to_unix_seconds(-1, 12, 31, 0, 0, 0), -719529 * day)
-    # The ENC-02 counterexample: 28 Feb and 1 Mar of year -1 are one day
+    # The counterexample: 28 Feb and 1 Mar of year -1 are one day
     # apart (year -1 is not a leap year), and 1 Mar -1 is 366 days before
     # 0000-03-01 (it spans 0000-02-29).
     assert_equal(civil_to_unix_seconds(-1, 3, 1, 0, 0, 0), -719834 * day)
@@ -304,7 +304,7 @@ def test_civil_known_days_before_year_zero() raises:
 
 
 def test_civil_day_walk_matches_calendar_across_year_zero() raises:
-    """ENC-02: every day from year -2900 to 2900 follows the previous one
+    """Every day from year -2900 to 2900 follows the previous one
     on the Gregorian calendar (independent leap-year rule) and the forward
     and inverse helpers agree on it."""
     var day = 86400

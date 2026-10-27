@@ -189,7 +189,7 @@ def negotiate_encoding(accept: String, brotli_ok: Bool) -> _AcceptEncodingPick:
     coding with no entry of its own takes the weight of ``*`` ("any
     content coding not explicitly listed"), so the result does not
     depend on entry order and ``identity;q=0, *`` never selects the
-    refused identity (APP-20). When every weight is 0 the pick is
+    refused identity. When every weight is 0 the pick is
     ``identity`` with quality 0.
 
     Args:

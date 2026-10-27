@@ -1936,8 +1936,8 @@ struct HttpClient(Movable):
         var u = Url.parse(url)
 
         # Pooling is enabled only for cleartext h1. The TLS path
-        # always full-handshakes (TLS resumption keeps that cheap;
-        # pool key-with-ALPN lands in a follow-up).
+        # always full-handshakes; TLS resumption keeps that cheap, and
+        # the pool key does not carry ALPN.
         var pool_enabled = (
             self._pool._addr != 0
             and not u.is_tls()
@@ -2131,9 +2131,9 @@ struct HttpClient(Movable):
 
         # A failure on a *pooled* fd may be a stale keep-alive, and the
         # request is re-sent on a fresh connection only when that cannot
-        # repeat its effect (see _may_replay). A read timeout after a
-        # POST was processed used to be replayed like any other error.
-        # Failure on a *fresh* fd is a real error.
+        # repeat its effect (see _may_replay): a read timeout after a
+        # POST was processed is not replayed. Failure on a *fresh* fd is
+        # a real error.
         stream.close()
         if not attempted_pooled:
             raise NetworkError("HTTP/1.1 pooled request failed: " + read_err)

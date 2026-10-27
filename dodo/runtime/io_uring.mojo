@@ -6,8 +6,7 @@ This is the **substrate**: the syscall wrappers, the
 ``io_uring_params`` struct, runtime feature detection, and
 allocation/teardown of a kernel ring. Submission-queue / completion-
 queue plumbing (SQE construction, CQE drain, multishot accept /
-recv / send) lands in follow-up commits that bolt onto this
-primitive without changing its public API.
+recv / send) lives in ``io_uring_sqe.mojo`` and ``uring_reactor.mojo``.
 
 Why io_uring
 ------------
@@ -41,9 +40,7 @@ Buffers, BufferRing, Multishot variants, Linked, Hardlinked,
 Splice, Tee, ZeroCopy, Discard, Bind, Listen, Sendmsg-zerocopy
 …). dodo needs only a small subset for HTTP/1.1 (multishot
 accept on the listener fd + recv on each accepted fd + send /
-sendv for the response). Shipping the substrate first lets the
-follow-up commits land that subset incrementally without
-re-touching the syscall-ABI plumbing.
+sendv for the response).
 
 What this module provides
 -------------------------
@@ -56,7 +53,7 @@ What this module provides
   ``struct io_uring_params`` ABI. Holds the ring sizes
   (``sq_entries`` / ``cq_entries``), the kernel-returned
   feature flags, and the per-region offset blobs needed for
-  the upcoming SQ/CQ mmaps.
+  the SQ/CQ mmaps.
 * **``io_uring_setup(entries, params) -> Int``** — wraps the
   ``SYS_io_uring_setup(2)`` syscall. Returns the ring file
   descriptor or a negative ``-errno`` on failure.
@@ -100,11 +97,9 @@ chooses the direct-syscall route because:
    syscall wrapper raises ``IoError`` / ``BrokenPipe`` /
    ``Timeout`` directly instead of returning C ``errno``.
 
-Wiring into the ``Reactor`` (the comptime branch that selects
-``UringReactor`` vs ``EpollReactor`` vs ``KqueueReactor`` based
-on kernel feature detection) is a follow-up commit that bolts
-onto this primitive without changing the existing
-``dodo.runtime.Reactor`` public surface.
+``dodo.runtime.Reactor`` never selects io_uring. The HTTP server uses
+it only through its opt-in buffer-ring loop (``use_bufring`` or
+``DODO_BUFRING_HANDLER=1``), which ``UringReactor`` drives.
 """
 
 from std.ffi import (
@@ -568,11 +563,6 @@ def is_io_uring_available() -> Bool:
     returns ``True``. On EINVAL / ENOSYS / EPERM (kernel too
     old, sandbox, container without ``io_uring_setup`` syscall
     permitted, …) returns ``False`` without raising.
-
-    Useful for the upcoming ``Reactor`` comptime branch:
-    ``UringReactor`` is selected when both
-    ``CompilationTarget.is_linux()`` and
-    ``is_io_uring_available()`` are true.
     """
     comptime if not CompilationTarget.is_linux():
         return False

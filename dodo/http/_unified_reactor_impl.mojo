@@ -791,7 +791,7 @@ def _accept_loop_unified_fd(
 
     ``max_connections`` (0 = unlimited) caps the per-worker live table
     and the errno decides the stop/skip action -- same admission
-    contract as the HTTP/1.1 ``_accept_loop_fd`` (D8).
+    contract as the HTTP/1.1 ``_accept_loop_fd``.
 
     When ``bal`` is enabled and this worker holds clearly more
     connections than the least-loaded peer, the new stream goes to that
@@ -891,7 +891,7 @@ def _unified_handle_conn_event[
         # the 101 has flushed. `_drive_h1_writable` applies the step
         # without migrating, so a 101 held back by a full send buffer
         # would leave the connection write-armed and re-announcing the
-        # upgrade on every poll (APP-47). With the handle in
+        # upgrade on every poll. With the handle in
         # STATE_WRITING, `on_readable` is a no-op that hands over to
         # `on_writable` inside `_drive_h1`.
         var h1_ptr = _conn_ptr_from_int(_addr(packed))

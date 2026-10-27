@@ -43,7 +43,7 @@ def test_obs_fold_is_refused() raises:
 
 
 def test_bare_lf_head_cannot_hide_a_blank_line() raises:
-    """H1-07: an LF-recognising peer ends this head at ``\\n\\n``.
+    """An LF-recognising peer ends this head at ``\\n\\n``.
 
     The client used to read to the first CRLFCRLF and skip the empty line,
     so ``Set-Cookie`` here was a header field to dodo and body to a cache
@@ -77,7 +77,7 @@ def test_crlf_head_is_still_parsed() raises:
 
 
 def test_status_code_of_more_than_three_digits_is_refused() raises:
-    """H1-08: ``HTTP/1.1 2041 OK`` is not a 204 with a stray digit.
+    """``HTTP/1.1 2041 OK`` is not a 204 with a stray digit.
 
     status-code is exactly 3DIGIT (RFC 9112 sec 4). A 204 has no body, so
     reading the code as 204 left the real body on the connection.
@@ -132,7 +132,7 @@ def _reusable(wire: String) raises -> Bool:
 
 
 def test_only_an_http11_response_keeps_the_connection() raises:
-    """H1-09: RFC 9112 sec 9.3 -- HTTP/1.0 closes unless it says keep-alive.
+    """RFC 9112 sec 9.3 -- HTTP/1.0 closes unless it says keep-alive.
 
     The reuse decision ignored the response version, so an HTTP/1.0 answer
     sent the connection back to the pool and the next request went to a
@@ -239,7 +239,7 @@ def test_well_formed_responses_still_parse() raises:
 
 
 def test_truncated_chunked_body_is_refused() raises:
-    """H1-06: a chunked body that ends before its last-chunk and the empty
+    """A chunked body that ends before its last-chunk and the empty
     line after the trailers is an incomplete message (RFC 9112 sec 7.1),
     not a short but complete one. Every proper prefix of a valid response
     must raise, for the whole-buffer parser and the legacy extractor."""

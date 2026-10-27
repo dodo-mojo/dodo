@@ -162,7 +162,7 @@ struct Url(Movable):
         # Cut at the LAST ``@``: userinfo may not contain a raw ``@`` but
         # lenient senders put one there, and no host form contains one
         # (RFC 3986 sec 3.2.2; WHATWG and curl split at the last ``@``), so
-        # ``http://a@evil.com@good.com/`` has host ``good.com`` (APP-25).
+        # ``http://a@evil.com@good.com/`` has host ``good.com``.
         var at_pos = _rfind(authority, "@")
         if at_pos >= 0:
             authority = String(

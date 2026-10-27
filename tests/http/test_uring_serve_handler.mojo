@@ -5,21 +5,16 @@ When :func:`dodo.runtime.uring_reactor.use_uring_backend` returns
 True, ``HttpServer.serve(handler)`` routes through
 ``run_uring_bufring_reactor_loop[H]`` (in
 ``dodo.http._server_reactor_impl``) -- the kernel-managed
-buffer-ring recv-multishot dispatch that supersedes the two
-reverted attempts (poll-multishot in ``c8cd770``, recv-multishot
-in ``981eb8e``). This file boots a real server on the io_uring
-handler path and validates two scenarios that surface the bugs
-those reverted attempts hit:
+buffer-ring recv-multishot dispatch. This file boots a real server on
+the io_uring handler path and checks two scenarios that break a naive
+uring loop:
 
-1. **Sequential keep-alive churn** (the recv-multishot 981eb8e
-   ConnHandle lifecycle bug at request #62 reproducer): one
-   client opens 8 connections in a row, fires 50 keep-alive
-   requests on each, closes between conns. Validates that the
-   kernel-managed buffer ring fully eliminates the per-conn
-   buffer pinning that triggered the lifecycle bug.
+1. **Sequential keep-alive churn**: one client opens 8 connections in a
+   row, fires 50 keep-alive requests on each, closes between conns.
+   Checks that the kernel-managed buffer ring keeps per-connection
+   state right across many requests and reconnects.
 
-2. **Concurrent fan-out** (the buffer-ring 9cf97d0 SIGSEGV
-   reproducer): 8 client conns in parallel, 50 requests each.
+2. **Concurrent fan-out**: 8 client conns in parallel, 50 requests each.
    Validates that the cancel-before-free fix in
    ``_cleanup_conn_uring_br`` eliminates the kernel race
    between conn close and reaccept on the same fd.
@@ -177,11 +172,9 @@ comptime _BenchHandler = FnHandlerCT[_handler]
 
 def test_serve_handler_sequential_keepalive_churn() raises:
     """8 sequential connections, 50 keep-alive requests each =
-    400 round-trips. Reproduces the 981eb8e lifecycle bug
-    (ConnHandle keepalive_count reset at request #62) and the
-    9cf97d0 SIGSEGV (kernel race on conn-close + reaccept-on-
-    same-fd). Both are now fixed via the buffer-ring substrate
-    (`bf6ca75`) + the cancel-before-free fix.
+    400 round-trips. Covers keep-alive counting across many requests
+    and the kernel race between conn close and reaccept on the same
+    fd.
     """
     comptime if not CompilationTarget.is_linux():
         print("(skipped: io_uring is Linux-only)")

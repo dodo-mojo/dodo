@@ -1,4 +1,4 @@
-"""An idle io_uring buffer-ring worker must see the stop flag (CONC-07).
+"""An idle io_uring buffer-ring worker must see the stop flag.
 
 The worker's ring has no wakeup channel and its loop waited with
 ``poll(1, ...)``, an ``io_uring_enter(min_complete=1)`` with no timeout, so

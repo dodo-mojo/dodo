@@ -65,7 +65,7 @@ Example:
         reason="OK",
         body=ChunkedBody[CountingSource](source=CountingSource(n=10)),
     )
-    # The reactor's serve_streaming entry point (C5) drives
+    # The reactor's serve_streaming entry point drives
     # body.next_chunk(cancel) on each writable edge; emits
     # ``Transfer-Encoding: chunked`` framing because
     # ``ChunkedBody.content_length()`` is None.

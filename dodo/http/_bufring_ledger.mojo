@@ -4,12 +4,11 @@ io_uring buffer-ring server loop.
 This is the sans-I/O kernel of ``run_uring_bufring_reactor_loop_shared``
 (``dodo/http/_server_reactor_uring.mojo``): the loop asks
 :func:`classify_recv` what to do with every receive completion and does
-exactly that. ``formal/Dodo/Kernels/BufLedger.lean`` proves the decisions
-never lose or double-return a provided buffer, so ``in_ring + in_cq ==
-ring_size`` holds across any sequence of kernel fills and completions.
-Issue #37 was a decision that skipped a stale completion without
-returning its buffer, which drained the ring until every receive failed
-with ``-ENOBUFS``.
+exactly that. The decisions never lose or double-return a provided
+buffer, so ``in_ring + in_cq == ring_size`` holds across any sequence of
+kernel fills and completions. A decision that skipped a stale completion
+without returning its buffer would drain the ring until every receive
+failed with ``-ENOBUFS``.
 """
 
 

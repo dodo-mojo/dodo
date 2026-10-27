@@ -224,7 +224,7 @@ def test_comptime_matches_runtime_route_shape() raises:
     assert_equal(resp.text(), "home")
 
 
-# ── Non-final wildcard (APP-10) ─────────────────────────────────────────────
+# ── Non-final wildcard ─────────────────────────────────────────────
 
 
 def _meta(req: Request) raises -> Response:
@@ -239,7 +239,7 @@ comptime _BAD_WILDCARD_ROUTES: List[ComptimeRoute] = [
 
 
 def test_non_final_wildcard_matches_nothing() raises:
-    """APP-10: ``*`` is only valid as the last segment (the runtime
+    """``*`` is only valid as the last segment (the runtime
     ``Router`` rejects such a pattern); the comptime router must not treat a
     middle ``*`` as a tail wildcard."""
     var r = ComptimeRouter[_BAD_WILDCARD_ROUTES]()
@@ -255,7 +255,7 @@ def test_non_final_wildcard_matches_nothing() raises:
 
 
 def test_final_wildcard_still_captures_rest() raises:
-    """APP-10: a table with an invalid route keeps routing its valid ones."""
+    """A table with an invalid route keeps routing its valid ones."""
     var r = ComptimeRouter[_BAD_WILDCARD_ROUTES]()
     var resp = r.serve(Request(method=Method.GET, url="/ok/a/b"))
     assert_equal(resp.status, Status.OK)

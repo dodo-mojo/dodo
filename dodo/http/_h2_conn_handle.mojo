@@ -211,7 +211,7 @@ struct Http2ConnHandle(Movable):
     redundant ``reactor.modify`` syscalls when the wanted
     interest hasn't actually changed since the previous event."""
 
-    # ── Streaming response state (K1 on h2) ────────────────────────────
+    # ── Streaming response state ────────────────────────────
     # HTTP/2 multiplexes: N handlers can each return a streaming Response
     # concurrently on one connection. Each active streaming stream is
     # boxed in _stream_out keyed on its stream id and pumped fairly (one
@@ -678,7 +678,7 @@ struct Http2ConnHandle(Movable):
             else:
                 self._ws_tunnels[sid] = carrier^
 
-    # ── Streaming response (K1 on h2) ────────────────────────────────────────
+    # ── Streaming response ────────────────────────────────────────
 
     def _begin_stream(mut self, sid: Int, var resp: Response) raises:
         """Adopt ``resp`` as a concurrent streaming response on ``sid``.
@@ -1286,7 +1286,7 @@ struct Http2ConnHandle(Movable):
         # write_buf fully drained; reset for the next response.
         _reset_retained(self.write_buf)
         self.write_pos = 0
-        # Streaming responses (K1 on h2): refill from every active chunk
+        # Streaming responses: refill from every active chunk
         # source, window permitting, and stay in STATE_WRITING to flush.
         # When the pump queues nothing but streams are still active the
         # send windows are exhausted -- fall through to STATE_READING to

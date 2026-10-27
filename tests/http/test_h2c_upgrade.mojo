@@ -259,7 +259,7 @@ def _ok(req: Request) raises -> Response:
 
 
 def test_h2c_upgrade_101_flushed_on_a_writable_edge_migrates() raises:
-    """APP-47: a 101 that only flushes on a writable edge must still
+    """A 101 that only flushes on a writable edge must still
     migrate the connection to HTTP/2. The handle is driven to the
     "101 queued, nothing written" state by calling ``on_readable``
     directly, so the first socket write happens on the writable edge
