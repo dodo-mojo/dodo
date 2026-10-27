@@ -38,6 +38,12 @@ from std.memory import unsafe_memcpy, stack_allocation
 from dodo.crypto.hmac import base64url_decode
 from dodo.errors import map_handler_error, log_handler_error
 from dodo.http.cancel import CancelCell, CancelReason
+from dodo.http._offload_pool import (
+    offload_cancel,
+    offload_job,
+    offload_submit,
+    unavailable_response,
+)
 from dodo.http.handler import Handler, CancelHandler
 from dodo.http.headers import HeaderMap
 from dodo.http.request import Request
@@ -69,6 +75,7 @@ from .keepalive_scan import (
     LINGER_TOTAL_MS,
     STATE_CLOSING,
     STATE_LINGERING,
+    STATE_PARKED,
     STATE_READING,
     STATE_WRITING,
     StepResult,
@@ -139,8 +146,32 @@ comptime PIPELINE_BATCH_REQUESTS: Int = 32
 comptime PIPELINE_BATCH_BYTES: Int = 64 * 1024
 """Response bytes a pipelined batch may hold before it is flushed."""
 
+comptime PARKED_READ_LIMIT: Int = 64 * 1024
+"""Bytes a parked connection keeps of what the client sends while its
+request is on the offload pool. Past this the connection closes after the
+response and further input is dropped."""
+
 
 # ── Connection handle ─────────────────────────────────────────────────────────
+
+
+def _wants_offload[H: Handler](ref handler: H, req: Request) -> Bool:
+    """Whether ``handler`` sends ``req`` to the offload pool. A
+    ``blocking`` that raises keeps the request inline."""
+    try:
+        return handler.blocking(req)
+    except:
+        return False
+
+
+def _wants_offload_cancel[
+    CH: CancelHandler
+](ref handler: CH, req: Request) -> Bool:
+    """:func:`_wants_offload` for a ``CancelHandler``."""
+    try:
+        return handler.blocking(req)
+    except:
+        return False
 
 
 def _is_ws_version_mismatch(req: Request) -> Bool:
@@ -399,6 +430,17 @@ struct ConnHandle(Movable):
     interests and the reactor re-enters the *other* drive function on
     the next edge. Always False for cleartext."""
 
+    var offload_port: Int
+    """The worker's ``OffloadPort`` address, or 0 when its handler never
+    offloads (or the loop has no pool). Set by the unified loop."""
+
+    var offload_job: Int
+    """The job this connection is parked on (``STATE_PARKED``), else 0."""
+
+    var offload_close: Bool
+    """Whether the connection closes after the parked request's
+    response, decided when the request was parsed."""
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def __init__(
@@ -455,6 +497,9 @@ struct ConnHandle(Movable):
         self.tls = Optional[TlsTransport]()
         self.is_chunked = False
         self.tls_cross_interest = False
+        self.offload_port = 0
+        self.offload_job = 0
+        self.offload_close = False
 
     def attach_tls(mut self, var transport: TlsTransport):
         """Adopt the ``SSL*`` of an already-handshaken connection.
@@ -862,12 +907,7 @@ struct ConnHandle(Movable):
         serialise ``resp`` into ``self.write_buf``, and transition
         into ``STATE_WRITING``.
         """
-        if self.body_total > 0 and self.body_total <= len(self.read_buf):
-            _compact_read_buf_drop_prefix(self.read_buf, self.body_total)
-        self.headers_end = -1
-        self.content_length = 0
-        self.body_total = -1
-        self.is_chunked = False
+        self._consume_request()
         # Streaming path (K1): a handler that returned a streaming
         # Response carries a chunk source. Take it onto the connection,
         # emit chunked-framed headers, and let ``on_writable`` pull the
@@ -895,6 +935,195 @@ struct ConnHandle(Movable):
             self.write_pos = 0
         return self._transition_to_writing()
 
+    def _consume_request(mut self):
+        """Drop the request just parsed from ``read_buf`` and reset the
+        per-request offsets for the next one."""
+        if self.body_total > 0 and self.body_total <= len(self.read_buf):
+            _compact_read_buf_drop_prefix(self.read_buf, self.body_total)
+        self.headers_end = -1
+        self.content_length = 0
+        self.body_total = -1
+        self.is_chunked = False
+
+    # ── Offload (ADR-0004) ───────────────────────────────────────────────────
+
+    def _offload(
+        mut self, var req: Request, close_after: Bool, config: ServerConfig
+    ) raises -> StepResult:
+        """Send ``req`` to the offload pool and park the connection.
+
+        Nothing more is parsed until the response is back, since HTTP/1.1
+        answers in order; the socket is still read to notice the client
+        leaving. ``handler_timeout_ms`` arms the connection's timer. A
+        full queue is answered at once with 503.
+        """
+        var job = offload_submit(self.offload_port, req^, Int(self.fd()), 0)
+        if job == 0:
+            return self._finalise_response(unavailable_response(), close_after)
+        self._consume_request()
+        self.offload_job = job
+        self.offload_close = close_after
+        self.state = STATE_PARKED
+        return StepResult(
+            want_read=True,
+            want_write=len(self.write_buf) > self.write_pos,
+            idle_timeout_ms=config.handler_timeout_ms,
+        )
+
+    def _parked_step(self) -> StepResult:
+        """Interest while parked: read (to see the client leave), and
+        write while earlier pipelined responses are still going out. The
+        handler deadline timer stays as it is."""
+        return StepResult(
+            want_read=True, want_write=len(self.write_buf) > self.write_pos
+        )
+
+    def _parked_read(mut self) raises -> StepResult:
+        """Read while parked. A close or a read error means the client
+        is gone: its job is cancelled with ``PEER_CLOSED`` and the
+        connection finishes. Anything else the client sends is kept for
+        after the response, up to ``PARKED_READ_LIMIT``."""
+        var gone = False
+        if self.tls:
+            while True:
+                var got = self.tls.value().recv(self.read_buf, 8192)
+                if got > 0:
+                    continue
+                if got == SSL_IO_WANT_READ:
+                    break
+                if got == SSL_IO_WANT_WRITE:
+                    self.tls_cross_interest = True
+                    break
+                gone = True
+                break
+        else:
+            var chunk = stack_allocation[8192, UInt8]()
+            while True:
+                var got = _recv(self.fd(), chunk, c_size_t(8192), c_int(0))
+                if got > 0:
+                    var old_len = len(self.read_buf)
+                    var got_int = Int(got)
+                    self.read_buf.resize(old_len + got_int, UInt8(0))
+                    var dst = self.read_buf.unsafe_ptr().unsafe_offset(old_len)
+                    unsafe_memcpy(dest=dst, src=chunk, count=got_int)
+                    continue
+                if got == 0:
+                    gone = True
+                    break
+                var e = get_errno()
+                if e == ErrNo.EINTR:
+                    continue
+                if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                    break
+                gone = True
+                break
+        if gone:
+            self.offload_abandon(CancelReason.PEER_CLOSED)
+            self.should_close = True
+            return StepResult(want_read=False, want_write=False, done=True)
+        if len(self.read_buf) > PARKED_READ_LIMIT:
+            self.read_buf.clear()
+            self.offload_close = True
+            self.should_close = True
+        if self.tls_cross_interest:
+            return StepResult(want_read=True, want_write=True)
+        return self._parked_step()
+
+    def _parked_bytes(mut self, bytes: Span[UInt8, _]) -> StepResult:
+        """Keep bytes the io_uring loop received while parked, for after
+        the response, up to ``PARKED_READ_LIMIT``. That loop sees the
+        client leave on its own, from the receive completion."""
+        self.read_buf.extend(bytes)
+        if len(self.read_buf) > PARKED_READ_LIMIT:
+            self.read_buf.clear()
+            self.offload_close = True
+            self.should_close = True
+        return self._parked_step()
+
+    def offload_abandon(mut self, reason: Int):
+        """Give up on the parked job: flip its cancel cell to ``reason``
+        and forget it, so its result is dropped when it comes back."""
+        if self.offload_job == 0:
+            return
+        offload_cancel(self.offload_job, reason)
+        self.offload_job = 0
+
+    def offload_done(mut self, job: Int) raises -> Optional[StepResult]:
+        """Queue the response of ``job``, back from the pool. ``None``
+        when this connection is no longer waiting for it (it timed out,
+        or the fd now belongs to another connection): the result is
+        dropped."""
+        if self.state != STATE_PARKED or self.offload_job != job:
+            return Optional[StepResult]()
+        self.offload_job = 0
+        var jp = offload_job(job)
+        if jp[].resp:
+            return Optional[StepResult](self._unpark(jp[].resp.take()))
+        if jp[].err_status != 0:
+            return Optional[StepResult](
+                self._unpark_error(jp[].err_status, jp[].err_reason)
+            )
+        return Optional[StepResult](self._unpark(unavailable_response()))
+
+    def offload_timeout(mut self) raises -> StepResult:
+        """``handler_timeout_ms`` ran out while parked: cancel the job
+        with ``TIMEOUT`` and answer 503."""
+        self.offload_abandon(CancelReason.TIMEOUT)
+        return self._unpark(unavailable_response())
+
+    def _keep_earlier_output(mut self):
+        """Set aside responses to earlier pipelined requests that are
+        still unsent, so the parked request's response goes after them
+        (``_merge_batch`` puts them back in front)."""
+        for i in range(self.write_pos, len(self.write_buf)):
+            self.batch_out.append(self.write_buf[i])
+        self.write_buf.clear()
+        self.write_pos = 0
+
+    def _unpark(mut self, var resp: Response) raises -> StepResult:
+        self._keep_earlier_output()
+        var step = self._finalise_response(resp^, self.offload_close)
+        self._merge_batch()
+        return step
+
+    def _unpark_error(mut self, status: Int, reason: String) -> StepResult:
+        self._keep_earlier_output()
+        self._queue_error(status, reason)
+        var step = self._transition_to_writing()
+        self._merge_batch()
+        return step
+
+    def _flush_parked(mut self) raises -> StepResult:
+        """Send earlier pipelined responses while parked."""
+        if self.tls:
+            var tls_step = self._flush_write_buf_tls()
+            if tls_step:
+                return tls_step.value()
+        else:
+            while self.write_pos < len(self.write_buf):
+                var remaining = len(self.write_buf) - self.write_pos
+                var ptr = self.write_buf.unsafe_ptr().unsafe_offset(
+                    self.write_pos
+                )
+                var n = _send(
+                    self.fd(), ptr, c_size_t(remaining), c_int(MSG_NOSIGNAL)
+                )
+                if n > 0:
+                    self.write_pos += Int(n)
+                    continue
+                var e = get_errno()
+                if e == ErrNo.EINTR:
+                    continue
+                if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                    break
+                self.offload_abandon(CancelReason.PEER_CLOSED)
+                self.should_close = True
+                return StepResult(want_read=False, want_write=False, done=True)
+        if self.write_pos == len(self.write_buf):
+            self.write_buf.clear()
+            self.write_pos = 0
+        return self._parked_step()
+
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def on_readable[
@@ -912,6 +1141,13 @@ struct ConnHandle(Movable):
             step = self._serve_next(handler, config, False)
             served += 1
         self._merge_batch()
+        if self.state == STATE_PARKED:
+            # The batch ended on an offloaded request. Earlier responses in
+            # the batch still go out now; the handler deadline set by
+            # ``_offload`` stands.
+            var parked = self._parked_step()
+            parked.idle_timeout_ms = step.idle_timeout_ms
+            return parked
         if self.state == STATE_READING and len(self.write_buf) > self.write_pos:
             # The batch ended on a request that isn't complete yet. Send
             # the responses it already has instead of holding them.
@@ -940,6 +1176,8 @@ struct ConnHandle(Movable):
         """
         if self.state == STATE_LINGERING:
             return self._linger_read()
+        if self.state == STATE_PARKED:
+            return self._parked_read()
         if self.state != STATE_READING:
             return StepResult(
                 want_read=False, want_write=self.state == STATE_WRITING
@@ -1101,6 +1339,8 @@ struct ConnHandle(Movable):
                 )
 
         var final_close = self._apply_keepalive_policy(config, close_after)
+        if self.offload_port != 0 and _wants_offload(handler, req):
+            return self._offload(req^, final_close, config)
         var expose_errors = req.expose_errors
         var request_id = req.headers.get("x-request-id")
         var resp: Response
@@ -1141,6 +1381,8 @@ struct ConnHandle(Movable):
             A ``StepResult`` describing the new reactor-interest
             state.
         """
+        if self.state == STATE_PARKED:
+            return self._parked_bytes(bytes)
         if self.state != STATE_READING:
             return StepResult(
                 want_read=False, want_write=self.state == STATE_WRITING
@@ -1202,6 +1444,8 @@ struct ConnHandle(Movable):
             return self._transition_to_writing()
 
         var final_close = self._apply_keepalive_policy(config, close_after)
+        if self.offload_port != 0 and _wants_offload(handler, req):
+            return self._offload(req^, final_close, config)
         var expose_errors = req.expose_errors
         var request_id = req.headers.get("x-request-id")
         var resp: Response
@@ -1224,7 +1468,11 @@ struct ConnHandle(Movable):
         request, flipped to ``PEER_CLOSED`` on ``recv == 0``
         observed before the handler runs, and a ``Cancel`` handle
         bound to the cell is passed to ``CH.serve(req, cancel)``.
+        A request the handler marks ``blocking`` goes to the offload
+        pool instead, which binds ``cancel`` to the job.
         """
+        if self.state == STATE_PARKED:
+            return self._parked_read()
         if self.state != STATE_READING:
             return StepResult(
                 want_read=False, want_write=self.state == STATE_WRITING
@@ -1282,6 +1530,8 @@ struct ConnHandle(Movable):
 
         var close_after = _compute_close_after(req.headers, req.version)
         var final_close = self._apply_keepalive_policy(config, close_after)
+        if self.offload_port != 0 and _wants_offload_cancel(handler, req):
+            return self._offload(req^, final_close, config)
         var expose_errors = req.expose_errors
         var request_id = req.headers.get("x-request-id")
         var resp: Response
@@ -1464,6 +1714,8 @@ struct ConnHandle(Movable):
         Returns:
             A ``StepResult`` describing the new reactor-interest state.
         """
+        if self.state == STATE_PARKED:
+            return self._flush_parked()
         if self.state != STATE_WRITING:
             var reading = (
                 self.state == STATE_READING or self.state == STATE_LINGERING

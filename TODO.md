@@ -19,7 +19,6 @@
 - [ ] Publish `0.0.1` and open the modular-community PR using `packaging/recipe.yaml`. This claims the `dodo` package name and needs a minimal working server.
 - [ ] Enable GitHub Pages for docs at `dodo-mojo.github.io/dodo`.
 - [ ] PyPI `dodo-mojo`: only if we ship a pip-installable CLI.
-- [ ] Audit F7: build the offload pool (ADR-0004, accepted), including the `offload_queue_depth` bound. F1–F6 and F8–F10 are fixed (see `docs/flare-audit.md`).
 - [ ] Review, after the offload pool lands: is it worth folding `serve_cancellable`'s `Cancel` support and the streaming loop into the unified loop, so the remaining separate loops can be deleted? Weigh the code removed against the risk and the performance-pass numbers.
 - [ ] Rebuild the live-server checks the import dropped (they needed upstream's benchmark and example servers): h2spec, the Autobahn WebSocket suite, curl/h2load interop, and ASan/TSan runs. Each needs a small test server under `tests/`. The audit probes (`research/flare-audit/probe.py`) belong there too.
 - [ ] Lingering close (after an early error response) runs only on the unified loop for cleartext. The HTTP/1.1-only loops (`serve_cancellable`, io_uring) and TLS still close at once.

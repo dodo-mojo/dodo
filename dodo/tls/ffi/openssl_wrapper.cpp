@@ -308,11 +308,30 @@ int dodo_ssl_read(dodo_ssl_t ssl, uint8_t* buf, int len) {
     return n;
 }
 
+/* A signal (or, on Linux, io_uring task work) landing during a blocking
+ * recv/send on a socket with SO_RCVTIMEO / SO_SNDTIMEO makes it fail with
+ * EINTR, which the kernel never restarts. OpenSSL reports that as
+ * WANT_READ / WANT_WRITE, the same as a timeout, so the blocking calls
+ * look at errno and try again, as TcpStream does. */
+static bool interrupted_by_signal(int err, int saved_errno) {
+    if (saved_errno != EINTR) return false;
+    return err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE;
+}
+
 int dodo_ssl_write(dodo_ssl_t ssl, const uint8_t* buf, int len) {
-    ERR_clear_error();
-    int n = SSL_write(static_cast<SSL*>(ssl), buf, len);
-    if (n < 0) capture_openssl_errors();
-    return n;
+    SSL* s = static_cast<SSL*>(ssl);
+    while (true) {
+        ERR_clear_error();
+        errno = 0;
+        int n = SSL_write(s, buf, len);
+        if (n > 0) return n;
+        int saved_errno = errno;
+        int err = SSL_get_error(s, n);
+        if (!interrupted_by_signal(err, saved_errno)) {
+            if (n < 0) capture_openssl_errors();
+            return n;
+        }
+    }
 }
 
 // Map an SSL_get_error result on a <= 0 SSL_read/SSL_write return into
@@ -341,11 +360,18 @@ int dodo_ssl_read_ex(dodo_ssl_t ssl, uint8_t* buf, int len) {
 }
 
 int dodo_ssl_read_blocking(dodo_ssl_t ssl, uint8_t* buf, int len) {
-    ERR_clear_error();
     SSL* s = static_cast<SSL*>(ssl);
-    int n = SSL_read(s, buf, len);
-    if (n > 0) return n;
-    int err = SSL_get_error(s, n);
+    int n = 0;
+    int err = SSL_ERROR_NONE;
+    while (true) {
+        ERR_clear_error();
+        errno = 0;
+        n = SSL_read(s, buf, len);
+        if (n > 0) return n;
+        int saved_errno = errno;
+        err = SSL_get_error(s, n);
+        if (!interrupted_by_signal(err, saved_errno)) break;
+    }
     /* On a blocking fd these two mean the socket's own SO_RCVTIMEO /
      * SO_SNDTIMEO expired -- recv/send returned EAGAIN mid-record. */
     if (err == SSL_ERROR_WANT_READ)  return DODO_SSL_IO_WANT_READ;

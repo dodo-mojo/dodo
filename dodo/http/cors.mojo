@@ -223,3 +223,9 @@ struct Cors[Inner: Handler & Copyable](Copyable, Handler):
         var resp = self.inner.serve(req).lower()
         self._attach_origin(resp, origin)
         return resp^
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)

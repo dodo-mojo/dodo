@@ -55,6 +55,14 @@ from std.ffi import c_int, get_errno
 from std.memory import Pointer
 
 from dodo.http.cancel import CancelReason
+from dodo.http._offload_pool import (
+    offload_cancel_all,
+    offload_free,
+    offload_job,
+    offload_outstanding,
+    offload_port_open,
+    offload_take_done,
+)
 from dodo.http.handler import Handler
 from dodo.http.server import ServerConfig
 from dodo.http2.server import Http2Config
@@ -96,6 +104,7 @@ from ._h2_conn_handle import (
     _pending_conn_free_addr,
     _pending_conn_ptr_from_int,
 )
+from ._reactor.offload_loop import close_offload_port
 from ._reactor.lifecycle import (
     _collect_fired_timers,
     _expired_idle_conns,
@@ -105,6 +114,7 @@ from ._reactor.lifecycle import (
 from ._server_reactor_impl import (
     ConnHandle,
     StepResult,
+    STATE_PARKED,
     STATE_READING,
     STATE_WRITING,
     _apply_step,
@@ -160,6 +170,7 @@ def _drive_h1[
     mut wheel: TimerWheel,
     mut timers: Dict[Int, UInt64],
     ws_hooks: Optional[WsH2Hooks] = None,
+    offload_port: Int = 0,
 ) raises -> Bool:
     """Drive one HTTP/1.1 ConnHandle through ``on_readable`` (with
     the same 3-cycle inline fast-path the standalone HTTP/1.1
@@ -176,6 +187,7 @@ def _drive_h1[
     must clean it up); ``False`` to keep it live.
     """
     var ch_ptr = _conn_ptr_from_int(addr)
+    ch_ptr[].offload_port = offload_port
     var step_done: Bool
     try:
         var last_step = ch_ptr[].on_readable(handler, config)
@@ -229,6 +241,7 @@ def _drive_h1[
                         reactor,
                         wheel,
                         timers,
+                        offload_port=offload_port,
                     )
                     return done_h2
             return False
@@ -327,9 +340,11 @@ def _drive_h2[
     mut reactor: Reactor,
     mut wheel: TimerWheel,
     mut timers: Dict[Int, UInt64],
+    offload_port: Int = 0,
 ) raises -> Bool:
     """Drive one HTTP/2 Http2ConnHandle through one event."""
     var h2_ptr = _h2_conn_ptr_from_int(addr)
+    h2_ptr[].offload_port = offload_port
     var step_done: Bool
     try:
         var last_step: StepResult
@@ -397,6 +412,9 @@ def _cleanup_conn_unified(
         elif k == KIND_H1:
             _conn_free_addr(a)
         elif k == KIND_H2:
+            _h2_conn_ptr_from_int(a)[].offload_abandon_all(
+                CancelReason.PEER_CLOSED
+            )
             _h2_conn_free_addr(a)
         elif k == KIND_TLS:
             _tls_conn_free_addr(a)
@@ -842,6 +860,7 @@ def _unified_handle_conn_event[
     mut timers: Dict[Int, UInt64],
     ws_hooks: Optional[WsH2Hooks] = None,
     peer_hup: Bool = False,
+    offload_port: Int = 0,
 ) raises:
     """Dispatch one reactor event for an already-known connection fd.
 
@@ -897,6 +916,7 @@ def _unified_handle_conn_event[
                 wheel,
                 timers,
                 ws_hooks.copy(),
+                offload_port=offload_port,
             )
         elif is_writable:
             done3 = _drive_h1_writable(
@@ -929,6 +949,7 @@ def _unified_handle_conn_event[
                     wheel,
                     timers,
                     ws_hooks.copy(),
+                    offload_port=offload_port,
                 )
         if done3:
             _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
@@ -949,6 +970,7 @@ def _unified_handle_conn_event[
             reactor,
             wheel,
             timers,
+            offload_port=offload_port,
         )
         if done4:
             _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
@@ -1004,6 +1026,7 @@ def _unified_handle_conn_event[
                 reactor,
                 wheel,
                 timers,
+                offload_port=offload_port,
             ):
                 _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         else:
@@ -1018,6 +1041,7 @@ def _unified_handle_conn_event[
                 wheel,
                 timers,
                 ws_hooks.copy(),
+                offload_port=offload_port,
             ):
                 _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
         return
@@ -1056,6 +1080,7 @@ def _unified_handle_conn_event[
             reactor,
             wheel,
             timers,
+            offload_port=offload_port,
         )
         if done:
             _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
@@ -1071,6 +1096,7 @@ def _unified_handle_conn_event[
             wheel,
             timers,
             ws_hooks.copy(),
+            offload_port=offload_port,
         )
         if done2:
             _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
@@ -1112,16 +1138,185 @@ def _drain_remaining_conns_unified(
         if packed != 0:
             var k = _kind(packed)
             if k == KIND_H1:
-                _conn_ptr_from_int(_addr(packed))[].cancel_cell.flip(
-                    CancelReason.SHUTDOWN
-                )
+                var ch = _conn_ptr_from_int(_addr(packed))
+                ch[].cancel_cell.flip(CancelReason.SHUTDOWN)
+                ch[].offload_abandon(CancelReason.SHUTDOWN)
             elif k == KIND_H2:
+                var h2 = _h2_conn_ptr_from_int(_addr(packed))
+                h2[].offload_abandon_all(CancelReason.SHUTDOWN)
                 try:
-                    _h2_conn_ptr_from_int(_addr(packed))[].signal_drain()
+                    h2[].signal_drain()
                 except:
                     pass
         _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
     return len(leftover)
+
+
+# ── Offload pool (ADR-0004) ────────────────────────────────────────────────
+
+
+def _deliver_offloads[
+    H: Handler
+](
+    port: Int,
+    ref handler: H,
+    config: ServerConfig,
+    h2_config: Http2Config,
+    mut conns: Dict[Int, Int],
+    mut reactor: Reactor,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+    ws_hooks: Optional[WsH2Hooks] = None,
+) raises:
+    """Hand each finished job back to its connection and start writing
+    the response. A job whose connection or stream stopped waiting
+    (timeout, client gone, fd reused) is dropped. Every job is freed."""
+    var jobs = offload_take_done(port)
+    for i in range(len(jobs)):
+        var job = jobs[i]
+        var fd = offload_job(job)[].fd
+        var sid = offload_job(job)[].sid
+        var queued = False
+        var finished = False
+        if fd in conns:
+            var packed = conns[fd]
+            if _kind(packed) == KIND_H1 and sid == 0:
+                var ch = _conn_ptr_from_int(_addr(packed))
+                try:
+                    var step = ch[].offload_done(job)
+                    if step:
+                        _apply_step(
+                            fd, step.value(), reactor, wheel, timers, ch
+                        )
+                        queued = True
+                except:
+                    finished = True
+            elif _kind(packed) == KIND_H2 and sid != 0:
+                var h2 = _h2_conn_ptr_from_int(_addr(packed))
+                try:
+                    var step = h2[].offload_done(sid, job, config)
+                    if step:
+                        if step.value().done:
+                            finished = True
+                        else:
+                            _apply_step_h2(
+                                fd, step.value(), reactor, wheel, timers, h2
+                            )
+                            queued = True
+                except:
+                    finished = True
+        offload_free(job)
+        if finished:
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
+        elif queued and fd in conns:
+            # Flush now rather than wait a poll for the writable edge.
+            _unified_handle_conn_event(
+                fd,
+                conns[fd],
+                False,
+                True,
+                handler,
+                config,
+                h2_config,
+                conns,
+                reactor,
+                wheel,
+                timers,
+                ws_hooks.copy(),
+                offload_port=port,
+            )
+
+
+def _offload_timer_fired(
+    fd: Int,
+    config: ServerConfig,
+    mut conns: Dict[Int, Int],
+    mut reactor: Reactor,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+) raises -> Bool:
+    """Handle a fired timer that was an offload deadline: a parked
+    HTTP/1.1 request, or parked HTTP/2 streams on a reading connection.
+    True when handled here; False leaves it to the idle reaper."""
+    if fd not in conns:
+        return False
+    var packed = conns[fd]
+    if _kind(packed) == KIND_H1:
+        var ch = _conn_ptr_from_int(_addr(packed))
+        if ch[].state != STATE_PARKED:
+            return False
+        var step = ch[].offload_timeout()
+        _apply_step(fd, step, reactor, wheel, timers, ch)
+        return True
+    if _kind(packed) == KIND_H2:
+        var h2 = _h2_conn_ptr_from_int(_addr(packed))
+        if not h2[].has_parked_streams() or h2[].state != STATE_READING:
+            return False
+        var step = h2[].offload_timer(config)
+        if step.done:
+            return False
+        _apply_step_h2(fd, step, reactor, wheel, timers, h2)
+        return True
+    return False
+
+
+def _begin_offload_settle(
+    port: Int,
+    listener_fds: List[Int],
+    config: ServerConfig,
+    mut conns: Dict[Int, Int],
+    mut reactor: Reactor,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+) raises:
+    """Start a graceful shutdown that waits for offloaded requests.
+
+    Stops accepting, flips ``SHUTDOWN`` on every job still out (queued
+    ones are then answered 503 without running), sends GOAWAY on HTTP/2
+    connections with parked streams, and closes every connection that
+    has nothing parked.
+    """
+    for i in range(len(listener_fds)):
+        try:
+            reactor.unregister(c_int(listener_fds[i]))
+        except:
+            pass
+    offload_cancel_all(port, CancelReason.SHUTDOWN)
+    var fds = List[Int]()
+    for kv in conns.items():
+        fds.append(kv.key)
+    for i in range(len(fds)):
+        var fd = fds[i]
+        var packed = conns[fd]
+        if _kind(packed) == KIND_H1:
+            var ch = _conn_ptr_from_int(_addr(packed))
+            if ch[].state == STATE_PARKED:
+                ch[].offload_close = True
+                continue
+            ch[].cancel_cell.flip(CancelReason.SHUTDOWN)
+        elif _kind(packed) == KIND_H2:
+            var h2 = _h2_conn_ptr_from_int(_addr(packed))
+            if h2[].has_parked_streams():
+                var step = h2[].begin_close(config)
+                _apply_step_h2(fd, step, reactor, wheel, timers, h2)
+                continue
+            h2[].signal_drain()
+        _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
+
+
+def _offload_settled(conns: Dict[Int, Int]) raises -> Bool:
+    """No connection is parked or still writing a response."""
+    for kv in conns.items():
+        var packed = kv.value
+        if _kind(packed) == KIND_H1:
+            var state = _conn_ptr_from_int(_addr(packed))[].state
+            if state == STATE_PARKED or state == STATE_WRITING:
+                return False
+        elif _kind(packed) == KIND_H2:
+            var h2 = _h2_conn_ptr_from_int(_addr(packed))
+            if h2[].has_parked_streams() or h2[].state == STATE_WRITING:
+                return False
+    return True
 
 
 # ── Unified reactor loop -- single listener (single-worker) ────────────────
@@ -1188,7 +1383,42 @@ def _run_unified_loop_for_fd[
     # Joins the scheduler's accept-balancing group (disabled for a lone
     # worker or when ``DODO_BALANCE_ACCEPT=0``).
     var bal = Balancer.open(stats_addr, reactor.wake_fd())
-    while not load_stop_flag(stopping_addr):
+    # A handler with an ``Offload`` somewhere inside gets a port to the
+    # offload pool; any other handler never touches it.
+    var offload_port = 0
+    if handler.may_block():
+        offload_port = offload_port_open(
+            handler,
+            reactor.wake_fd(),
+            config.offload_threads,
+            config.offload_queue_depth,
+        )
+    var all_listeners = List[Int]()
+    all_listeners.append(listener_fd)
+    for i in range(len(extra_fds)):
+        all_listeners.append(extra_fds[i])
+    # Non-zero once the stop flag is seen with offloaded requests out:
+    # the loop keeps serving their connections until this deadline.
+    var settle_deadline = 0
+    while True:
+        if settle_deadline == 0 and load_stop_flag(stopping_addr):
+            if offload_outstanding(offload_port) == 0:
+                break
+            settle_deadline = _monotonic_ms() + max(
+                config.shutdown_timeout_ms, 0
+            )
+            _begin_offload_settle(
+                offload_port,
+                all_listeners,
+                config,
+                conns,
+                reactor,
+                wheel,
+                timers,
+            )
+        if settle_deadline != 0:
+            if _offload_settled(conns) or _monotonic_ms() >= settle_deadline:
+                break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         bal.publish(len(conns))
         events.clear()
@@ -1197,7 +1427,7 @@ def _run_unified_loop_for_fd[
         except:
             exit_status = WORKER_STATUS_CRASHED
             break
-        if bal.pending() > 0:
+        if settle_deadline == 0 and bal.pending() > 0:
             _adopt_handed_off(
                 bal,
                 reactor,
@@ -1262,6 +1492,20 @@ def _run_unified_loop_for_fd[
                 timers,
                 ws_hooks.copy(),
                 peer_hup=evt.is_hup(),
+                offload_port=offload_port,
+            )
+
+        if offload_outstanding(offload_port) > 0:
+            _deliver_offloads(
+                offload_port,
+                handler,
+                config,
+                h2_config,
+                conns,
+                reactor,
+                wheel,
+                timers,
+                ws_hooks.copy(),
             )
 
         # Deadlines that passed while this poll's events were pending are
@@ -1269,8 +1513,30 @@ def _run_unified_loop_for_fd[
         # served above and re-armed its timer, so it is spared.
         var expired = _expired_idle_conns(fired_fds, fired_ids, conns, timers)
         for i in range(len(expired)):
-            _cleanup_conn_unified(expired[i], conns, timers, reactor, wheel)
-        gate.sync(reactor, len(conns), config.max_connections)
+            var fd = expired[i]
+            if offload_port != 0 and _offload_timer_fired(
+                fd, config, conns, reactor, wheel, timers
+            ):
+                if fd in conns:
+                    _unified_handle_conn_event(
+                        fd,
+                        conns[fd],
+                        False,
+                        True,
+                        handler,
+                        config,
+                        h2_config,
+                        conns,
+                        reactor,
+                        wheel,
+                        timers,
+                        ws_hooks.copy(),
+                        offload_port=offload_port,
+                    )
+                continue
+            _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
+        if settle_deadline == 0:
+            gate.sync(reactor, len(conns), config.max_connections)
 
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)
     # Stop taking hand-offs, then close what peers queued before that
@@ -1287,6 +1553,7 @@ def _run_unified_loop_for_fd[
     var still_live = _drain_remaining_conns_unified(
         conns, timers, reactor, wheel
     )
+    close_offload_port(offload_port)
     store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, still_live)
 
 

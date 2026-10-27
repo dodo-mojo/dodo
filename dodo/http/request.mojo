@@ -4,6 +4,7 @@ from std.collections import Dict, Optional
 from std.memory import Layout, Pointer, alloc
 from json import loads, Value
 
+from .cancel import Cancel
 from .headers import HeaderMap
 from .cookie import Cookie, CookieJar, parse_cookie_header
 from .proto.ascii import ascii_unchecked_string
@@ -88,6 +89,12 @@ struct Request(Movable):
     Default False; the reactor copies
     ``ServerConfig.expose_error_messages`` onto every parsed request.
     See struct docstring."""
+    var cancel: Cancel
+    """Set by the server when the request runs on the offload pool
+    (``Offload``): it flips to ``TIMEOUT``, ``PEER_CLOSED`` or
+    ``SHUTDOWN`` while the handler runs, so a long handler can poll
+    ``req.cancel.cancelled()`` and stop early. Inline handlers, which
+    nothing can interrupt, see ``Cancel.never()``."""
     var _params: Optional[Pointer[Dict[String, String], MutUntrackedOrigin]]
     """Lazily-allocated path-params table. ``None`` by default; ``Router``
     allocates the underlying ``Dict`` on the first path-parameter
@@ -139,6 +146,7 @@ struct Request(Movable):
         self.version = version
         self.peer = peer
         self.expose_errors = expose_errors
+        self.cancel = Cancel.never()
         self._params = None
 
     def __deinit__(deinit self):
@@ -533,6 +541,7 @@ def _child_request(req: Request, url: String) -> Request:
     )
     child.headers = req.headers.copy()
     child.trailers = req.trailers.copy()
+    child.cancel = req.cancel
     if req.has_params():
         for kv in req._params.value()[].items():
             child.params_mut()[kv.key] = kv.value

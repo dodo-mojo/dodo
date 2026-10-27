@@ -35,6 +35,7 @@ from .keepalive_scan import (
     STATE_CLOSING,
     STATE_READING,
     STATE_WRITING,
+    STATE_PARKED,
     StepResult,
     _compact_read_buf_drop_prefix,
     _compute_close_after,

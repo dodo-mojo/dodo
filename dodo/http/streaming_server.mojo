@@ -81,7 +81,10 @@ from std.memory import unsafe_memcpy
 
 from .async_body import ChunkPoll, UpstreamChunkSource
 from .cancel import Cancel, CancelCell, CancelReason
+from .handler import Handler
+from .request import Request
 from .response import Response
+from ._offload_pool import OffloadCall, offload_cancel
 from ._server.write import frame_h1_stream_head_into
 from dodo.net import NetworkError
 from dodo.net._libc import _recv, _send, _strerror, MSG_NOSIGNAL
@@ -103,6 +106,23 @@ band that stops interest from thrashing on every chunk."""
 
 
 # ── StreamConn ─────────────────────────────────────────────────────────────
+
+
+struct _OffloadSlot(Movable):
+    """One request a connection offloaded, in the order it asked: the
+    job still on the pool, or the answer waiting for its turn."""
+
+    var job: Int
+    """The pool job, or 0 once the answer is in."""
+    var resp: Optional[Response]
+
+    def __init__(out self, job: Int):
+        self.job = job
+        self.resp = None
+
+    def __init__(out self, var resp: Response):
+        self.job = 0
+        self.resp = resp^
 
 
 struct StreamConn(Movable):
@@ -190,6 +210,12 @@ struct StreamConn(Movable):
     lifetime (closes it on teardown) and ``relay_upstream`` drains it --
     the front never touches a file descriptor or a per-connection table.
     Empty when the front manages its own upstream via the raw-fd overload."""
+    var _offload_calls: List[OffloadCall]
+    """Requests the front handed to ``offload``, not yet queued. The
+    loop queues them once the current callback returns."""
+    var _offload_slots: List[_OffloadSlot]
+    """Queued requests in the order the front asked, until each answer
+    goes to ``on_offload_done``."""
 
     def __init__(out self, var client: TcpStream, id: Int = 0) raises:
         """Adopt ``client`` into a fresh per-connection handle."""
@@ -210,6 +236,8 @@ struct StreamConn(Movable):
         self._inbound_enabled = False
         self._write_syscalls = 0
         self._upstream = None
+        self._offload_calls = List[OffloadCall]()
+        self._offload_slots = List[_OffloadSlot]()
 
     @always_inline
     def id(self) -> Int:
@@ -242,6 +270,73 @@ struct StreamConn(Movable):
     def is_closing(self) -> Bool:
         """True once ``request_close`` has been called."""
         return self._close_requested
+
+    # ── Offload pool (ADR-0004) ────────────────────────────────────
+
+    def offload[
+        H: Handler & Copyable
+    ](mut self, handler: H, var req: Request) raises:
+        """Run ``handler.serve(req)`` on the offload pool instead of in
+        this callback, which would stall every connection on the worker.
+
+        For a request the stack marks ``blocking`` (it reaches an
+        ``Offload``): the front calls ``conn.offload(stack, req)`` and
+        returns. The job runs on its own copy of ``stack``; this
+        connection gets no ``on_writable`` edges meanwhile, and its
+        ``StreamHandler.on_offload_done`` receives the response. A full
+        queue or ``handler_timeout_ms`` answers 503, a handler error its
+        mapped status. The job's ``req.cancel`` flips to ``PEER_CLOSED``
+        when the client leaves and to ``TIMEOUT`` at the deadline.
+
+        A connection may have several requests out at once (pipelined
+        requests, or a fan-out); they run side by side and
+        ``on_offload_done`` gets their answers in the order they were
+        offloaded.
+        """
+        self._offload_calls.append(OffloadCall(handler, req^))
+
+    @always_inline
+    def offload_pending(self) -> Bool:
+        """True while an offloaded request has not been answered."""
+        if len(self._offload_calls) > 0:
+            return True
+        return len(self._offload_slots) > 0
+
+    def _offload_waits_on(self, job: Int) -> Bool:
+        """Whether ``job`` is one of this connection's, still unanswered."""
+        for i in range(len(self._offload_slots)):
+            if self._offload_slots[i].job == job:
+                return True
+        return False
+
+    def _offload_answer(mut self, job: Int, var resp: Response):
+        """Keep ``resp`` as the answer to ``job`` until its turn."""
+        for i in range(len(self._offload_slots)):
+            if self._offload_slots[i].job == job:
+                self._offload_slots[i].job = 0
+                self._offload_slots[i].resp = resp^
+                return
+
+    def _offload_next_ready(self) -> Bool:
+        """Whether the oldest offloaded request has its answer."""
+        if len(self._offload_slots) == 0:
+            return False
+        return self._offload_slots[0].job == 0
+
+    def _offload_take_next(mut self) -> Response:
+        """Take the oldest answer; call only when it is ready."""
+        var slot = self._offload_slots.pop(0)
+        return slot.resp.take()
+
+    def _offload_cancel_all(mut self, reason: Int):
+        """Cancel every job still on the pool and forget the requests:
+        nobody is left to answer."""
+        for i in range(len(self._offload_slots)):
+            var job = self._offload_slots[i].job
+            if job != 0:
+                offload_cancel(job, reason)
+        self._offload_slots.clear()
+        self._offload_calls.clear()
 
     # ── Upstream attachment ────────────────────────────────────────
 
@@ -768,6 +863,19 @@ trait StreamHandler(Deinitable, Movable):
         the framework has nothing to release."""
         pass
 
+    def on_offload_done(
+        mut self, mut conn: StreamConn, var resp: Response
+    ) raises:
+        """Called with the response to a request the front passed to
+        ``conn.offload``: the handler's, its mapped error status, or 503
+        (queue full, ``handler_timeout_ms``). With several requests out
+        it is called once per request, in the order they were offloaded.
+
+        Defaults to sending it and closing the connection, which suits
+        one request per connection; closing cancels any still out."""
+        conn.send_response(resp)
+        conn.request_close()
+
 
 # ── Single-connection blocking driver ──────────────────────────────────────
 
@@ -788,8 +896,21 @@ def run_stream_connection[
     """
     var conn = StreamConn(client^, id)
     handler.on_open(conn)
+    _run_offload_here(handler, conn)
     conn.flush_blocking()
     while not conn.is_closing():
         handler.on_writable(conn)
+        _run_offload_here(handler, conn)
         conn.flush_blocking()
     handler.on_close(conn)
+
+
+def _run_offload_here[
+    H: StreamHandler
+](mut handler: H, mut conn: StreamConn) raises:
+    """This driver has no pool and nothing else to serve while it
+    waits, so an offloaded request runs in place."""
+    while len(conn._offload_calls) > 0:
+        var call = conn._offload_calls.pop(0)
+        var resp = call.run_here()
+        handler.on_offload_done(conn, resp^)

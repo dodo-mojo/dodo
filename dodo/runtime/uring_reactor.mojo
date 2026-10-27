@@ -320,6 +320,12 @@ struct UringReactor(Movable):
         """Return the underlying io_uring ring fd."""
         return self._driver.fd()
 
+    def wake_fd(self) -> Int:
+        """The wakeup eventfd, or ``INVALID_FD`` without
+        ``enable_wakeup``. Another thread writing 8 bytes to it makes
+        :meth:`poll` return, as :meth:`wakeup` does."""
+        return Int(self._wake_fd)
+
     def sq_entries(self) -> Int:
         """Kernel-allocated SQ size."""
         return self._driver.sq_entries()

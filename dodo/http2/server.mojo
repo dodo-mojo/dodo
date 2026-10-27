@@ -485,6 +485,25 @@ struct Http2Connection(Defaultable, Movable):
         s.response_started = True
         self.conn.streams[sid] = s^
 
+    def mark_dispatched(mut self, sid: Int) raises:
+        """Keep ``sid`` out of :meth:`take_completed_streams` while its
+        response is produced elsewhere (the offload pool)."""
+        self._mark_response_started(sid)
+
+    def stream_sendable(self, sid: Int) raises -> Bool:
+        """``sid`` still exists and is not CLOSED (not reset by the
+        peer), so a response for it can go out."""
+        return self._stream_still_sendable(sid)
+
+    def send_goaway(mut self):
+        """Queue a graceful GOAWAY (``NO_ERROR``) naming the last stream
+        the peer opened, once. Streams up to it are still answered."""
+        if self.conn.goaway_sent:
+            return
+        self.conn.goaway_sent = True
+        var f = self.conn._goaway_frame(self.conn.last_peer_stream_id, 0)
+        self.outbox.extend(Span(encode_frame(f)))
+
     def take_completed_streams(self) -> List[Int]:
         """Return stream ids whose request is fully buffered.
 

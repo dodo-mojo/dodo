@@ -84,6 +84,12 @@ struct Logger[Inner: Handler & Copyable](Copyable, Handler):
         )
         return resp^
 
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
 
 # ── RequestId ──────────────────────────────────────────────────────────────
 
@@ -108,6 +114,12 @@ struct RequestId[Inner: Handler & Copyable](Copyable, Handler):
         var resp = self.inner.serve(req).lower()
         resp.headers.set("X-Request-Id", id)
         return resp^
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
 
 
 # ── Compress ───────────────────────────────────────────────────────────────
@@ -365,6 +377,12 @@ struct Compress[Inner: Handler & Copyable](Copyable, Handler):
         resp.headers.set("Content-Length", String(len(resp.body)))
         return resp^
 
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
 
 # ── CatchPanic ─────────────────────────────────────────────────────────────
 
@@ -395,3 +413,9 @@ struct CatchPanic[Inner: Handler & Copyable](Copyable, Handler):
             resp.body = List[UInt8](self.body.as_bytes())
             resp.headers.set("Content-Type", "text/plain; charset=utf-8")
             return resp^
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)

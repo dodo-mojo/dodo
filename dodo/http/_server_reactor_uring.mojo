@@ -12,7 +12,16 @@ from std.os import getenv
 from std.memory import Layout, Pointer, alloc, stack_allocation
 from std.sys.info import CompilationTarget
 
+from dodo.http.cancel import CancelReason
 from dodo.http.handler import Handler
+from dodo.http._offload_pool import (
+    offload_cancel_all,
+    offload_free,
+    offload_job,
+    offload_outstanding,
+    offload_port_open,
+    offload_take_done,
+)
 from dodo.http.server import ServerConfig
 from dodo.net import SocketAddr
 from dodo.net._libc import _close
@@ -33,7 +42,14 @@ from dodo.runtime.uring_reactor import (
     _pbuf_ring_set_tail,
 )
 from ._bufring_ledger import RECV_CLOSE, RECV_STAGE, classify_recv
-from ._reactor import ConnHandle, STATE_READING, STATE_WRITING
+from ._reactor import (
+    ConnHandle,
+    STATE_PARKED,
+    STATE_READING,
+    STATE_WRITING,
+    _monotonic_ms,
+)
+from ._reactor.offload_loop import close_offload_port
 from ._server_uring_setup import _probe_bufring_setup_flags
 
 # Shared connection-lifecycle helpers live in ``_server_reactor_epoll``
@@ -317,9 +333,12 @@ def _drive_handler_with_submit_send[
         # off the submit_send + mark in-flight. The send CQE will
         # land later; the dispatch handler will reset state +
         # process any deferred read_buf bytes then.
+        var sending = (
+            ch_ptr[].state == STATE_WRITING or ch_ptr[].state == STATE_PARKED
+        )
         if (
             (not step_done)
-            and ch_ptr[].state == STATE_WRITING
+            and sending
             and len(ch_ptr[].write_buf) > ch_ptr[].write_pos
         ):
             var write_ptr = (
@@ -381,6 +400,10 @@ def _on_send_cqe_complete[
     # serializes from a clean state.
     ch_ptr[].write_buf.clear()
     ch_ptr[].write_pos = 0
+    if ch_ptr[].state == STATE_PARKED:
+        # Earlier pipelined responses are out; the offloaded one is
+        # still on the pool.
+        return False
     # Was this the close-after-send response? If so, the conn is
     # done.
     if ch_ptr[].should_close:
@@ -464,6 +487,219 @@ def _drive_handler_after_buf_recv[
     return step_done
 
 
+# ── Offload pool (ADR-0004) ────────────────────────────────────────────────
+#
+# This loop has no timer wheel, so it tracks its parked connections itself:
+# which connection waits on the pool, and until when (``handler_timeout_ms``).
+# The pool wakes the ring through its eventfd.
+
+
+struct _BrParked(Movable):
+    """Connections of the io_uring loop parked on the offload pool."""
+
+    var ids: Dict[Int, UInt64]
+    """fd -> conn_id of the connection parked on it."""
+    var deadlines: Dict[Int, Int]
+    """fd -> monotonic ms its handler deadline runs out (only with
+    ``handler_timeout_ms``)."""
+    var held: List[Int]
+    """Finished jobs whose connection still has a send in the kernel:
+    its write buffer can't change until that send completes."""
+
+    def __init__(out self):
+        self.ids = Dict[Int, UInt64]()
+        self.deadlines = Dict[Int, Int]()
+        self.held = List[Int]()
+
+    def note(
+        mut self,
+        fd: Int,
+        conn_id: UInt64,
+        ch_ptr: Pointer[ConnHandle, MutUntrackedOrigin],
+        config: ServerConfig,
+    ):
+        """Start tracking ``fd`` if its connection just parked."""
+        if ch_ptr[].state != STATE_PARKED:
+            return
+        var known = self.ids.get(fd)
+        if known and known.value() == conn_id:
+            return
+        self.ids[fd] = conn_id
+        if config.handler_timeout_ms > 0:
+            self.deadlines[fd] = _monotonic_ms() + config.handler_timeout_ms
+        else:
+            _ = self.deadlines.pop(fd, 0)
+
+    def forget(mut self, fd: Int):
+        _ = self.ids.pop(fd, UInt64(0))
+        _ = self.deadlines.pop(fd, 0)
+
+    def poll_timeout_ms(self) -> Int:
+        """How long the ring may block: until the earliest deadline, at
+        most ``URING_STOP_POLL_MS``."""
+        var wait = URING_STOP_POLL_MS
+        var now = _monotonic_ms()
+        for kv in self.deadlines.items():
+            var left = kv.value - now
+            if left < wait:
+                wait = left
+        return max(wait, 0)
+
+
+def _br_drive[
+    H: Handler
+](
+    conn_id: UInt64,
+    config: ServerConfig,
+    ref handler: H,
+    ch_ptr: Pointer[ConnHandle, MutUntrackedOrigin],
+    mut ureactor: UringReactor,
+    submit_send: Bool,
+) raises -> Bool:
+    """Run the connection on what it already holds: serve buffered
+    requests and send what is queued. True when it is done."""
+    var fd = _br_unpack_fd(conn_id)
+    var empty_buf = stack_allocation[1, UInt8]()
+    var empty_span = Span[UInt8, _](unsafe_ptr=empty_buf, length=0)
+    if ch_ptr[].send_in_flight:
+        return False
+    if submit_send:
+        return _drive_handler_with_submit_send[H](
+            fd, conn_id, empty_span, config, handler, ch_ptr, ureactor
+        )
+    return _drive_handler_after_buf_recv[H](
+        fd, conn_id, empty_span, config, handler, ch_ptr, ureactor
+    )
+
+
+def _br_deliver_offloads[
+    H: Handler
+](
+    port: Int,
+    config: ServerConfig,
+    ref handler: H,
+    mut conns: Dict[UInt64, Int],
+    mut parked: _BrParked,
+    mut ureactor: UringReactor,
+    submit_send: Bool,
+) raises:
+    """Hand each finished job back to its connection and send the
+    response. A job whose connection stopped waiting is dropped; one
+    whose connection is mid-send waits in ``parked.held``."""
+    var jobs = parked.held.copy()
+    parked.held.clear()
+    var fresh = offload_take_done(port)
+    for i in range(len(fresh)):
+        jobs.append(fresh[i])
+    for i in range(len(jobs)):
+        var job = jobs[i]
+        var fd = offload_job(job)[].fd
+        var conn_id = parked.ids.get(fd)
+        if not conn_id or conn_id.value() not in conns:
+            offload_free(job)
+            continue
+        var id = conn_id.value()
+        var ch_ptr = _conn_ptr_from_int(conns[id])
+        if ch_ptr[].send_in_flight:
+            parked.held.append(job)
+            continue
+        var done = False
+        try:
+            var step = ch_ptr[].offload_done(job)
+            if step:
+                parked.forget(fd)
+                done = _br_drive[H](
+                    id, config, handler, ch_ptr, ureactor, submit_send
+                )
+                parked.note(fd, id, ch_ptr, config)
+        except:
+            done = True
+        offload_free(job)
+        if done:
+            parked.forget(fd)
+            _cleanup_conn_uring_br(id, conns, ureactor)
+
+
+def _br_expire_offloads[
+    H: Handler
+](
+    config: ServerConfig,
+    ref handler: H,
+    mut conns: Dict[UInt64, Int],
+    mut parked: _BrParked,
+    mut ureactor: UringReactor,
+    submit_send: Bool,
+) raises:
+    """Answer 503 on every parked connection whose handler deadline ran
+    out, cancelling its job with ``TIMEOUT``. One mid-send is answered
+    once its send completes."""
+    var now = _monotonic_ms()
+    var expired = List[Int]()
+    for kv in parked.deadlines.items():
+        if kv.value <= now:
+            expired.append(kv.key)
+    for i in range(len(expired)):
+        var fd = expired[i]
+        var conn_id = parked.ids.get(fd)
+        if not conn_id or conn_id.value() not in conns:
+            parked.forget(fd)
+            continue
+        var id = conn_id.value()
+        var ch_ptr = _conn_ptr_from_int(conns[id])
+        if ch_ptr[].state != STATE_PARKED:
+            parked.forget(fd)
+            continue
+        if ch_ptr[].send_in_flight:
+            continue
+        parked.forget(fd)
+        var done = False
+        try:
+            _ = ch_ptr[].offload_timeout()
+            done = _br_drive[H](
+                id, config, handler, ch_ptr, ureactor, submit_send
+            )
+            parked.note(fd, id, ch_ptr, config)
+        except:
+            done = True
+        if done:
+            parked.forget(fd)
+            _cleanup_conn_uring_br(id, conns, ureactor)
+
+
+def _br_begin_settle(
+    port: Int,
+    mut conns: Dict[UInt64, Int],
+    mut ureactor: UringReactor,
+):
+    """Start a graceful stop that waits for offloaded requests: flip
+    ``SHUTDOWN`` on every job still out and close every connection with
+    nothing parked or being sent. A parked one closes after its
+    response. New connections are closed as they arrive."""
+    offload_cancel_all(port, CancelReason.SHUTDOWN)
+    var ids = List[UInt64]()
+    for kv in conns.items():
+        ids.append(kv.key)
+    for i in range(len(ids)):
+        var ch_ptr = _conn_ptr_from_int(conns.get(ids[i]).value())
+        if ch_ptr[].state == STATE_PARKED:
+            ch_ptr[].offload_close = True
+            continue
+        if ch_ptr[].send_in_flight:
+            ch_ptr[].should_close = True
+            continue
+        ch_ptr[].cancel_cell.flip(CancelReason.SHUTDOWN)
+        _cleanup_conn_uring_br(ids[i], conns, ureactor)
+
+
+def _br_settled(conns: Dict[UInt64, Int]) -> Bool:
+    """No connection is parked or still sending a response."""
+    for kv in conns.items():
+        var ch_ptr = _conn_ptr_from_int(kv.value)
+        if ch_ptr[].state == STATE_PARKED or ch_ptr[].send_in_flight:
+            return False
+    return True
+
+
 def run_uring_bufring_reactor_loop[
     H: Handler,
 ](
@@ -509,6 +745,11 @@ def run_uring_bufring_reactor_loop_shared[
     per-ring, and rings are per-worker). Multishot accept on the
     shared listener fd from each worker; kernel hands each new
     connection to exactly one worker. Linux-only.
+
+    A handler that may block gets a port to the offload pool, and the
+    ring keeps its wakeup eventfd so the pool can wake it. An offloaded
+    request parks its connection; ``handler_timeout_ms`` answers 503
+    and a stop waits up to ``shutdown_timeout_ms`` for it.
     """
     comptime if not CompilationTarget.is_linux():
         raise Error(
@@ -526,12 +767,14 @@ def run_uring_bufring_reactor_loop_shared[
 
     # Same setup-flag probe as the single-worker variant;
     # per-worker rings independently negotiate. Each worker is
-    # single-issuer (one pthread owns its ring) so the wakeup
-    # eventfd is skipped via enable_wakeup=False.
+    # single-issuer (one pthread owns its ring), so the wakeup eventfd
+    # is kept only for the offload pool, the one other thread that
+    # needs to wake it.
+    var may_block = handler.may_block()
     var ureactor = UringReactor(
         4096,
         setup_flags=_probe_bufring_setup_flags(),
-        enable_wakeup=False,
+        enable_wakeup=may_block,
     )
     var conns = Dict[UInt64, Int]()
     var next_gen: UInt64 = 1
@@ -553,14 +796,37 @@ def run_uring_bufring_reactor_loop_shared[
 
     ureactor.arm_listener_multishot(listener_fd, UInt64(0))
 
+    var offload_port = 0
+    if may_block:
+        offload_port = offload_port_open(
+            handler,
+            ureactor.wake_fd(),
+            config.offload_threads,
+            config.offload_queue_depth,
+        )
+    var parked = _BrParked()
+
     var completions = List[UringCompletion]()
     var exit_status = WORKER_STATUS_CLEAN
     var stopping_addr = Int(Pointer[Bool, _](to=stopping))
-    while not load_stop_flag(stopping_addr):
+    # Non-zero once the stop flag is seen with offloaded requests out:
+    # the loop keeps serving their connections until this deadline.
+    var settle_deadline = 0
+    while True:
+        if settle_deadline == 0 and load_stop_flag(stopping_addr):
+            if offload_outstanding(offload_port) == 0:
+                break
+            settle_deadline = _monotonic_ms() + max(
+                config.shutdown_timeout_ms, 0
+            )
+            _br_begin_settle(offload_port, conns, ureactor)
+        if settle_deadline != 0:
+            if _br_settled(conns) or _monotonic_ms() >= settle_deadline:
+                break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         completions.clear()
         try:
-            _ = ureactor.poll(1, completions, 64, URING_STOP_POLL_MS)
+            _ = ureactor.poll(1, completions, 64, parked.poll_timeout_ms())
         except:
             exit_status = WORKER_STATUS_CRASHED
             break
@@ -571,6 +837,9 @@ def run_uring_bufring_reactor_loop_shared[
                 if comp.is_error():
                     continue
                 var client_fd = Int(comp.res)
+                if settle_deadline != 0:
+                    _ = _close(c_int(client_fd))
+                    continue
                 var conn_addr: Int
                 try:
                     conn_addr = _alloc_conn_from_accepted_fd(client_fd)
@@ -580,6 +849,7 @@ def run_uring_bufring_reactor_loop_shared[
                     continue
                 var conn_id = _br_pack_conn_id(client_fd, next_gen)
                 next_gen += 1
+                _conn_ptr_from_int(conn_addr)[].offload_port = offload_port
                 conns[conn_id] = conn_addr
                 try:
                     ureactor.arm_recv_buffer_select(
@@ -611,7 +881,10 @@ def run_uring_bufring_reactor_loop_shared[
                     ureactor,
                 )
                 if send_done:
+                    parked.forget(send_fd)
                     _cleanup_conn_uring_br(send_conn_id, conns, ureactor)
+                else:
+                    parked.note(send_fd, send_conn_id, send_ch_ptr, config)
                 continue
 
             if comp.op != URING_OP_RECV:
@@ -629,6 +902,8 @@ def run_uring_bufring_reactor_loop_shared[
                 if decision.return_buf:
                     _br_return_buf(ring_addr, pool_addr, bid)
                 if decision.action == RECV_CLOSE:
+                    if conn_id in conns:
+                        parked.forget(_br_unpack_fd(conn_id))
                     _cleanup_conn_uring_br(conn_id, conns, ureactor)
                 continue
 
@@ -674,6 +949,9 @@ def run_uring_bufring_reactor_loop_shared[
                     ureactor,
                 )
 
+            if not step_done:
+                parked.note(fd, conn_id, ch_ptr, config)
+
             if (not step_done) and (not comp.has_more):
                 try:
                     ureactor.arm_recv_buffer_select(
@@ -686,7 +964,24 @@ def run_uring_bufring_reactor_loop_shared[
                     step_done = True
 
             if step_done:
+                parked.forget(fd)
                 _cleanup_conn_uring_br(conn_id, conns, ureactor)
+
+        if offload_port != 0:
+            if offload_outstanding(offload_port) > 0 or len(parked.held) > 0:
+                _br_deliver_offloads[H](
+                    offload_port,
+                    config,
+                    handler,
+                    conns,
+                    parked,
+                    ureactor,
+                    submit_send,
+                )
+            if len(parked.deadlines) > 0:
+                _br_expire_offloads[H](
+                    config, handler, conns, parked, ureactor, submit_send
+                )
 
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)
 
@@ -698,6 +993,9 @@ def run_uring_bufring_reactor_loop_shared[
         leftover.append(kv.key)
     for i in range(len(leftover)):
         _cleanup_conn_uring_br(leftover[i], conns, ureactor)
+    for i in range(len(parked.held)):
+        offload_free(parked.held[i])
+    close_offload_port(offload_port)
     try:
         ureactor.unregister_pbuf_ring(
             _URING_BR_BGID, ring_addr, _URING_BR_NBUFS

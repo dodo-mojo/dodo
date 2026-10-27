@@ -22,6 +22,7 @@ from std.collections import Optional
 from std.sys import stderr
 
 from .handler import Handler, CancelHandler
+from ._shared_handler import SharedCancelHandler, SharedHandler
 from .cancel import Cancel
 from .streaming_server import StreamHandler
 from .intern import intern_method_bytes
@@ -503,6 +504,10 @@ struct HttpServer(Movable):
         Copyable](handler, num_workers, pin_cores)`` overload
         below for that.
 
+        A handler that is not ``Copyable`` is moved into a
+        :class:`SharedHandler`, so the offload pool can keep it alive for
+        a job still running after this returns.
+
         Args:
             handler: The request handler (ownership transferred).
 
@@ -510,7 +515,11 @@ struct HttpServer(Movable):
             NetworkError: On fatal listener errors; per-connection
                 errors close the offending connection silently.
         """
-        self._serve_one(handler)
+        comptime if conforms_to(H, Copyable):
+            self._serve_one(handler)
+        else:
+            var shared = SharedHandler(handler^)
+            self._serve_one(shared)
 
     def _resolve_max_connections(mut self, workers: Int):
         """Turn ``max_connections == 0`` (automatic) into a per-worker cap
@@ -663,6 +672,12 @@ struct HttpServer(Movable):
         Single-listener, single-worker. Extra ``bind(List[SocketAddr])`` listeners
         and multi-worker mode are not supported here yet.
 
+        A front hands a blocking request to the offload pool with
+        ``conn.offload(stack, req)`` and gets the response in
+        ``on_offload_done``; the server's ``offload_threads``,
+        ``offload_queue_depth``, ``handler_timeout_ms`` and
+        ``shutdown_timeout_ms`` apply.
+
         Args:
             handler: The streaming front (ownership transferred). One
                 instance services every connection.
@@ -690,6 +705,7 @@ struct HttpServer(Movable):
             self._stopping,
             max_in_flight=max_in_flight,
             retry_after_s=retry_after_s,
+            config=self.config,
         )
 
     def serve_streaming[
@@ -754,6 +770,7 @@ struct HttpServer(Movable):
             handler^,
             max_in_flight=max_in_flight,
             retry_after_s=retry_after_s,
+            config=self.config.copy(),
         )
         var scheduler = Scheduler[StreamFrontend[H]].start(
             addr=addr,
@@ -909,9 +926,16 @@ struct HttpServer(Movable):
 
         self._stopping = False
         self._resolve_max_connections(1)
-        run_reactor_loop_cancel(
-            self._listener, self.config, handler, self._stopping
-        )
+        comptime if conforms_to(CH, Copyable):
+            run_reactor_loop_cancel(
+                self._listener, self.config, handler, self._stopping
+            )
+        else:
+            # Shared, so the offload pool can keep it for a running job.
+            var shared = SharedCancelHandler(handler^)
+            run_reactor_loop_cancel(
+                self._listener, self.config, shared, self._stopping
+            )
 
     def local_addr(self) -> SocketAddr:
         """Return the local address the server is bound to."""

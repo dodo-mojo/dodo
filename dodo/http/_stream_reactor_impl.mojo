@@ -46,10 +46,27 @@ from std.collections import Dict
 from std.ffi import c_int
 
 from dodo.runtime import Reactor, Event, INTEREST_READ, INTEREST_WRITE
+from dodo.runtime.scheduler import load_stop_flag
 from dodo.tcp import TcpListener, TcpStream, accept_fd
 
 from .cancel import CancelReason
-from .streaming_server import StreamConn, StreamHandler
+from .response import Response
+from .streaming_server import StreamConn, StreamHandler, _OffloadSlot
+from ._offload_pool import (
+    offload_cancel,
+    offload_cancel_all,
+    offload_free,
+    offload_job,
+    offload_job_response,
+    offload_outstanding,
+    offload_port_open_bare,
+    offload_submit_call,
+    offload_take_done,
+    unavailable_response,
+)
+from ._reactor.keepalive_scan import _monotonic_ms
+from ._reactor.offload_loop import close_offload_port
+from ._server.config import ServerConfig
 
 
 def _shed_503_bytes(retry_after_s: Int) -> List[UInt8]:
@@ -73,11 +90,242 @@ def _shed_503_bytes(retry_after_s: Int) -> List[UInt8]:
 def _desired_interest(conn: StreamConn) -> Int:
     """Interest bits for an open connection: always READ (to see peer
     FIN); WRITE while there is pending output or the stream is still
-    live (producing)."""
+    live (producing). A connection waiting on the offload pool produces
+    nothing until the response is back."""
     var interest = INTEREST_READ
-    if conn.has_pending_out() or not conn.is_closing():
+    if conn.has_pending_out():
+        interest |= INTEREST_WRITE
+    elif not conn.is_closing() and not conn.offload_pending():
         interest |= INTEREST_WRITE
     return interest
+
+
+# ── Offload pool (ADR-0004) ──────────────────────────────────────────────
+
+
+struct _StreamOffload(Movable):
+    """The loop's link to the offload pool. The port opens on the first
+    ``StreamConn.offload``, so a front that never offloads starts no
+    pool. This loop has no timer wheel, so handler deadlines are kept
+    here, per job."""
+
+    var port: Int
+    var wake_fd: Int
+    var threads: Int
+    var depth: Int
+    var timeout_ms: Int
+    var deadlines: Dict[Int, Int]
+    """Job address to its handler deadline, until the job comes back."""
+
+    def __init__(out self, wake_fd: Int, config: ServerConfig):
+        self.port = 0
+        self.wake_fd = wake_fd
+        self.threads = config.offload_threads
+        self.depth = config.offload_queue_depth
+        self.timeout_ms = config.handler_timeout_ms
+        self.deadlines = Dict[Int, Int]()
+
+    def outstanding(self) -> Int:
+        return offload_outstanding(self.port)
+
+    def submit[
+        H: StreamHandler
+    ](mut self, mut handler: H, mut conn: StreamConn, fd: Int) raises:
+        """Queue what the last callback passed to ``conn.offload``, then
+        hand the front every answer that is ready, oldest first. A full
+        queue answers 503 in that request's turn."""
+        while True:
+            self._queue(conn, fd)
+            if not conn._offload_next_ready():
+                return
+            handler.on_offload_done(conn, conn._offload_take_next())
+
+    def _queue(mut self, mut conn: StreamConn, fd: Int) raises:
+        while len(conn._offload_calls) > 0:
+            var call = conn._offload_calls.pop(0)
+            if self.port == 0:
+                self.port = offload_port_open_bare(
+                    self.wake_fd, self.threads, self.depth
+                )
+            var job = offload_submit_call(self.port, call^, fd)
+            if job == 0:
+                conn._offload_slots.append(
+                    _OffloadSlot(unavailable_response())
+                )
+                continue
+            conn._offload_slots.append(_OffloadSlot(job))
+            if self.timeout_ms > 0:
+                self.deadlines[job] = _monotonic_ms() + self.timeout_ms
+
+    def poll_timeout_ms(self, cap_ms: Int) -> Int:
+        """How long to block: until the earliest handler deadline, at
+        most ``cap_ms``."""
+        var wait = cap_ms
+        var now = _monotonic_ms()
+        for kv in self.deadlines.items():
+            var left = kv.value - now
+            if left < wait:
+                wait = left
+        return max(wait, 0)
+
+    def expired(mut self) -> List[Int]:
+        """Jobs whose handler deadline ran out; forgotten here."""
+        var now = _monotonic_ms()
+        var out = List[Int]()
+        for kv in self.deadlines.items():
+            if kv.value <= now:
+                out.append(kv.key)
+        for i in range(len(out)):
+            _ = self.deadlines.pop(out[i], 0)
+        return out^
+
+
+def _give_offload_response[
+    H: StreamHandler
+](
+    mut conns: Dict[Int, StreamConn],
+    fd: Int,
+    job: Int,
+    var resp: Response,
+    mut handler: H,
+    mut off: _StreamOffload,
+) raises -> Bool:
+    """Record ``resp`` as the answer to ``job``, hand the front what is
+    ready and send what it queued. True when the connection is done and
+    can be dropped."""
+    ref c = conns[fd]
+    c._offload_answer(job, resp^)
+    off.submit(handler, c, fd)
+    _ = c.drain_nonblocking()
+    return c.is_closing() and not c.has_pending_out()
+
+
+def _waits_on(conns: Dict[Int, StreamConn], fd: Int, job: Int) -> Bool:
+    """Whether the connection on ``fd`` still waits for ``job``. False
+    when the connection is gone or the fd now belongs to another one."""
+    if fd not in conns:
+        return False
+    try:
+        return conns[fd]._offload_waits_on(job)
+    except:
+        return False
+
+
+def _answer_offload[
+    H: StreamHandler
+](
+    mut reactor: Reactor,
+    mut conns: Dict[Int, StreamConn],
+    mut interests: Dict[Int, Int],
+    mut up_to_client: Dict[Int, Int],
+    fd: Int,
+    job: Int,
+    var resp: Response,
+    mut handler: H,
+    mut off: _StreamOffload,
+):
+    """Give the front the response to its offloaded request, then send
+    what it queued and close the connection if it is done."""
+    var drop_it = False
+    try:
+        drop_it = _give_offload_response(conns, fd, job, resp^, handler, off)
+    except:
+        drop_it = True
+    if drop_it:
+        _close_conn(reactor, conns, interests, up_to_client, fd, handler)
+        return
+    try:
+        _reconcile_after(reactor, conns, interests, up_to_client, fd)
+    except:
+        pass
+
+
+def _deliver_offloads[
+    H: StreamHandler
+](
+    mut reactor: Reactor,
+    mut conns: Dict[Int, StreamConn],
+    mut interests: Dict[Int, Int],
+    mut up_to_client: Dict[Int, Int],
+    mut handler: H,
+    mut off: _StreamOffload,
+):
+    """Hand each finished job's response to its connection. A job whose
+    connection stopped waiting (timeout, client gone) is dropped."""
+    var jobs = offload_take_done(off.port)
+    for i in range(len(jobs)):
+        var job = jobs[i]
+        var fd = offload_job(job)[].fd
+        _ = off.deadlines.pop(job, 0)
+        if _waits_on(conns, fd, job):
+            _answer_offload(
+                reactor,
+                conns,
+                interests,
+                up_to_client,
+                fd,
+                job,
+                offload_job_response(job),
+                handler,
+                off,
+            )
+        offload_free(job)
+
+
+def _expire_offloads[
+    H: StreamHandler
+](
+    mut reactor: Reactor,
+    mut conns: Dict[Int, StreamConn],
+    mut interests: Dict[Int, Int],
+    mut up_to_client: Dict[Int, Int],
+    mut handler: H,
+    mut off: _StreamOffload,
+):
+    """``handler_timeout_ms`` ran out: cancel the job with ``TIMEOUT``
+    and answer 503."""
+    var jobs = off.expired()
+    for i in range(len(jobs)):
+        var job = jobs[i]
+        # The job stays alive until the pool hands it back, so its fd
+        # can still be read.
+        var fd = offload_job(job)[].fd
+        if not _waits_on(conns, fd, job):
+            continue
+        offload_cancel(job, CancelReason.TIMEOUT)
+        _answer_offload(
+            reactor,
+            conns,
+            interests,
+            up_to_client,
+            fd,
+            job,
+            unavailable_response(),
+            handler,
+            off,
+        )
+
+
+def _client_fds(interests: Dict[Int, Int]) -> List[Int]:
+    """Every open client fd. ``interests`` has the same keys as
+    ``conns``, which can't be walked because ``StreamConn`` is not
+    ``Copyable``."""
+    var fds = List[Int]()
+    for fd in interests.keys():
+        fds.append(fd)
+    return fds^
+
+
+def _offload_settled(
+    conns: Dict[Int, StreamConn], interests: Dict[Int, Int]
+) raises -> Bool:
+    """No connection waits on the pool or still has a response going
+    out."""
+    for fd in _client_fds(interests):
+        ref c = conns[fd]
+        if c.offload_pending() or c.has_pending_out():
+            return False
+    return True
 
 
 def _close_conn[
@@ -117,6 +365,8 @@ def _close_conn[
         # producing before we drop it. No-op for a front managing its
         # own raw-fd upstream.
         conn._maybe_cancel_upstream()
+        # Requests still on the offload pool have no one to answer.
+        conn._offload_cancel_all(CancelReason.PEER_CLOSED)
         try:
             handler.on_close(conn)
         except:
@@ -196,6 +446,7 @@ def run_stream_reactor_loop[
     poll_timeout_ms: Int = 100,
     max_in_flight: Int = 0,
     retry_after_s: Int = 1,
+    config: ServerConfig = ServerConfig(),
 ) raises:
     """Run the streaming reactor loop until ``stopping`` flips.
 
@@ -217,6 +468,10 @@ def run_stream_reactor_loop[
             the streaming reactor holds many connections concurrently, so
             this cap is meaningful and enforced at the accept edge.
         retry_after_s: ``Retry-After`` seconds advertised in the 503.
+        config: Offload pool settings for ``StreamConn.offload``:
+            ``offload_threads``, ``offload_queue_depth``,
+            ``handler_timeout_ms`` and ``shutdown_timeout_ms`` (how long
+            a stop waits for offloaded requests).
     """
     listener._socket.set_nonblocking(True)
     _run_stream_loop_impl[H, is_shared=False](
@@ -226,6 +481,7 @@ def run_stream_reactor_loop[
         poll_timeout_ms,
         max_in_flight,
         retry_after_s,
+        config,
     )
 
 
@@ -239,6 +495,7 @@ def run_stream_reactor_loop_shared[
     poll_timeout_ms: Int = 100,
     max_in_flight: Int = 0,
     retry_after_s: Int = 1,
+    config: ServerConfig = ServerConfig(),
 ) raises:
     """Multi-worker streaming reactor loop sharing a borrowed listener fd.
 
@@ -261,6 +518,7 @@ def run_stream_reactor_loop_shared[
         poll_timeout_ms,
         max_in_flight,
         retry_after_s,
+        config,
     )
 
 
@@ -273,10 +531,15 @@ def _run_stream_loop_impl[
     poll_timeout_ms: Int,
     max_in_flight: Int,
     retry_after_s: Int,
+    config: ServerConfig,
 ) raises:
     """Shared body for the streaming reactor loop (single- and
     multi-worker). ``is_shared`` picks ``register_exclusive`` (shared
-    listener) vs plain ``register`` for the listener fd."""
+    listener) vs plain ``register`` for the listener fd.
+
+    A stop with offloaded requests out stops accepting, closes every
+    other connection and keeps serving those until they are answered or
+    ``shutdown_timeout_ms`` passes."""
     var reactor = Reactor()
 
     comptime if is_shared:
@@ -293,9 +556,42 @@ def _run_stream_loop_impl[
     var up_to_client = Dict[Int, Int]()
     var next_id = 1
     var events = List[Event]()
+    var off = _StreamOffload(reactor.wake_fd(), config)
+    # Non-zero once the stop flag is seen with offloaded requests out:
+    # the loop keeps serving their connections until this deadline.
+    var settle_deadline = 0
+    # Another thread sets the flag, so it is read atomically: a plain
+    # read may be hoisted out of the loop.
+    var stopping_addr = Int(Pointer[Bool, _](to=stopping))
 
-    while not stopping:
-        var n = reactor.poll(poll_timeout_ms, events)
+    while True:
+        if settle_deadline == 0 and load_stop_flag(stopping_addr):
+            if off.outstanding() == 0:
+                break
+            settle_deadline = _monotonic_ms() + max(
+                config.shutdown_timeout_ms, 0
+            )
+            try:
+                reactor.unregister(c_int(listen_fd))
+            except:
+                pass
+            offload_cancel_all(off.port, CancelReason.SHUTDOWN)
+            var idle = List[Int]()
+            for fd in _client_fds(interests):
+                if not conns[fd].offload_pending():
+                    idle.append(fd)
+            for i in range(len(idle)):
+                conns[idle[i]].flip_cancel(CancelReason.SHUTDOWN)
+                _close_conn(
+                    reactor, conns, interests, up_to_client, idle[i], handler
+                )
+        if settle_deadline != 0:
+            if (
+                _offload_settled(conns, interests)
+                or _monotonic_ms() >= settle_deadline
+            ):
+                break
+        var n = reactor.poll(off.poll_timeout_ms(poll_timeout_ms), events)
         for i in range(n):
             var ev = events[i]
             if ev.is_wakeup():
@@ -333,6 +629,7 @@ def _run_stream_loop_impl[
                     var open_ok = True
                     try:
                         handler.on_open(conn)
+                        off.submit(handler, conn, cfd)
                         _ = conn.drain_nonblocking()
                     except:
                         open_ok = False
@@ -375,6 +672,7 @@ def _run_stream_loop_impl[
                 ref uc = conns[client_fd]
                 try:
                     handler.on_upstream(uc)
+                    off.submit(handler, uc, client_fd)
                     _ = uc.drain_nonblocking()
                 except:
                     up_drop = True
@@ -441,7 +739,11 @@ def _run_stream_loop_impl[
             if not drop_it and ev.is_writable():
                 ref c = conns[tok]
                 try:
-                    handler.on_writable(c)
+                    # A connection waiting on the pool only sends what it
+                    # already queued.
+                    if not c.offload_pending():
+                        handler.on_writable(c)
+                        off.submit(handler, c, tok)
                     _ = c.drain_nonblocking()
                 except:
                     drop_it = True
@@ -461,11 +763,18 @@ def _run_stream_loop_impl[
             # Reconcile upstream registration + re-arm write interest.
             _reconcile_after(reactor, conns, interests, up_to_client, tok)
 
+        if off.outstanding() > 0:
+            _deliver_offloads(
+                reactor, conns, interests, up_to_client, handler, off
+            )
+        if len(off.deadlines) > 0:
+            _expire_offloads(
+                reactor, conns, interests, up_to_client, handler, off
+            )
+
     # Drain remaining connections on shutdown. ``conns`` keys are the
     # client fds; the upstream entries in ``up_to_client`` are cleaned up
     # by ``_close_conn`` as each owning connection is torn down.
-    var live = List[Int]()
-    for fd_key in interests.keys():
-        live.append(fd_key)
-    for fd_key in live:
+    for fd_key in _client_fds(interests):
         _close_conn(reactor, conns, interests, up_to_client, fd_key, handler)
+    close_offload_port(off.port)

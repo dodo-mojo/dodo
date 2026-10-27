@@ -24,6 +24,8 @@ from dodo.runtime import (
 from dodo.runtime._balance import Balancer
 from dodo.tcp import TcpStream, TcpListener, accept_fd
 
+from dodo.http.cancel import CancelReason
+
 from .conn_handle import ConnHandle
 from .keepalive_scan import StepResult, _monotonic_ms
 
@@ -119,7 +121,12 @@ def _conn_free_addr(addr: Int):
     ``_conn_alloc_addr``.
 
     Safe to call on 0 (no-op). Routes through ``Pool[ConnHandle].free``.
+    A request still on the offload pool has no one left to answer, so
+    its job is cancelled with ``PEER_CLOSED`` first.
     """
+    if addr == 0:
+        return
+    _conn_ptr_from_int(addr)[].offload_abandon(CancelReason.PEER_CLOSED)
     Pool[ConnHandle].free(addr)
 
 
@@ -252,6 +259,7 @@ def _accept_loop(
     mut timers: Dict[Int, UInt64],
     idle_timeout_ms: Int,
     max_connections: Int = 0,
+    offload_port: Int = 0,
 ):
     """Accept every connection available on ``listener`` (until EAGAIN).
 
@@ -265,6 +273,7 @@ def _accept_loop(
     without bound. On an accept error the errno decides the action --
     ECONNABORTED skips one and keeps draining; everything else
     (EAGAIN drained / EMFILE-ENFILE exhausted) stops this pass.
+    ``offload_port`` is the worker's offload pool port, or 0.
     """
     while True:
         if max_connections > 0 and len(conns) >= max_connections:
@@ -286,6 +295,7 @@ def _accept_loop(
             addr = _conn_alloc_addr(stream^)
         except:
             continue
+        _conn_ptr_from_int(addr)[].offload_port = offload_port
         conns[client_fd] = addr
         try:
             reactor.register(c_int(client_fd), UInt64(client_fd), INTEREST_READ)
@@ -308,6 +318,7 @@ def _accept_loop_fd(
     idle_timeout_ms: Int,
     max_connections: Int = 0,
     bal: Balancer = Balancer(),
+    offload_port: Int = 0,
 ):
     """Accept every available connection on a *borrowed* listener fd.
 
@@ -326,7 +337,8 @@ def _accept_loop_fd(
     When ``bal`` is enabled and this worker holds clearly more
     connections than the least-loaded peer, the new stream goes to that
     peer instead (see ``dodo.runtime._balance``); otherwise it stays
-    here, as before.
+    here, as before. ``offload_port`` is the worker's offload pool
+    port, or 0.
     """
     while True:
         if max_connections > 0 and len(conns) >= max_connections:
@@ -355,6 +367,7 @@ def _accept_loop_fd(
             addr = _conn_alloc_addr(stream^)
         except:
             continue
+        _conn_ptr_from_int(addr)[].offload_port = offload_port
         conns[client_fd] = addr
         try:
             reactor.register(c_int(client_fd), UInt64(client_fd), INTEREST_READ)

@@ -55,6 +55,9 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
     3. **HTTP/1.1 only** (default):
        :func:`run_reactor_loop_shared`.
 
+    Every path runs a handler's ``Offload`` requests on the offload
+    pool.
+
     The frontend is :class:`Copyable` so the scheduler can clone
     it once per worker before pthread spawn; expensive shared
     state inside the user handler should be wrapped behind an
@@ -207,16 +210,20 @@ struct StreamFrontend[H: StreamHandler & Copyable](Copyable, Frontend):
     var handler: Self.H
     var max_in_flight: Int
     var retry_after_s: Int
+    var config: ServerConfig
+    """Offload pool settings for ``StreamConn.offload``."""
 
     def __init__(
         out self,
         var handler: Self.H,
         max_in_flight: Int = 0,
         retry_after_s: Int = 1,
+        var config: ServerConfig = ServerConfig(),
     ):
         self.handler = handler^
         self.max_in_flight = max_in_flight
         self.retry_after_s = retry_after_s
+        self.config = config^
 
     def requires_per_worker_listener(self) -> Bool:
         """Streaming is fine with either listener strategy (honours the
@@ -248,6 +255,7 @@ struct StreamFrontend[H: StreamHandler & Copyable](Copyable, Frontend):
                 stats_addr=stats_addr,
                 max_in_flight=self.max_in_flight,
                 retry_after_s=self.retry_after_s,
+                config=self.config,
             )
         except:
             pass

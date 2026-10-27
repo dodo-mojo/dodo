@@ -9,6 +9,7 @@ helpers) lives in ``dodo.http._reactor``; the epoll/kqueue loops in
 from ._reactor import (
     STATE_READING,
     STATE_WRITING,
+    STATE_PARKED,
     STATE_CLOSING,
     StepResult,
     ConnHandle,
