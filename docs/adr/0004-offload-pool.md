@@ -21,7 +21,8 @@ Mojo constraints: capturing closures can't be passed to another thread today, an
    - The worker drains completions on wake-up and writes each response as usual.
 3. **Timeouts.** If `handler_timeout_ms` passes first, the client gets `503 Service Unavailable` and the request's `Cancel` is set to `TIMEOUT`, so a handler that checks it can stop early. The late result is dropped. Inline handlers still can't be interrupted; the docs say so.
 4. **Client gone.** If the client closes while the job runs, `Cancel` is set to `PEER_CLOSED` and the result is dropped.
-5. **Scope of v1.** HTTP/1.1 and HTTP/2, cleartext and TLS, on the unified loop (the default for `serve`).
+5. **Scope of v1.** HTTP/1.1 and HTTP/2, cleartext and TLS, on every server loop: the unified loop (the default for `serve`), `serve_cancellable`, the HTTP/1.1-only multi-worker loop and the io_uring buffer ring. A `serve_streaming` front owns its protocol, so it hands a blocking request to the pool itself with `conn.offload(stack, req)`; one connection may have several out, and their answers reach `on_offload_done` in the order they were offloaded.
+   - Each worker's port keeps its own copy of the handler, so a job still running at shutdown never holds the worker back. `serve` moves a handler that is not `Copyable` into a shared, reference-counted `SharedHandler` first; the last copy frees it.
    - HTTP/1.1 parks the whole connection, since its responses must go out in order.
    - HTTP/2 parks only the stream. The connection keeps reading, so other streams and control frames (PING, SETTINGS, WINDOW_UPDATE) keep flowing while a job runs. Each connection keeps a list of pending stream deadlines and arms its timer for the earliest one.
    - `RST_STREAM` from the client sets that stream's `Cancel` to `PEER_CLOSED` and drops its result. Closing the connection does the same for all of its pending streams.
