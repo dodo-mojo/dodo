@@ -101,3 +101,36 @@ def bind_shared(addr: SocketAddr, backlog: Int = 1024) raises -> TcpListener:
     return TcpListener.bind_with_options(
         addr, backlog=backlog, reuse_port=False
     )
+
+
+def bind_reuseport_if_free(
+    addr: SocketAddr, backlog: Int = 128
+) raises -> TcpListener:
+    """Bind with ``SO_REUSEPORT``, but only on a port nothing holds yet.
+
+    ``HttpServer.bind`` uses this so that multi-worker serving can add
+    each worker's ``SO_REUSEPORT`` listener next to the bound one and
+    hand the bound one to worker 0. Closing it first instead would
+    leave the port without a listener while the workers start: connects
+    are refused and the connections already in its backlog are reset.
+
+    ``SO_REUSEPORT`` alone would also let a second server join the port
+    without an error. A plain bind fails on a port that any listener
+    holds, so it runs first as a probe and keeps ``AddressInUse``
+    working. Port 0 skips the probe: the kernel picks a free port.
+
+    Args:
+        addr: Local address to bind.
+        backlog: Listen backlog.
+
+    Returns:
+        A listening ``TcpListener`` with ``SO_REUSEPORT`` set.
+
+    Raises:
+        AddressInUse: If any listener already holds the port.
+        NetworkError: For any other OS error.
+    """
+    if addr.port != 0:
+        var probe = TcpListener.bind_with_options(addr, backlog=backlog)
+        probe.close()
+    return TcpListener.bind_with_options(addr, backlog=backlog, reuse_port=True)

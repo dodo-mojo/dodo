@@ -68,11 +68,13 @@ Known limitations:
 """
 
 from std.atomic import Atomic, Ordering
+from std.ffi import c_int
 from std.memory import Layout, Pointer, alloc
 
 from std.os import getenv
 from std.sys.info import CompilationTarget
 from ..net import SocketAddr
+from ..net._libc import _close
 from ..tcp import TcpListener
 
 from ._thread import ThreadHandle, num_cpus, _OpaquePtr
@@ -167,6 +169,96 @@ def _scheduler_free_ctxs[F: Frontend](addrs: List[Int]):
         var typed = raw.unsafe_bitcast[_WorkerCtx[F]]()
         typed.unsafe_deinit_pointee()
         _scheduler_free_raw(raw)
+
+
+# ── Listener helpers ─────────────────────────────────────────────────────────
+
+
+def _close_fds(fds: List[Int]):
+    """Close bare fds handed to ``start`` that were never wrapped."""
+    for i in range(len(fds)):
+        _ = _close(c_int(fds[i]))
+
+
+def _heap_listener(var listener: TcpListener) -> Int:
+    """Move ``listener`` to the heap so worker threads can use its fd
+    after this frame returns. Freed by :func:`_free_listeners`."""
+    var ptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
+    ptr.unsafe_write(listener^)
+    return Int(ptr)
+
+
+def _heap_listener_fd(addr: Int) -> Int:
+    """The fd of the heap listener at ``addr``."""
+    var ptr = Pointer[TcpListener, MutUntrackedOrigin](unsafe_from_address=addr)
+    return Int(ptr[].as_raw_fd())
+
+
+def _free_listeners(addrs: List[Int]):
+    """Close and free every heap listener in ``addrs``."""
+    for i in range(len(addrs)):
+        var raw = _OpaquePtr(unsafe_from_address=addrs[i])
+        var typed = raw.unsafe_bitcast[TcpListener]()
+        typed.unsafe_deinit_pointee()
+        _scheduler_free_raw(raw)
+
+
+def _bind_worker_listeners(
+    addr: SocketAddr,
+    extra_addrs: List[SocketAddr],
+    num_workers: Int,
+    var handed_fds: List[Int],
+) raises -> List[Int]:
+    """One non-blocking ``SO_REUSEPORT`` listener per worker per address.
+
+    Returns heap listener addresses: worker ``i``'s primary at ``i``,
+    then worker ``i``'s extra ``j`` at
+    ``num_workers + i * len(extra_addrs) + j``. ``drain`` relies on
+    this layout to keep a stuck worker's listeners.
+
+    When ``handed_fds`` is not empty, worker 0 takes those listeners
+    (``addr``'s first, then the extras in order) instead of new ones,
+    so the addresses keep a listener the whole time. On failure every
+    listener is closed, the handed-over ones included, and the error is
+    raised again.
+    """
+    var primaries = List[Int]()
+    var extras = List[Int]()
+    var first_new_worker = 0
+    if len(handed_fds) > 0:
+        primaries.append(
+            _heap_listener(TcpListener.from_raw_fd(c_int(handed_fds[0]), addr))
+        )
+        for j in range(len(extra_addrs)):
+            var fd = c_int(handed_fds[1 + j])
+            extras.append(
+                _heap_listener(TcpListener.from_raw_fd(fd, extra_addrs[j]))
+            )
+        first_new_worker = 1
+    try:
+        for _ in range(first_new_worker, num_workers):
+            primaries.append(_heap_listener(bind_reuseport(addr)))
+        for _ in range(first_new_worker, num_workers):
+            for j in range(len(extra_addrs)):
+                extras.append(_heap_listener(bind_reuseport(extra_addrs[j])))
+        _set_nonblocking(primaries)
+        _set_nonblocking(extras)
+    except e:
+        _free_listeners(primaries)
+        _free_listeners(extras)
+        raise e^
+    var all = primaries^
+    all.extend(extras^)
+    return all^
+
+
+def _set_nonblocking(addrs: List[Int]) raises:
+    """Make every heap listener in ``addrs`` non-blocking."""
+    for i in range(len(addrs)):
+        var ptr = Pointer[TcpListener, MutUntrackedOrigin](
+            unsafe_from_address=addrs[i]
+        )
+        ptr[]._socket.set_nonblocking(True)
 
 
 # ── Scheduler ────────────────────────────────────────────────────────────────
@@ -294,6 +386,7 @@ struct Scheduler[F: Frontend](Movable):
         num_workers: Int,
         pin_cores: Bool = True,
         extra_addrs: List[SocketAddr] = List[SocketAddr](),
+        listener_fds: List[Int] = List[Int](),
     ) raises -> Scheduler[Self.F]:
         """Spawn ``num_workers`` threads sharing one listener.
 
@@ -322,7 +415,17 @@ struct Scheduler[F: Frontend](Movable):
                 serially on this thread. Empty (default) preserves
                 the single-address behaviour exactly. Every extra
                 address must be bindable with ``SO_REUSEPORT``, so
-                any earlier listener on it must already be closed.
+                any earlier listener on it must either be closed or
+                be handed over through ``listener_fds``.
+            listener_fds: Listeners the caller already bound, as
+                bare fds: ``addr``'s first, then one per extra
+                address in order. Empty (default) means the
+                scheduler binds every listener itself. When given,
+                they must carry ``SO_REUSEPORT``; worker 0 serves
+                them (or, with one shared listener, every worker
+                does), so the addresses are never left without a
+                listener. The scheduler owns them from the call on
+                and closes them, also when ``start`` raises.
 
         Returns:
             A running ``Scheduler`` whose workers will continue to
@@ -335,10 +438,17 @@ struct Scheduler[F: Frontend](Movable):
                 re-raising.
         """
         if num_workers < 1 or num_workers > 256:
+            _close_fds(listener_fds)
             raise Error(
                 "Scheduler.start: num_workers must be in 1..=256 (got "
                 + String(num_workers)
                 + ")"
+            )
+        var handed_over = len(listener_fds) > 0
+        if handed_over and len(listener_fds) != 1 + len(extra_addrs):
+            _close_fds(listener_fds)
+            raise Error(
+                "Scheduler.start: listener_fds needs one fd per address"
             )
         var s = Scheduler[Self.F]()
 
@@ -420,22 +530,22 @@ struct Scheduler[F: Frontend](Movable):
             or len(extra_addrs) > 0
         )
 
-        # Probe-bind each extra address on this thread so an unusable
-        # one raises here rather than inside an opaque pthread, and
-        # before any listener has been heap-stored.
-        for j in range(len(extra_addrs)):
-            try:
-                var xprobe = bind_reuseport(extra_addrs[j])
-                _ = xprobe^
-            except e:
-                _scheduler_free_raw(stop_raw)
-                s._stopping_addr = 0
-                raise e^
-        if prebind_per_worker:
-            # Probe-bind to validate the addr (raises on the
-            # caller's thread if AddressInUse / etc.); the probe
-            # listener is dropped immediately and each worker binds
-            # its own SO_REUSEPORT listener inside _worker_entry.
+        # Probe-bind each address on this thread so an unusable one
+        # raises here rather than inside an opaque pthread, and before
+        # any listener has been heap-stored. Handed-over listeners skip
+        # it: they prove the address works, and a probe would join their
+        # SO_REUSEPORT group, so connections the kernel routed to it
+        # would be reset when it closes.
+        if not handed_over:
+            for j in range(len(extra_addrs)):
+                try:
+                    var xprobe = bind_reuseport(extra_addrs[j])
+                    _ = xprobe^
+                except e:
+                    _scheduler_free_raw(stop_raw)
+                    s._stopping_addr = 0
+                    raise e^
+        if prebind_per_worker and not handed_over:
             try:
                 var probe = bind_reuseport(addr)
                 _ = probe^
@@ -443,10 +553,15 @@ struct Scheduler[F: Frontend](Movable):
                 _scheduler_free_raw(stop_raw)
                 s._stopping_addr = 0
                 raise e^
+        if prebind_per_worker:
             s._shared_listener_addr = 0
             s._shared_listener_fd = -1
         else:
-            var bound = bind_shared(addr)
+            var bound: TcpListener
+            if handed_over:
+                bound = TcpListener.from_raw_fd(c_int(listener_fds[0]), addr)
+            else:
+                bound = bind_shared(addr)
             try:
                 bound._socket.set_nonblocking(True)
             except e:
@@ -488,74 +603,40 @@ struct Scheduler[F: Frontend](Movable):
             sp[unsafe_offset=WORKER_STAT_INDEX] = Int64(w)
             s._stats_addrs.append(Int(sp))
 
-        # If we need per-worker listeners (io_uring buffer-ring
-        # path OR the opt-in epoll reuseport mode): pre-bind one
-        # SO_REUSEPORT listener PER WORKER on the Scheduler thread
-        # before spawning any pthreads. Doing the binds serially
-        # on a single thread eliminates any concurrent-bind races
-        # that could surface from N pthreads each calling
-        # bind_reuseport simultaneously, which empirically caused
-        # the multi-worker bufring crash on commit 88ea2f7.
-        # Per-worker listeners are heap-stored in a parallel array
-        # so their destructors don't fire here; the same shutdown
-        # path that frees s._shared_listener_addr will iterate +
-        # free them.
-        # A failed bind raises. It used to be skipped: the listener list
-        # came up short, a worker past its end ran on fd -1, and with
-        # extra addresses a worker was handed another address's
-        # listener as its primary, since the extras sit right after the
-        # primaries in the same list.
+        # Per-worker listeners are bound serially on this thread before
+        # any pthread spawns: N pthreads each calling bind_reuseport at
+        # once caused the multi-worker bufring crash on commit 88ea2f7.
+        # A failed bind raises rather than leaving a worker without a
+        # listener.
         if prebind_per_worker:
-            for _ in range(num_workers):
-                try:
-                    var pwl = bind_reuseport(addr)
-                    pwl._socket.set_nonblocking(True)
-                    var ptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
-                    ptr.unsafe_write(pwl^)
-                    s._per_worker_listener_addrs.append(Int(ptr))
-                except e:
-                    s._abandon_start()
-                    raise e^
+            try:
+                s._per_worker_listener_addrs = _bind_worker_listeners(
+                    addr, extra_addrs, num_workers, listener_fds.copy()
+                )
+            except e:
+                s._abandon_start()
+                raise e^
 
-        # Extra addresses, same serial-bind discipline. Appended to
-        # _per_worker_listener_addrs AFTER the primaries so indices
-        # 0..num_workers-1 keep pointing at each worker's primary
-        # listener (the pick below indexes by worker number), while
-        # shutdown still frees every listener from the one list.
-        var extra_worker_fds = List[List[Int]]()
-        for _ in range(num_workers):
-            var per_worker = List[Int]()
-            for j in range(len(extra_addrs)):
-                try:
-                    var xl = bind_reuseport(extra_addrs[j])
-                    xl._socket.set_nonblocking(True)
-                    var xfd = Int(xl.as_raw_fd())
-                    var xptr = alloc(Layout[TcpListener](count=1)).unsafe_leak()
-                    xptr.unsafe_write(xl^)
-                    s._per_worker_listener_addrs.append(Int(xptr))
-                    per_worker.append(xfd)
-                except e:
-                    s._abandon_start()
-                    raise e^
-            extra_worker_fds.append(per_worker^)
-
+        var n_extra = len(extra_addrs)
         for i in range(num_workers):
             var frontend_copy = frontend.copy()
-            # Pick this worker's listener fd: either the shared
-            # epoll listener, or its own per-worker SO_REUSEPORT
-            # listener (pre-bound on this thread above).
+            # Pick this worker's listener fds: the shared listener, or
+            # its own per-worker SO_REUSEPORT listeners (layout in
+            # ``_bind_worker_listeners``).
             var worker_listener_fd: Int = listener_fd
-            if prebind_per_worker and i < len(s._per_worker_listener_addrs):
-                var pwl_ptr = Pointer[TcpListener, MutUntrackedOrigin](
-                    unsafe_from_address=s._per_worker_listener_addrs[i]
+            var worker_extra_fds = List[Int]()
+            if prebind_per_worker:
+                worker_listener_fd = _heap_listener_fd(
+                    s._per_worker_listener_addrs[i]
                 )
-                worker_listener_fd = Int(pwl_ptr[].as_raw_fd())
+                for j in range(n_extra):
+                    var slot = num_workers + i * n_extra + j
+                    worker_extra_fds.append(
+                        _heap_listener_fd(s._per_worker_listener_addrs[slot])
+                    )
             var worker_stats_addr = (
                 s._stats_addrs[i] if i < len(s._stats_addrs) else 0
             )
-            var worker_extra_fds = List[Int]()
-            if i < len(extra_worker_fds):
-                worker_extra_fds = extra_worker_fds[i].copy()
             var ctx = _WorkerCtx[Self.F](
                 worker_listener_fd,
                 addr,
@@ -708,13 +789,7 @@ struct Scheduler[F: Frontend](Movable):
     def _free_per_worker_listeners(mut self):
         """Close and free every pre-bound per-worker listener (primaries
         and extras). Only call once no worker can still use them."""
-        for i in range(len(self._per_worker_listener_addrs)):
-            var pwl_raw = _OpaquePtr(
-                unsafe_from_address=self._per_worker_listener_addrs[i]
-            )
-            var pwl_typed = pwl_raw.unsafe_bitcast[TcpListener]()
-            pwl_typed.unsafe_deinit_pointee()
-            _scheduler_free_raw(pwl_raw)
+        _free_listeners(self._per_worker_listener_addrs)
         self._per_worker_listener_addrs.clear()
 
     def _free_resources(mut self):

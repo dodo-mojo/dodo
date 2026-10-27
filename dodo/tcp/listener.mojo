@@ -19,6 +19,7 @@ from ..net import (
 )
 from ..net.socket import (
     RawSocket,
+    INVALID_FD,
     AF_INET,
     AF_INET6,
     SOCK_STREAM,
@@ -202,6 +203,37 @@ struct TcpListener(Movable):
         # Query the actual local address (handles port 0 → OS-assigned port)
         var local = sock.local_addr()
         return TcpListener(sock^, local)
+
+    @staticmethod
+    def from_raw_fd(fd: c_int, local: SocketAddr) -> TcpListener:
+        """Take ownership of a listening socket handed over as a bare fd.
+
+        The counterpart of :meth:`into_raw_fd`.
+
+        Args:
+            fd: An open socket in the listening state.
+            local: The address it is bound to.
+
+        Returns:
+            A ``TcpListener`` that closes ``fd`` when destroyed.
+        """
+        var family = AF_INET6 if local.ip.is_v6() else AF_INET
+        var sock = RawSocket(fd, family, SOCK_STREAM, _wrap=True)
+        return TcpListener(sock^, local)
+
+    def into_raw_fd(mut self) -> c_int:
+        """Give up ownership of the socket and return its fd.
+
+        The listener no longer closes it; whoever receives the fd does
+        (usually through :meth:`from_raw_fd`). Afterwards this listener
+        behaves as closed.
+
+        Returns:
+            The fd, or a negative value when the listener was closed.
+        """
+        var fd = self._socket.fd
+        self._socket.fd = INVALID_FD
+        return fd
 
     # ── Accept ────────────────────────────────────────────────────────────────
 
