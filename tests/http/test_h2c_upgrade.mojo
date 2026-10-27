@@ -278,6 +278,7 @@ def test_h2c_upgrade_101_flushed_on_a_writable_edge_migrates() raises:
     conns[fd] = _pack(KIND_H1, _conn_alloc_addr(accepted^))
     var handler = FnHandler(_ok)
     var config = ServerConfig()
+    config.h2.allow_h2c_upgrade = True
     var h2 = Http2Config()
 
     var req = String(
@@ -286,7 +287,7 @@ def test_h2c_upgrade_101_flushed_on_a_writable_edge_migrates() raises:
     )
     client.write_all(req.as_bytes())
     ref ch = _conn_ptr_from_int(_addr(conns[fd]))[]
-    ch.h2c_upgrade_allowed = True
+    ch.on_unified_loop = True
     # Wait (bounded by the socket, not a sleep) for the request bytes.
     var step = ch.on_readable(handler, config)
     for _ in range(1000):

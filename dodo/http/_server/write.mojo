@@ -174,8 +174,12 @@ def _status_reason(code: Int) -> String:
         return "Content Too Large"
     if code == 414:
         return "URI Too Long"
+    if code == 417:
+        return "Expectation Failed"
     if code == 422:
         return "Unprocessable Entity"
+    if code == 431:
+        return "Request Header Fields Too Large"
     if code == 500:
         return "Internal Server Error"
     if code == 501:
@@ -186,6 +190,8 @@ def _status_reason(code: Int) -> String:
         return "Service Unavailable"
     if code == 504:
         return "Gateway Timeout"
+    if code == 505:
+        return "HTTP Version Not Supported"
     return "Unknown"
 
 

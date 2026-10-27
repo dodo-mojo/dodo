@@ -653,6 +653,42 @@ def _shutdown(fd: c_int, how: c_int) -> c_int:
     return external_call["shutdown", c_int](fd, how)
 
 
+comptime _RLIMIT_NOFILE: c_int = c_int(_pm["RLIMIT_NOFILE", linux=7, macos=8]())
+
+comptime _MACOS_OPEN_MAX: Int = 10240
+"""macOS refuses a soft file limit above this, whatever the hard limit."""
+
+
+def raise_open_file_limit() -> Int:
+    """Raise this process's open-file limit to its hard limit and return
+    the soft limit now in force (unchanged if raising it failed).
+
+    Most systems start processes at a soft limit of 1024 files, far
+    below what a server needs; the hard limit is usually much higher.
+    """
+    # struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; }, two u64.
+    var lim = stack_allocation[2, UInt64]()
+    lim[unsafe_offset=0] = 0
+    lim[unsafe_offset=1] = 0
+    var raw = lim.unsafe_bitcast[NoneType]()
+    if external_call["getrlimit", c_int](_RLIMIT_NOFILE, raw) != 0:
+        return 1024
+    var soft = lim[unsafe_offset=0]
+    var target = lim[unsafe_offset=1]
+    comptime if CompilationTarget.is_macos():
+        if target > UInt64(_MACOS_OPEN_MAX):
+            target = UInt64(_MACOS_OPEN_MAX)
+    if target > soft:
+        lim[unsafe_offset=0] = target
+        if external_call["setrlimit", c_int](_RLIMIT_NOFILE, raw) == 0:
+            soft = target
+    # RLIM_INFINITY reads as a huge unsigned value; any real fd table
+    # is far smaller.
+    if soft > UInt64(1 << 30):
+        return 1 << 30
+    return Int(soft)
+
+
 @always_inline
 def _getsockopt(
     fd: c_int,

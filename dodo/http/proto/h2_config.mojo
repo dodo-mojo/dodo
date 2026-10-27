@@ -146,6 +146,12 @@ struct Http2Config(Copyable, Defaultable):
     # False -- the unified dodo.http.HttpServer flips this on
     # automatically when the WebSocket-over-HTTP/2 bridge is
     # wired in.
+    var allow_h2c_upgrade: Bool
+    """Honour ``Upgrade: h2c`` on cleartext HTTP/1.1 (RFC 7540 sec 3.2).
+    Default ``False``: behind a proxy that forwards ``Upgrade``, a client
+    could switch to HTTP/2 and get past the proxy's path rules (h2c
+    smuggling). Prior-knowledge h2c (the client opens with the HTTP/2
+    preface) and h2 over TLS work either way."""
 
     def __init__(out self):
         """Default to the production-shape SETTINGS pinned in
@@ -163,6 +169,7 @@ struct Http2Config(Copyable, Defaultable):
         self.allow_huffman_decode = True
         self.allow_huffman_encode = False
         self.enable_connect_protocol = False
+        self.allow_h2c_upgrade = False
 
     def __init__(
         out self,
@@ -175,8 +182,9 @@ struct Http2Config(Copyable, Defaultable):
         allow_huffman_encode: Bool,
         enable_connect_protocol: Bool,
         max_body_size: Int = 10 * 1024 * 1024,
+        allow_h2c_upgrade: Bool = False,
     ):
-        """Configure all SETTINGS, preserving the existing constructor shape."""
+        """Configure every field."""
         self.max_concurrent_streams = max_concurrent_streams
         self.max_body_size = max_body_size
         self.initial_window_size = initial_window_size
@@ -186,6 +194,7 @@ struct Http2Config(Copyable, Defaultable):
         self.allow_huffman_decode = allow_huffman_decode
         self.allow_huffman_encode = allow_huffman_encode
         self.enable_connect_protocol = enable_connect_protocol
+        self.allow_h2c_upgrade = allow_h2c_upgrade
 
     def validate(self) raises -> None:
         """Raise if any field violates the RFC 9113 / RFC 7541 bounds.

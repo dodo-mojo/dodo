@@ -48,6 +48,18 @@ comptime STATE_WRITING: Int = 1
 comptime STATE_CLOSING: Int = 2
 """Connection is shutting down; next event should finalize close."""
 
+comptime STATE_LINGERING: Int = 3
+"""An error response was sent and our side is half-closed. Input is read
+and dropped until the peer closes or the linger time runs out, so a
+client still sending its request reads the response instead of a reset
+(RFC 9112 sec 9.6)."""
+
+comptime LINGER_READ_TIMEOUT_MS: Int = 2_000
+"""Close a lingering connection that sends nothing for this long."""
+
+comptime LINGER_TOTAL_MS: Int = 5_000
+"""Close a lingering connection after this long, however much it sends."""
+
 
 # ── h2c upgrade detection ─────────────────────────────────────────────
 
@@ -535,4 +547,17 @@ def _wants_close(data: List[UInt8], header_end: Int) -> Bool:
         return True
     if version_is_10 and not conn_keepalive:
         return True
+    return False
+
+
+def _has_bare_lf(buf: List[UInt8]) -> Bool:
+    """True when ``buf`` holds an LF not preceded by a CR.
+
+    A request head with bare-LF line endings never shows the CRLFCRLF
+    the reactor waits for, so it is refused at once instead of timing
+    out with no response.
+    """
+    for i in range(len(buf)):
+        if buf[i] == 10 and (i == 0 or buf[i - 1] != 13):
+            return True
     return False

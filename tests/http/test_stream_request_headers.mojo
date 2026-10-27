@@ -107,8 +107,11 @@ def test_unknown_body_size_omits_content_length() raises:
 def test_rejects_header_values_that_could_inject() raises:
     """CR, LF and NUL are refused rather than escaped or dropped."""
     for bad in ["a\rb", "a\nb", "a\r\nX-Evil: 1", String("a\0b")]:
+        # `set` refuses these too, so write the fields directly to test
+        # the writer's own check.
         var h = HeaderMap()
-        h.set_unchecked("X-Bad", "x-bad", bad)
+        h._keys.append("X-Bad")
+        h._values.append(bad)
         with assert_raises():
             _ = prepare_stream_headers("GET", _u(), h, "ua/1")
 
@@ -116,7 +119,7 @@ def test_rejects_header_values_that_could_inject() raises:
 def test_rejects_field_names_that_are_not_tokens() raises:
     for bad in ["X Bad", "X:Bad", "X(Bad)", "X@Bad", "X\tBad", ""]:
         var h = HeaderMap()
-        h.set_unchecked(bad, bad.lower(), "v")
+        h.set(bad, "v")
         with assert_raises():
             _ = prepare_stream_headers("GET", _u(), h, "ua/1")
 

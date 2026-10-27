@@ -289,6 +289,10 @@ def scan_chunked_resume(
                 break
             i += 1
         if line_end < 0:
+            # A bare LF can never start a valid line ending here, so a
+            # client using bare LFs gets a 400 now, not after a timeout.
+            if _has_lf(buf, pos, n):
+                return CHUNKED_MALFORMED
             # One byte of slack for a CR that may be the first half of
             # the CRLF: a line of exactly CHUNK_LINE_MAX bytes cut after
             # its CR is not over the cap (the complete-line test below
@@ -335,6 +339,8 @@ def scan_chunked_resume(
                         break
                     k += 1
                 if found < 0:
+                    if _has_lf(buf, t, n):
+                        return CHUNKED_MALFORMED
                     if n - t > CHUNK_LINE_MAX + 1:
                         return CHUNKED_MALFORMED
                     return CHUNKED_INCOMPLETE

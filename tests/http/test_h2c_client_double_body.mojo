@@ -28,9 +28,23 @@ This regression fixture pins the fix:
 
 from std.testing import assert_equal, assert_true
 
-from dodo.http import HttpClient, HttpServer, Request, Response, ok
+from dodo.http import (
+    HttpClient,
+    HttpServer,
+    Request,
+    Response,
+    ServerConfig,
+    ok,
+)
 from dodo.net import SocketAddr
 from dodo.testing import fork_server, kill_forked_server
+
+
+def _h2c_config() -> ServerConfig:
+    """The server only honours Upgrade: h2c when the config allows it."""
+    var config = ServerConfig()
+    config.h2.allow_h2c_upgrade = True
+    return config^
 
 
 def _hello_64(req: Request) raises -> Response:
@@ -51,7 +65,7 @@ def test_post_body_not_doubled() raises:
     NOT ``POST:12POST:12``. Pre-fix this was a flaky failure
     because the Span over the slice temporary read freed storage
     on the second loop iteration."""
-    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var srv = HttpServer.bind(SocketAddr.localhost(0), _h2c_config())
     var port = UInt16(srv.local_addr().port)
     var pid = fork_server(srv^, _echo_method)
 
@@ -83,7 +97,7 @@ def test_get_response_length_invariant() raises:
     length-equality assertion catches a body-doubling regression
     in one bit -- a future regression that quietly returns a
     128-byte body fails this without needing to look at content."""
-    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var srv = HttpServer.bind(SocketAddr.localhost(0), _h2c_config())
     var port = UInt16(srv.local_addr().port)
     var pid = fork_server(srv^, _hello_64)
 

@@ -70,6 +70,27 @@ Each test ran against 1 worker and 4 workers.
 | F9 | Project risk | One maintainer has 1,309 of about 1,340 commits. | Pin a version, contribute upstream, keep Flare behind dodo's own API so a fork stays cheap. |
 | F10 | Low | A 64 KB header line gets 400 instead of 431. 900 KB of headers gets a connection reset. | Upstream issue. |
 
+### Status in dodo (2026-10-27)
+
+Rechecked with the same probes against dodo's server.
+
+| ID | Status |
+|---|---|
+| F1 | **Fixed.** `Http2Config.allow_h2c_upgrade`, default off; `Upgrade: h2c` is served as HTTP/1.1. Prior-knowledge h2c and h2 over TLS are unaffected. |
+| F2 | **Fixed.** `set_unchecked` is deleted. `set` and `append` also refuse NUL now, not just CR and LF. |
+| F3 | **Fixed.** HTTP/1.1 without `Host` gets 400 (both request parsers). |
+| F4 | **Fixed, one by design.** `CONNECT` gets 501, `*` is only allowed with `OPTIONS`, a target must be `/...` or `http(s)://...`, and `Expect` other than `100-continue` gets 417. `HTTP/1.9` is still served as HTTP/1.1, which RFC 9110 sec 2.5 requires; other major versions get 505. |
+| F5 | **Fixed.** Bare-LF heads and chunked bodies get 400 at once. |
+| F6 | **Fixed.** `header_timeout_ms` (10 s) bounds the head; `min_body_rate` (240 bytes/s after 5 s) cuts off trickled bodies; `max_connections` defaults to a per-worker cap derived from the open-file limit, which the server raises to the hard limit at startup. Without a cap, `accept` failing with `EMFILE` made the worker spin. |
+| F7 | **Open.** Design proposed in [ADR-0004](adr/0004-offload-pool.md), waiting for review. |
+| F8 | **Fixed** at import: `pixi run tests` makes the TLS certs first. |
+| F9 | **Moot.** dodo forked the code (ADR-0003). |
+| F10 | **Fixed.** Oversized headers get 431, a long URI 414. After an early error response (other than 408) the server half-closes and drops input for up to 5 s (a lingering close, RFC 9112 sec 9.6), so a client still sending reads the response instead of a reset. |
+
+Also fixed: a request line with no version (`GET /`, HTTP/0.9) was served as HTTP/1.1, and `Transfer-Encoding` in an HTTP/1.0 request was accepted (RFC 9112 sec 6.1 says the framing is faulty). Both get 400 now.
+
+Also found and fixed: **a lost response with pipelining.** When a client pipelined a request whose body arrived later (`GET` then `POST` with part of its body), the server dropped the response to the `GET`. Batching treated the `POST` as ready once its head was in, set the `GET` response aside, and the `POST` response overwrote it when the body arrived. Only the io_uring buffer-ring tests covered this case, so the default loop never ran it.
+
 Not findings: `/../../etc/passwd` and `%00` reach the handler unchanged, which is correct for a server. dodo's router and static-file code must normalise and reject these (to test in Phase 1).
 
 ## Fuzzing

@@ -53,7 +53,7 @@ def _lower(s: String) -> String:
 
 
 struct HeaderInjectionError(Copyable, Writable):
-    """Raised when a header key or value contains CR or LF bytes."""
+    """Raised when a header key or value contains CR, LF or NUL bytes."""
 
     var field: String
     var value: String
@@ -74,14 +74,14 @@ struct HeaderInjectionError(Copyable, Writable):
 
 @always_inline
 def _check_injection(key: String, value: String) raises:
-    """Raise ``HeaderInjectionError`` if key or value contain CR/LF."""
+    """Raise ``HeaderInjectionError`` if key or value contain CR, LF or NUL."""
     for i in range(key.byte_length()):
         var c = key.unsafe_ptr()[unsafe_offset=i]
-        if c == 13 or c == 10:
+        if c == 13 or c == 10 or c == 0:
             raise HeaderInjectionError(key, value)
     for i in range(value.byte_length()):
         var c = value.unsafe_ptr()[unsafe_offset=i]
-        if c == 13 or c == 10:
+        if c == 13 or c == 10 or c == 0:
             raise HeaderInjectionError(key, value)
 
 
@@ -136,25 +136,6 @@ struct HeaderMap(Movable, Writable):
         self._keys.reserve(n)
         self._values.reserve(n)
 
-    def set_unchecked(mut self, key: String, lk: String, value: String):
-        """Set a header without injection checks.
-
-        The ``lk`` parameter is accepted for API compatibility but ignored;
-        lookup uses inline case-insensitive comparison on ``key``.
-
-        Args:
-            key: Header name.
-            lk: Ignored (kept for backward compat).
-            value: Header value.
-        """
-        for i in range(len(self._keys)):
-            if _eq_icase(self._keys[i], key):
-                self._keys[i] = key
-                self._values[i] = value
-                return
-        self._keys.append(key)
-        self._values.append(value)
-
     def copy(self) -> HeaderMap:
         """Return a deep copy of this ``HeaderMap``."""
         var out = HeaderMap()
@@ -171,7 +152,7 @@ struct HeaderMap(Movable, Writable):
             value: Header value.
 
         Raises:
-            HeaderInjectionError: If ``key`` or ``value`` contains ``\\r`` or ``\\n``.
+            HeaderInjectionError: If ``key`` or ``value`` contains CR, LF or NUL.
         """
         _check_injection(key, value)
         for i in range(len(self._keys)):
@@ -190,7 +171,7 @@ struct HeaderMap(Movable, Writable):
             value: Header value.
 
         Raises:
-            HeaderInjectionError: If ``key`` or ``value`` contains ``\\r`` or ``\\n``.
+            HeaderInjectionError: If ``key`` or ``value`` contains CR, LF or NUL.
         """
         _check_injection(key, value)
         self._keys.append(key)

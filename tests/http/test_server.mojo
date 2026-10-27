@@ -267,7 +267,10 @@ def test_parse_bytes_malformed_no_space() raises:
 def test_parse_bytes_body_exceeds_limit() raises:
     var body = "x" * 100
     var raw = (
-        "POST /data HTTP/1.1\r\n" + "Content-Length: 100\r\n" + "\r\n" + body
+        "POST /data HTTP/1.1\r\nHost: x\r\n"
+        + "Content-Length: 100\r\n"
+        + "\r\n"
+        + body
     )
     var data = raw.as_bytes()
     with assert_raises(contains="body exceeds limit"):
@@ -710,7 +713,7 @@ def test_server_large_headers() raises:
     var client = TcpStream.connect(SocketAddr.localhost(port))
     var server_stream = srv._listener.accept()
 
-    var raw_req = "GET / HTTP/1.1\r\n"
+    var raw_req = "GET / HTTP/1.1\r\nHost: x\r\n"
     for i in range(20):
         raw_req += "X-Header-" + String(i) + ": value-" + String(i) + "\r\n"
     raw_req += "\r\n"
@@ -847,25 +850,21 @@ def test_encode_to_empty() raises:
     assert_equal(len(buf), 0)
 
 
-# ── set_unchecked tests ──────────────────────────────────────────────────────
+# ── Header injection ─────────────────────────────────────────────────────────
 
 
-def test_set_unchecked_basic() raises:
-    """Set_unchecked adds headers and get retrieves them case-insensitively."""
-    var hm = HeaderMap()
-    hm.set_unchecked("Content-Type", "content-type", "application/json")
-    assert_equal(hm.get("content-type"), "application/json")
-    assert_equal(hm.get("Content-Type"), "application/json")
-    assert_equal(hm.len(), 1)
-
-
-def test_set_unchecked_replaces() raises:
-    """Set_unchecked replaces existing header."""
-    var hm = HeaderMap()
-    hm.set_unchecked("X-Foo", "x-foo", "old")
-    hm.set_unchecked("X-Foo", "x-foo", "new")
-    assert_equal(hm.get("X-Foo"), "new")
-    assert_equal(hm.len(), 1)
+def test_set_and_append_reject_cr_lf_and_nul() raises:
+    """No public way puts CR, LF or NUL in a header, so a response
+    can't be split."""
+    for bad in ["a\rb", "a\nb", "a\r\nX-Evil: 1", String("a\0b")]:
+        var hm = HeaderMap()
+        with assert_raises():
+            hm.set("X-Bad", bad)
+        with assert_raises():
+            hm.append("X-Bad", bad)
+        with assert_raises():
+            hm.set(bad, "v")
+        assert_equal(hm.len(), 0)
 
 
 # ── HeaderMap with _eq_icase integration ─────────────────────────────────────
@@ -939,7 +938,7 @@ def test_parse_bytes_lf_only() raises:
 def test_parse_bytes_long_header_value() raises:
     """Long header value parses correctly."""
     var long_val = "x" * 500
-    var raw = "GET / HTTP/1.1\r\nX-Long: " + long_val + "\r\n\r\n"
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\nX-Long: " + long_val + "\r\n\r\n"
     var data = raw.as_bytes()
     var req = _parse_http_request_bytes(Span[UInt8, _](data))
     assert_equal(req.headers.get("X-Long").byte_length(), 500)
@@ -947,7 +946,7 @@ def test_parse_bytes_long_header_value() raises:
 
 def test_parse_bytes_empty_header_value() raises:
     """Header with empty value parses correctly."""
-    var raw = "GET / HTTP/1.1\r\nX-Empty:\r\n\r\n"
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\nX-Empty:\r\n\r\n"
     var data = raw.as_bytes()
     var req = _parse_http_request_bytes(Span[UInt8, _](data))
     assert_equal(req.headers.get("X-Empty"), "")

@@ -122,6 +122,9 @@ def test_sqe_construction_zeros_buffer() raises:
     var buf = sqe.as_bytes()
     for i in range(IO_URING_SQE_BYTES):
         assert_equal(Int(buf[unsafe_offset=i]), 0)
+    # `buf` doesn't keep `sqe` alive. Without this, Mojo frees `sqe`
+    # right after `as_bytes()` and the loop reads freed memory.
+    _ = sqe^
 
 
 def test_encode_sqe_zero_clears_dirty_buffer() raises:

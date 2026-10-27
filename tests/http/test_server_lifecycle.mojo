@@ -429,8 +429,27 @@ def test_h2c_upgrade_on_a_loop_that_cannot_migrate_is_served_as_h1() raises:
     assert_true("hi /u" in got, "request not served as HTTP/1.1: " + got)
 
 
-def test_h2c_upgrade_still_switches_on_the_unified_loop() raises:
+def test_h2c_upgrade_is_ignored_by_default() raises:
+    """Behind a proxy that forwards Upgrade, h2c would let a client get
+    past the proxy's path rules, so the default serves it as HTTP/1.1."""
     var srv = _spawn(ServerConfig())
+    var got = String("")
+    try:
+        var c = _connect_loopback(srv[1])
+        _send_str(c, _H2C_UPGRADE)
+        got = _read_until_close(c)
+        _ = _close(c)
+    except:
+        pass
+    _stop(srv[0])
+    assert_false("101" in got, "upgraded without allow_h2c_upgrade: " + got)
+    assert_true("hi /u" in got, "request not served as HTTP/1.1: " + got)
+
+
+def test_h2c_upgrade_switches_when_allowed() raises:
+    var config = ServerConfig()
+    config.h2.allow_h2c_upgrade = True
+    var srv = _spawn(config^)
     var got = String("")
     try:
         var c = _connect_loopback(srv[1])
@@ -498,6 +517,58 @@ def test_body_gap_longer_than_idle_timeout_is_tolerated() raises:
         pass
     _stop(srv[0])
     assert_true("hi /slow-body" in got, "slow body was cut off: " + got)
+
+
+# ── Early error responses reach a client that is still sending (F10) ───────
+
+
+def test_oversized_head_gets_431_while_the_client_is_still_sending() raises:
+    """The server answers 431 before the head is in, then reads and drops
+    the rest (a lingering close). Closing at once would make the kernel
+    reset the connection and the client would never see the 431."""
+    var srv = _spawn(ServerConfig())
+    var got = String("")
+    try:
+        var c = _connect_loopback(srv[1])
+        _send_str(c, "GET / HTTP/1.1\r\nHost: x\r\n")
+        var line = "X-Fill: " + "a" * 8000 + "\r\n"
+        for _ in range(100):
+            _send_str(c, line)
+        got = _read_until_close(c)
+        _ = _close(c)
+    except:
+        pass
+    _stop(srv[0])
+    assert_true(got.startswith("HTTP/1.1 431"), "no 431 for an 800 KB head")
+
+
+# ── Automatic connection cap (F6) ──────────────────────────────────────────
+
+
+def test_automatic_connection_cap_stays_below_the_file_limit() raises:
+    from dodo.net._libc import raise_open_file_limit
+
+    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    srv._resolve_max_connections(4)
+    var cap = srv.config.max_connections
+    srv.close()
+    assert_true(cap > 0, "no cap was set")
+    assert_true(cap * 4 < raise_open_file_limit(), "cap reaches the limit")
+
+
+def test_explicit_connection_cap_is_kept() raises:
+    var unlimited = ServerConfig()
+    unlimited.max_connections = -1
+    var a = HttpServer.bind(SocketAddr.localhost(0), unlimited^)
+    a._resolve_max_connections(1)
+    assert_equal(a.config.max_connections, -1)
+    a.close()
+    var fixed = ServerConfig()
+    fixed.max_connections = 7
+    var b = HttpServer.bind(SocketAddr.localhost(0), fixed^)
+    b._resolve_max_connections(1)
+    assert_equal(b.config.max_connections, 7)
+    b.close()
 
 
 def main() raises:

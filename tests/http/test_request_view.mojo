@@ -76,7 +76,7 @@ def test_url_borrows_into_buffer() raises:
     buffer — no copy, no allocation. We verify by checking the
     underlying byte pointer matches.
     """
-    var raw = "GET /borrowed HTTP/1.1\r\n\r\n"
+    var raw = "GET /borrowed HTTP/1.1\r\nHost: x\r\n\r\n"
     var bytes_list = List[UInt8](capacity=raw.byte_length())
     bytes_list.resize(raw.byte_length(), UInt8(0))
     for i in range(raw.byte_length()):
@@ -93,7 +93,7 @@ def test_url_borrows_into_buffer() raises:
 def test_body_borrows_into_buffer() raises:
     """``view.body()`` is a borrowed slice; pointer must lie inside
     the source buffer."""
-    var raw = "POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nABC"
+    var raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nABC"
     var bytes_list = List[UInt8](capacity=raw.byte_length())
     bytes_list.resize(raw.byte_length(), UInt8(0))
     for i in range(raw.byte_length()):
@@ -158,7 +158,7 @@ def test_into_owned_independent_lifetime() raises:
 
 
 def test_peer_threaded_through() raises:
-    var raw = "GET / HTTP/1.1\r\n\r\n"
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     var bytes = raw.as_bytes()
     var p = SocketAddr(IpAddr("203.0.113.5", False), UInt16(54321))
     var view = parse_request_view(Span[UInt8, _](bytes), peer=p)
@@ -168,7 +168,7 @@ def test_peer_threaded_through() raises:
 
 
 def test_expose_errors_threaded_through() raises:
-    var raw = "GET / HTTP/1.1\r\n\r\n"
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     var bytes = raw.as_bytes()
     var view = parse_request_view(Span[UInt8, _](bytes), expose_errors=True)
     assert_true(view.expose_errors)

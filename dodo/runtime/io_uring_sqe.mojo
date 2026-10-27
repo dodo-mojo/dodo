@@ -227,9 +227,9 @@ struct IoUringSqe(Movable):
     def as_bytes(self) -> Pointer[UInt8, MutUntrackedOrigin]:
         """Return the raw 64-byte buffer pointer.
 
-        The pointer's lifetime is tied to the SQE. Callers may
-        ``memcpy`` the bytes into a kernel SQ slot before the SQE
-        is dropped.
+        The pointer does not keep the SQE alive. Mojo frees a value
+        after its last use, so use the SQE again (or end with
+        ``_ = sqe^``) after the last read through this pointer.
         """
         return self._buf
 

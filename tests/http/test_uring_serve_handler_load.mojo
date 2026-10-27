@@ -62,6 +62,9 @@ def _bufring_config() -> ServerConfig:
         write_timeout_ms=0,
         read_body_timeout_ms=0,
         request_timeout_ms=0,
+        header_timeout_ms=0,
+        min_body_rate=0,
+        max_connections=-1,
     )
 
 

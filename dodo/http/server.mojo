@@ -496,6 +496,19 @@ struct HttpServer(Movable):
         """
         self._serve_one(handler)
 
+    def _resolve_max_connections(mut self, workers: Int):
+        """Turn ``max_connections == 0`` (automatic) into a per-worker cap
+        that keeps the process below its open-file limit."""
+        from dodo.net._libc import raise_open_file_limit
+
+        if self.config.max_connections != 0:
+            return
+        # Listeners, epoll and event fds, files being served, DNS, TLS.
+        comptime SPARE_FILES = 128
+        var files = raise_open_file_limit()
+        var per_worker = (files - SPARE_FILES) // max(workers, 1)
+        self.config.max_connections = max(per_worker, 16)
+
     def _resolve_bufring(mut self):
         """Decide once, at startup, whether the io_uring buffer-ring loop
         serves: when opted into (``DODO_BUFRING_HANDLER=1`` or
@@ -525,6 +538,7 @@ struct HttpServer(Movable):
         from std.sys.info import CompilationTarget
 
         self._stopping = False
+        self._resolve_max_connections(1)
         self._resolve_bufring()
         comptime if CompilationTarget.is_linux():
             if (
@@ -803,6 +817,7 @@ struct HttpServer(Movable):
         self._close_extras()
 
         # Before the config is handed to the worker threads.
+        self._resolve_max_connections(num_workers)
         self._resolve_bufring()
 
         var frontend = HttpFrontend[H](
@@ -893,6 +908,7 @@ struct HttpServer(Movable):
         from ._server_reactor_impl import run_reactor_loop_cancel
 
         self._stopping = False
+        self._resolve_max_connections(1)
         run_reactor_loop_cancel(
             self._listener, self.config, handler, self._stopping
         )
@@ -937,6 +953,7 @@ struct HttpServer(Movable):
         from ._server_reactor_impl import run_reactor_loop_view
 
         self._stopping = False
+        self._resolve_max_connections(1)
         run_reactor_loop_view(
             self._listener, self.config, handler, self._stopping
         )
@@ -984,6 +1001,7 @@ struct HttpServer(Movable):
                 " serve() on a bind_tls server"
             )
         self._reject_extra_listeners("serve_static")
+        self._resolve_max_connections(num_workers)
         if num_workers > 1:
             self._serve_static_multicore(resp.copy(), num_workers, pin_cores)
             return

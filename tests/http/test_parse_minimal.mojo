@@ -19,7 +19,13 @@ Test cases lock in the contract:
 6. URI cap rejection.
 """
 
-from std.testing import assert_equal, assert_true, assert_false, TestSuite
+from std.testing import (
+    assert_equal,
+    assert_false,
+    assert_raises,
+    assert_true,
+    TestSuite,
+)
 
 from dodo.http.server import _parse_http_request_bytes_minimal
 from dodo.http.headers import HeaderMap
@@ -156,19 +162,17 @@ def test_uri_size_cap_raises() raises:
     assert_true(raised, "expected URI-cap to raise")
 
 
-def test_default_version_when_no_second_space() raises:
-    """Request line ``GET /``: no version, parser defaults to
-    HTTP/1.1 (matches the full parser's behaviour)."""
+def test_missing_version_is_refused() raises:
+    """Request line ``GET /`` (HTTP/0.9) has no version and is refused,
+    as the full parser does."""
     var data = _bytes_of(String("GET /\r\n\r\n"))
     var span = Span[UInt8, _](data)
-    var req = _parse_http_request_bytes_minimal(
-        span,
-        header_end=len(data),
-        content_length=0,
-    )
-    assert_equal(req.method, String("GET"))
-    assert_equal(req.url, String("/"))
-    assert_equal(req.version, String("HTTP/1.1"))
+    with assert_raises(contains="missing HTTP version"):
+        _ = _parse_http_request_bytes_minimal(
+            span,
+            header_end=len(data),
+            content_length=0,
+        )
 
 
 def main() raises:

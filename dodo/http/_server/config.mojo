@@ -27,6 +27,11 @@ from ...ws.server_reactor import (
     make_ws_reactor_hooks,
 )
 
+comptime MIN_BODY_RATE_GRACE_MS: Int = 5_000
+"""How long a request body may arrive at any speed before
+``ServerConfig.min_body_rate`` applies, so a slow start (TCP slow start,
+a client that waits for ``100 Continue``) is not punished."""
+
 comptime WsHandlerFn = def(mut WsConnection) raises thin -> None
 """The opt-in WebSocket handler signature. Identical to
 ``WsServer.serve``'s callback, so a handler written for a standalone
@@ -154,6 +159,17 @@ struct ServerConfig(Copyable):
             not interrupt a running handler. Must be >=
             ``handler_timeout_ms`` and >= ``read_body_timeout_ms``
             (checked at compile time by ``ServerConfig.check``).
+        header_timeout_ms: Max ms to read the request head (request line
+            and headers) from its first byte (default 10_000); 408 when
+            it runs out. 0 disables. Stops a client that sends its
+            headers a byte at a time from holding the connection for
+            the whole ``request_timeout_ms``.
+        min_body_rate: Minimum average upload speed for a request body,
+            in bytes per second (default 240), checked once the body has
+            been arriving for ``MIN_BODY_RATE_GRACE_MS``. A slower body
+            gets 408. 0 disables. Large uploads on slow links still
+            work; a client trickling bytes to hold the connection does
+            not.
         use_bufring: Opt into the io_uring buffer-ring single-worker
             reactor (HTTP/1.1-only, single-listener-only) on Linux
             ``>= 6.0``. When ``False`` (default), every entry point
@@ -184,6 +200,8 @@ struct ServerConfig(Copyable):
     var read_body_timeout_ms: Int
     var handler_timeout_ms: Int
     var request_timeout_ms: Int
+    var header_timeout_ms: Int
+    var min_body_rate: Int
     var skip_header_decode_for_short_requests: Bool
     """When True, the parser skips the per-request ``HeaderMap``
     build for requests whose handler doesn't read headers.
@@ -224,14 +242,15 @@ struct ServerConfig(Copyable):
     for the per-flag contract."""
     var max_connections: Int
     """Accept-path admission cap: the maximum number of concurrent
-    connections a single reactor worker will hold. ``0`` (default)
-    means unlimited. When the live count reaches the cap the accept
-    drainer stops pulling new connections (kernel backpressure via
-    the listen backlog) rather than growing the per-worker table
-    without bound; accepting resumes as slots free. Bounds the
-    file-descriptor-exhaustion / connection-flood DoS surface on the
-    plain Handler path, mirroring what the streaming path already
-    does with its own 503 + Retry-After shed."""
+    connections a single reactor worker will hold. When the live count
+    reaches the cap the worker stops accepting (new clients wait in the
+    listen backlog) and resumes as connections close.
+
+    ``0`` (default) means automatic: at startup the server raises its
+    open-file limit to the hard limit and splits it between the
+    workers, keeping some files spare. Without a cap below the file
+    limit, ``accept`` fails with ``EMFILE`` while the listener stays
+    readable, and the worker spins. A negative value means unlimited."""
     var ws: WsUpgrade
     """WebSocket-on-the-same-port configuration. Default: HTTP only."""
 
@@ -254,6 +273,8 @@ struct ServerConfig(Copyable):
         read_body_timeout_ms: Int = 30_000,
         handler_timeout_ms: Int = 30_000,
         request_timeout_ms: Int = 60_000,
+        header_timeout_ms: Int = 10_000,
+        min_body_rate: Int = 240,
         skip_header_decode_for_short_requests: Bool = False,
         use_bufring: Bool = False,
         var h1_leniency: H1LeniencyConfig = H1LeniencyConfig(),
@@ -274,6 +295,8 @@ struct ServerConfig(Copyable):
         self.read_body_timeout_ms = read_body_timeout_ms
         self.handler_timeout_ms = handler_timeout_ms
         self.request_timeout_ms = request_timeout_ms
+        self.header_timeout_ms = header_timeout_ms
+        self.min_body_rate = min_body_rate
         self.skip_header_decode_for_short_requests = (
             skip_header_decode_for_short_requests
         )
@@ -334,6 +357,12 @@ struct ServerConfig(Copyable):
         comptime assert (
             cfg.request_timeout_ms >= 0
         ), "ServerConfig.request_timeout_ms must be >= 0 (0 disables)"
+        comptime assert (
+            cfg.header_timeout_ms >= 0
+        ), "ServerConfig.header_timeout_ms must be >= 0 (0 disables)"
+        comptime assert (
+            cfg.min_body_rate >= 0
+        ), "ServerConfig.min_body_rate must be >= 0 (0 disables)"
         # When request_timeout_ms is non-zero (enabled), it must
         # bound the per-handler and per-body deadlines so the
         # outer-most reactor deadline is the last to fire. A
@@ -375,6 +404,8 @@ def bufring_gap(cfg: ServerConfig) -> String:
         or cfg.write_timeout_ms > 0
         or cfg.read_body_timeout_ms > 0
         or cfg.request_timeout_ms > 0
+        or cfg.header_timeout_ms > 0
+        or cfg.min_body_rate > 0
     ):
         return "timeouts"
     if cfg.max_connections > 0:

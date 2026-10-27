@@ -53,7 +53,8 @@ from std.memory import unsafe_memcpy
 
 from .header_view import HeaderMapView, _is_token_char, parse_header_view
 from .headers import HeaderMap
-from .proto.ascii import ascii_unchecked_string
+from .proto.ascii import ascii_eq_ignore_case, ascii_unchecked_string
+from ._server.parse_util import _check_http_version, _check_request_target
 from ._scan import parse_content_length_bytes
 from .request import Request
 from ..net import IpAddr, SocketAddr
@@ -79,20 +80,6 @@ def _find_byte(data: Span[UInt8, _], start: Int, target: UInt8) -> Int:
             return i
         i += 1
     return -1
-
-
-def _is_http_version(v: String) -> Bool:
-    """``HTTP/<DIGIT>.<DIGIT>`` and nothing else (RFC 9112 sec 2.3)."""
-    if v.byte_length() != 8 or not v.startswith("HTTP/"):
-        return False
-    var p = v.unsafe_ptr()
-    return (
-        p[unsafe_offset=5] >= 48
-        and p[unsafe_offset=5] <= 57
-        and p[unsafe_offset=6] == 46
-        and p[unsafe_offset=7] >= 48
-        and p[unsafe_offset=7] <= 57
-    )
 
 
 @always_inline
@@ -309,17 +296,13 @@ def parse_request_view[
             raise Error("invalid character in request method")
     var sp2 = _find_byte(data, sp1 + 1, _SP)
 
-    var url_start: Int
-    var url_len: Int
-    var version: String
+    # HTTP/0.9 (`GET /` with no version) is not supported.
     if sp2 < 0 or sp2 >= line_end_excl:
-        url_start = sp1 + 1
-        url_len = line_end_excl - url_start
-        version = "HTTP/1.1"
-    else:
-        url_start = sp1 + 1
-        url_len = sp2 - url_start
-        version = ascii_unchecked_string(data[sp2 + 1 : line_end_excl])
+        raise Error("missing HTTP version in request line")
+    var url_start = sp1 + 1
+    var url_len = sp2 - url_start
+    var version = ascii_unchecked_string(data[sp2 + 1 : line_end_excl])
+    _check_http_version(version)
 
     if url_len > max_uri_length:
         raise Error(
@@ -330,10 +313,11 @@ def parse_request_view[
     for i in range(url_start, url_start + url_len):
         if data[i] < 33 or data[i] > 126:
             raise Error("invalid character in request target")
-    if not _is_http_version(version):
-        raise Error("malformed HTTP version in request line")
 
     var method = ascii_unchecked_string(data[0:sp1])
+    _check_request_target(
+        method, ascii_unchecked_string(data[url_start : url_start + url_len])
+    )
 
     # Headers: from after the request line's CRLF to the empty
     # CRLF that terminates the header block.
@@ -377,8 +361,21 @@ def parse_request_view[
     # therefore IS body_start; no extra advance needed.
     var body_start = headers_end
 
-    if hv.count("host") > 1:
+    # The same header rules as the owning parser.
+    var host_count = hv.count("host")
+    if host_count > 1:
         raise Error("more than one Host header")
+    var http10 = version == "HTTP/1.0"
+    if host_count == 0 and not http10:
+        raise Error("missing Host header")
+    if http10 and hv.contains("transfer-encoding"):
+        raise Error("Transfer-Encoding in an HTTP/1.0 request")
+    if not http10 and hv.contains("expect"):
+        if hv.count("expect") > 1:
+            raise Error("unsupported expectation: more than one Expect")
+        var expect = String(hv.get("expect"))
+        if not ascii_eq_ignore_case(expect, "100-continue"):
+            raise Error("unsupported expectation")
 
     if body_len_override >= 0:
         if body_start + body_len_override > n:

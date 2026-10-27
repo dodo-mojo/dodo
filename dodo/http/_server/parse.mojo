@@ -24,7 +24,8 @@ from ...tcp import TcpStream
 
 from .parse_util import (
     _ascii_safe,
-    _is_valid_http_version,
+    _check_http_version,
+    _check_request_target,
     _ascii_strip_slice,
     _ascii_unchecked_string,
     _find_crlfcrlf,
@@ -67,6 +68,27 @@ def _check_field_value(v: String, accept_obs_text: Bool) raises:
             raise Error("invalid control character in header value")
     if has_obs_text and not _is_valid_utf8(v.as_bytes()):
         raise Error("obs-text header value is not valid UTF-8")
+
+
+def parse_error_status(message: String) -> Int:
+    """The status to answer a request the parser refused with.
+
+    Most refusals are a 400. The parser's messages for the cases that
+    have their own status start with a fixed phrase, matched here.
+    """
+    if message.startswith("request headers exceed limit"):
+        return 431
+    if message.startswith("request URI exceeds limit"):
+        return 414
+    if message.startswith("request body exceeds limit"):
+        return 413
+    if message.startswith("unsupported HTTP version"):
+        return 505
+    if message.startswith("unsupported expectation"):
+        return 417
+    if message.startswith("unsupported method"):
+        return 501
+    return 400
 
 
 def _parse_http_request_bytes(
@@ -192,17 +214,12 @@ def _parse_http_request_bytes(
         if req_line.unsafe_ptr()[unsafe_offset=i] == 32:
             sp2 = i
             break
-    var path: String
-    var version: String
+    # HTTP/0.9 (`GET /` with no version) is not supported.
     if sp2 < 0:
-        path = _ascii_unchecked_string(req_line.as_bytes()[sp1 + 1 :])
-        version = "HTTP/1.1"
-    else:
-        path = _ascii_unchecked_string(req_line.as_bytes()[sp1 + 1 : sp2])
-        version = _ascii_unchecked_string(req_line.as_bytes()[sp2 + 1 :])
-
-    if not _is_valid_http_version(version):
-        raise Error("malformed HTTP version in request line: " + version)
+        raise Error("missing HTTP version in request line")
+    var path = _ascii_unchecked_string(req_line.as_bytes()[sp1 + 1 : sp2])
+    var version = _ascii_unchecked_string(req_line.as_bytes()[sp2 + 1 :])
+    _check_http_version(version)
 
     # RFC 9112 sec 3.2: the request-target is visible ASCII. A CR, a
     # control byte or a high byte here reached ``req.url`` wrapped by
@@ -214,6 +231,7 @@ def _parse_http_request_bytes(
         var tc = path.unsafe_ptr()[unsafe_offset=i]
         if tc < 33 or tc > 126:
             raise Error("invalid character in request target")
+    _check_request_target(method, path)
 
     if (
         not leniency.allow_oversized_request_uri
@@ -344,8 +362,24 @@ def _parse_http_request_bytes(
     # 400. With last-wins storage the second Host silently replaced the
     # first, and a proxy that routed on the first sent dodo a request
     # for a different virtual host than the one it checked.
-    if len(headers.get_all("host")) > 1:
+    var host_count = len(headers.get_all("host"))
+    if host_count > 1:
         raise Error("more than one Host header")
+    # RFC 9112 sec 3.2: an HTTP/1.1 request without Host gets a 400.
+    if host_count == 0 and version != "HTTP/1.0":
+        raise Error("missing Host header")
+
+    # RFC 9110 sec 10.1.1: 100-continue is the only expectation defined.
+    # Any other gets a 417. HTTP/1.0 predates Expect, so it is ignored.
+    if version != "HTTP/1.0":
+        var expects = headers.get_all("expect")
+        if len(expects) > 1:
+            raise Error("unsupported expectation: more than one Expect")
+        if len(expects) == 1:
+            if not ascii_eq_ignore_case(expects[0], "100-continue"):
+                raise Error(
+                    "unsupported expectation: " + _ascii_safe(expects[0])
+                )
 
     # RFC 9112 §6.3: ``Transfer-Encoding`` + ``Content-Length`` is
     # ambiguous. Strict rejects (smuggling-safe); the leniency
@@ -360,6 +394,11 @@ def _parse_http_request_bytes(
     # the same joined list, and a parser that saw only the last line
     # could be talked into CL.TE with ``TE: chunked`` + ``TE: identity``.
     if te_seen:
+        # RFC 9112 sec 6.1: Transfer-Encoding in an HTTP/1.0 message
+        # means the framing is faulty. HTTP/1.0 has no chunked coding,
+        # so an intermediary may have framed this body differently.
+        if version == "HTTP/1.0":
+            raise Error("Transfer-Encoding in an HTTP/1.0 request")
         var framing = classify_transfer_coding(te_joined)
         if framing != TE_CHUNKED:
             raise Error(
@@ -493,17 +532,11 @@ def _parse_http_request_bytes_minimal(
         if req_line.unsafe_ptr()[unsafe_offset=i] == 32:
             sp2 = i
             break
-    var path: String
-    var version: String
     if sp2 < 0:
-        path = _ascii_unchecked_string(req_line.as_bytes()[sp1 + 1 :])
-        version = "HTTP/1.1"
-    else:
-        path = _ascii_unchecked_string(req_line.as_bytes()[sp1 + 1 : sp2])
-        version = _ascii_unchecked_string(req_line.as_bytes()[sp2 + 1 :])
-
-    if not _is_valid_http_version(version):
-        raise Error("malformed HTTP version in request line: " + version)
+        raise Error("missing HTTP version in request line")
+    var path = _ascii_unchecked_string(req_line.as_bytes()[sp1 + 1 : sp2])
+    var version = _ascii_unchecked_string(req_line.as_bytes()[sp2 + 1 :])
+    _check_http_version(version)
 
     if path.byte_length() > max_uri_length:
         raise Error(

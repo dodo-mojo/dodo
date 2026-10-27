@@ -108,7 +108,7 @@ def _drive[
 
 
 def test_view_handler_body_echo() raises:
-    var raw = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
+    var raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
     var resp = _drive[_BodyEcho](_BodyEcho("body"), raw)
     assert_equal(resp.status, Status.OK)
     assert_equal(resp.text(), "body:len=5")
@@ -183,7 +183,9 @@ def test_view_body_pointer_identity() raises:
     pointer outside the buffer, the zero-copy contract is broken
     and the test fails loudly.
     """
-    var raw = "POST / HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"
+    var raw = (
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"
+    )
     var bytes = List[UInt8]()
     for b in raw.as_bytes():
         bytes.append(b)

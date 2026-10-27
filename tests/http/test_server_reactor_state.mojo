@@ -708,6 +708,8 @@ def test_parse_errors_for_head_have_no_body() raises:
     )
     var cfg431 = _default_config()
     cfg431.max_header_size = 64
+    # An unfinished head may use both budgets (request line and headers).
+    cfg431.max_uri_length = 64
     _assert_head_only(
         _queued_error(
             "HEAD / HTTP/1.1\r\nX: " + String("a") * 200,
@@ -849,6 +851,143 @@ def test_response_includes_date_header_from_cache() raises:
     var gmt_pos = wire.find(" GMT\r\n", date_pos)
     assert_true(gmt_pos >= 0)
     assert_equal(gmt_pos - (date_pos + "\r\nDate: ".byte_length()), 25)
+    client.close()
+
+
+# ── Request strictness and slow clients (audit F4, F5, F6) ─────────────────
+
+
+def test_bare_lf_head_gets_400_at_once() raises:
+    """F5: a head with bare-LF line endings never shows CRLFCRLF; it gets
+    a 400 instead of waiting for the idle timeout."""
+    var wire = _queued_error(
+        "GET / HTTP/1.1\nHost: x\n\n", _echo_handler, _default_config()
+    )
+    assert_true(" 400 " in wire, wire)
+
+
+def test_unknown_expectation_gets_417() raises:
+    var wire = _queued_error(
+        "GET / HTTP/1.1\r\nHost: x\r\nExpect: banana\r\n\r\n",
+        _echo_handler,
+        _default_config(),
+    )
+    assert_true(" 417 " in wire, wire)
+
+
+def _partial_request_conn(
+    first: String, mut r: Reactor, config: ServerConfig
+) raises -> Tuple[ConnHandle, TcpStream]:
+    """A ConnHandle that has read ``first`` and is waiting for more."""
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    _ = client.write(Span[UInt8](_bytes_of(first)))
+    _ = _drive_readable(ch, r, _echo_handler, config)
+    assert_equal(ch.state, STATE_READING)
+    return (ch^, client^)
+
+
+def test_slow_head_gets_408_after_header_timeout() raises:
+    """F6: a head sent a byte at a time is cut off by header_timeout_ms,
+    not left to run to request_timeout_ms."""
+    var cfg = _default_config()
+    cfg.header_timeout_ms = 10_000
+    cfg.request_timeout_ms = 60_000
+    var r = Reactor()
+    var pair = _partial_request_conn("GET / HTTP/1.1\r\nHo", r, cfg)
+    ref ch = pair[0]
+    # Pretend the head started 11 s ago.
+    ch.request_started_ms -= 11_000
+    _ = pair[1].write(Span[UInt8](_bytes_of("s")))
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(" 408 " in wire, wire)
+
+
+def test_head_within_header_timeout_is_served() raises:
+    var cfg = _default_config()
+    cfg.header_timeout_ms = 10_000
+    var r = Reactor()
+    var pair = _partial_request_conn("GET / HTTP/1.1\r\nHo", r, cfg)
+    ref ch = pair[0]
+    ch.request_started_ms -= 5_000
+    _ = pair[1].write(Span[UInt8](_bytes_of("st: x\r\n\r\n")))
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(" 200 " in wire, wire)
+
+
+def test_trickled_body_gets_408_under_min_body_rate() raises:
+    """F6: a body arriving slower than min_body_rate after the grace
+    period gets a 408."""
+    var cfg = _default_config()
+    cfg.min_body_rate = 240
+    var r = Reactor()
+    var pair = _partial_request_conn(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nab", r, cfg
+    )
+    ref ch = pair[0]
+    # 3 bytes in 10 s is far below 240 bytes a second.
+    ch.body_started_ms -= 10_000
+    _ = pair[1].write(Span[UInt8](_bytes_of("c")))
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(" 408 " in wire, wire)
+
+
+def test_body_inside_grace_period_is_not_cut_off() raises:
+    var cfg = _default_config()
+    cfg.min_body_rate = 240
+    var r = Reactor()
+    var pair = _partial_request_conn(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nab", r, cfg
+    )
+    ref ch = pair[0]
+    ch.body_started_ms -= 2_000
+    _ = pair[1].write(Span[UInt8](_bytes_of("c")))
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    assert_equal(ch.state, STATE_READING)
+    assert_equal(len(ch.write_buf), 0)
+
+
+def test_pipelined_request_waiting_for_its_body_keeps_the_first_response() raises:
+    """A pipelined request whose head is in but whose body is not must not
+    swallow the response to the request before it. The first response
+    used to be set aside for the batch and then overwritten when the
+    second request's body arrived."""
+    var cfg = _default_config()
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    _ = client.write(
+        Span[UInt8](
+            _bytes_of(
+                "GET /a HTTP/1.1\r\nHost: x\r\n\r\n"
+                "POST /b HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhe"
+            )
+        )
+    )
+    _ = _drive_readable(ch, r, _url_handler, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    var first = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true("\r\n\r\n/a" in first, first)
+    assert_false("/b" in first, first)
+    _ = _drive_writable(ch, cfg)
+    assert_equal(ch.state, STATE_READING)
+    _ = client.write(Span[UInt8](_bytes_of("llo")))
+    _ = _drive_readable(ch, r, _url_handler, cfg)
+    var second = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true("\r\n\r\n/b" in second, second)
     client.close()
 
 

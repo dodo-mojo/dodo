@@ -25,9 +25,23 @@ Tests:
 from std.ffi import c_int, external_call
 from std.testing import assert_equal, assert_true
 
-from dodo.http import HttpClient, HttpServer, Request, Response, ok
+from dodo.http import (
+    HttpClient,
+    HttpServer,
+    Request,
+    Response,
+    ServerConfig,
+    ok,
+)
 from dodo.net import SocketAddr
 from dodo.testing import fork_server, kill_forked_server
+
+
+def _h2c_config() -> ServerConfig:
+    """The server only honours Upgrade: h2c when the config allows it."""
+    var config = ServerConfig()
+    config.h2.allow_h2c_upgrade = True
+    return config^
 
 
 def _hello(req: Request) raises -> Response:
@@ -41,7 +55,7 @@ def _echo_method(req: Request) raises -> Response:
 def test_upgrade_round_trip() raises:
     """``HttpClient(h2c_upgrade=True).get(...)`` over a unified server
     completes the Upgrade dance and returns the h2 response body."""
-    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var srv = HttpServer.bind(SocketAddr.localhost(0), _h2c_config())
     var port = UInt16(srv.local_addr().port)
     var pid = fork_server(srv^, _hello)
 
@@ -66,7 +80,7 @@ def test_upgrade_round_trip() raises:
 def test_upgrade_with_request_body() raises:
     """A POST body sent on the h1 wire is honoured by the server,
     and the h2 response on stream 1 is read correctly."""
-    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var srv = HttpServer.bind(SocketAddr.localhost(0), _h2c_config())
     var port = UInt16(srv.local_addr().port)
     var pid = fork_server(srv^, _echo_method)
 
@@ -91,7 +105,7 @@ def test_upgrade_two_back_to_back_requests() raises:
     Sanity-checks that the helper doesn't leak stream-1 state across
     fresh ``HttpClient`` instances or accidentally hold the listener
     open."""
-    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var srv = HttpServer.bind(SocketAddr.localhost(0), _h2c_config())
     var port = UInt16(srv.local_addr().port)
     var pid = fork_server(srv^, _hello)
 

@@ -41,10 +41,6 @@ EXCLUDE = {
     # Fills the whole per-process thread table to make pthread_create fail.
     "tests/runtime/test_scheduler_start_rollback.mojo",
     "tests/runtime/test_uring_bufring_dispatch.mojo",
-    # Fails when it shares a process with a real io_uring round trip: a
-    # freshly built `IoUringSqe` reads non-zero. Suspected use-after-free
-    # of the SQE buffer; tracked in TODO.md.
-    "tests/runtime/test_io_uring_sqe.mojo",
     "tests/runtime/test_reuseport.mojo",
     "tests/http/test_uring_serve_handler.mojo",
     "tests/http/test_uring_serve_handler_load.mojo",

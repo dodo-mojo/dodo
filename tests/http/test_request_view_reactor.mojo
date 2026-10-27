@@ -170,7 +170,7 @@ def test_dual_lf_only_terminators() raises:
 
 def test_dual_ows_trim() raises:
     """OWS (SP / HTAB) on header values trimmed identically."""
-    var raw = "GET / HTTP/1.1\r\nX-Pad: spaced\t \r\n\r\n"
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\nX-Pad: spaced\t \r\n\r\n"
     var via_view = _parse_via_view(raw)
     var via_oracle = _parse_via_oracle(raw)
     assert_equal(via_view.headers.get("X-Pad"), "spaced")
@@ -178,7 +178,7 @@ def test_dual_ows_trim() raises:
 
 
 def test_dual_empty_header_value() raises:
-    var raw = "GET / HTTP/1.1\r\nX-Empty:\r\n\r\n"
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\nX-Empty:\r\n\r\n"
     _assert_requests_equal(_parse_via_view(raw), _parse_via_oracle(raw))
 
 
@@ -305,7 +305,7 @@ def test_view_body_starts_at_correct_offset() raises:
     """``RequestView.body()`` returns a slice that starts exactly
     at the byte after the empty-line terminator. Catches off-by-
     ones at the chunk boundary."""
-    var raw = "POST / HTTP/1.1\r\nContent-Length: 7\r\n\r\npayload"
+    var raw = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 7\r\n\r\npayload"
     var bytes = _bytes(raw)
     var view = parse_request_view(Span[UInt8, _](bytes))
     var body = view.body()

@@ -306,3 +306,37 @@ def _is_valid_http_version(v: String) raises -> Bool:
     ):
         return False
     return True
+
+
+def _check_http_version(version: String) raises:
+    """Refuse a version this server can't speak.
+
+    ``HTTP/1.x`` with any minor version is served as HTTP/1.1 (RFC 9110
+    sec 2.5 says to treat a higher minor version as the highest one we
+    implement). Any other major version gets a 505.
+    """
+    if not _is_valid_http_version(version):
+        raise Error("malformed HTTP version in request line: " + version)
+    if version.as_bytes()[5] != UInt8(ord("1")):
+        raise Error("unsupported HTTP version: " + version)
+
+
+def _check_request_target(method: String, target: String) raises:
+    """Refuse a target that is not one of the forms RFC 9112 sec 3.2
+    allows for this method.
+
+    CONNECT (authority-form) asks for a tunnel, which this server does
+    not offer, so it gets a 501. ``*`` is only for ``OPTIONS``.
+    """
+    if method == "CONNECT":
+        raise Error("unsupported method: CONNECT")
+    if target == "*":
+        if method != "OPTIONS":
+            raise Error("asterisk-form target is only allowed for OPTIONS")
+        return
+    if target.startswith("/"):
+        return
+    var lower = target.lower()
+    if lower.startswith("http://") or lower.startswith("https://"):
+        return
+    raise Error("invalid request target")

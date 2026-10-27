@@ -63,14 +63,20 @@ from dodo.http.server import (
     _parse_http_request_bytes_minimal,
     _scan_content_length,
 )
+from dodo.http._server.config import MIN_BODY_RATE_GRACE_MS
+from dodo.http._server.parse import parse_error_status
+from dodo.http._server.write import _status_reason
 from dodo.http.static_response import StaticResponse
 from dodo.net import SocketAddr
-from dodo.net._libc import _recv, _send, MSG_NOSIGNAL
+from dodo.net._libc import _recv, _send, _shutdown, MSG_NOSIGNAL, SHUT_WR
 from dodo.tcp import TcpStream
 from dodo.runtime import DateCache
 
 from .keepalive_scan import (
+    LINGER_READ_TIMEOUT_MS,
+    LINGER_TOTAL_MS,
     STATE_CLOSING,
+    STATE_LINGERING,
     STATE_READING,
     STATE_WRITING,
     StepResult,
@@ -79,6 +85,7 @@ from .keepalive_scan import (
     _connection_is_close,
     _connection_is_keepalive,
     _detect_h2c_upgrade_inline,
+    _has_bare_lf,
     _is_connection,
     _is_content_length,
     _is_date,
@@ -347,12 +354,12 @@ struct ConnHandle(Movable):
     """The request being answered is HEAD, so its response carries a
     head and no content."""
 
-    var h2c_upgrade_allowed: Bool
-    """This connection may be upgraded to h2c. Only the unified loop can
-    migrate a connection to an ``Http2ConnHandle``, and only for
-    cleartext, so it alone sets this -- when it promotes a cleartext
-    pending connection to HTTP/1.1. Every other loop, and every TLS
-    connection, serves ``Upgrade: h2c`` requests as plain HTTP/1.1."""
+    var on_unified_loop: Bool
+    """This cleartext connection runs on the unified loop, which can hand
+    it to another handler (h2c, reactor WebSockets). The unified loop
+    sets it when it promotes a cleartext pending connection to HTTP/1.1.
+    h2c also needs ``config.h2.allow_h2c_upgrade``; every other loop, and
+    every TLS connection, serves ``Upgrade: h2c`` as plain HTTP/1.1."""
 
     var continue_sent: Bool
     """``100 Continue`` has been written for the request being read."""
@@ -377,10 +384,21 @@ struct ConnHandle(Movable):
     that does not fill the chunk then ends the drain without an extra
     probe. Left False (full drain to EAGAIN) by every other driver."""
 
+    var linger_on_close: Bool
+    """An error response is queued. Once it is sent, linger (see
+    ``STATE_LINGERING``) instead of closing at once."""
+
+    var linger_started_ms: Int
+    """When lingering began, for ``LINGER_TOTAL_MS``."""
+
     var request_started_ms: Int
     """Monotonic ms at which the first byte of the request being read
     was seen; 0 between requests. Bounds the whole read phase (head and
     body) by ``ServerConfig.request_timeout_ms``."""
+
+    var body_started_ms: Int
+    """Monotonic ms at which the request head was complete and the body
+    began; 0 when not timing a body. Used for ``min_body_rate``."""
 
     var tls_cross_interest: Bool
     """Set when the TLS session asked for the *opposite* readiness to
@@ -418,9 +436,12 @@ struct ConnHandle(Movable):
         self.chunk_decoded = 0
         self.head_request = False
         self.request_started_ms = 0
+        self.body_started_ms = 0
         self.peer_eof = False
         self.short_read_ok = False
-        self.h2c_upgrade_allowed = False
+        self.on_unified_loop = False
+        self.linger_on_close = False
+        self.linger_started_ms = 0
         self.continue_sent = False
         self.continue_pending = List[UInt8]()
         self.write_buf = List[UInt8]()
@@ -692,19 +713,42 @@ struct ConnHandle(Movable):
         # whether it answers a HEAD (no content, RFC 9110 sec 9.3.2); the
         # parsed ``req.method`` is not available yet (APP-05).
         self._note_head_from_buf()
-        if len(self.read_buf) > 0 and config.request_timeout_ms > 0:
+        var timed = (
+            config.request_timeout_ms > 0 or config.header_timeout_ms > 0
+        )
+        if len(self.read_buf) > 0 and timed:
             var now = _monotonic_ms()
             if self.request_started_ms == 0:
                 self.request_started_ms = now
-            elif now - self.request_started_ms > config.request_timeout_ms:
-                self.request_started_ms = 0
-                self._queue_error(408, "Request Timeout")
-                return Optional[StepResult](self._transition_to_writing())
+            else:
+                var elapsed = now - self.request_started_ms
+                var too_slow = (
+                    config.request_timeout_ms > 0
+                    and elapsed > config.request_timeout_ms
+                )
+                # header_timeout_ms covers the head only.
+                if self.headers_end < 0 and config.header_timeout_ms > 0:
+                    if elapsed > config.header_timeout_ms:
+                        too_slow = True
+                if too_slow:
+                    self.request_started_ms = 0
+                    self._queue_error(408, "Request Timeout")
+                    return Optional[StepResult](self._transition_to_writing())
         if self.headers_end < 0:
             self.continue_sent = False
             var end = _find_crlfcrlf(self.read_buf, 0)
             if end < 0:
-                if len(self.read_buf) > config.max_header_size:
+                if (
+                    not config.h1_leniency.allow_lf_only_line_endings
+                    and _has_bare_lf(self.read_buf)
+                ):
+                    self._queue_error(400, "Bad Request")
+                    return Optional[StepResult](self._transition_to_writing())
+                # The head is the request line (up to max_uri_length)
+                # plus the header lines (up to max_header_size). Once
+                # complete, the parser says which limit was crossed.
+                var head_budget = config.max_header_size + config.max_uri_length
+                if len(self.read_buf) > head_budget:
                     self._queue_error(431, "Request Header Fields Too Large")
                     return Optional[StepResult](self._transition_to_writing())
                 return Optional[StepResult](
@@ -715,6 +759,8 @@ struct ConnHandle(Movable):
                     )
                 )
             self.headers_end = end
+            if config.min_body_rate > 0:
+                self.body_started_ms = _monotonic_ms()
             var te = request_te_framing(
                 Span[UInt8, _](self.read_buf),
                 self.headers_end,
@@ -759,6 +805,9 @@ struct ConnHandle(Movable):
                 self._queue_error(400, "Bad Request")
                 return Optional[StepResult](self._transition_to_writing())
             if cend == CHUNKED_INCOMPLETE:
+                if self._body_too_slow(config):
+                    self._queue_error(408, "Request Timeout")
+                    return Optional[StepResult](self._transition_to_writing())
                 self._maybe_send_continue()
                 var t2 = (
                     body_timeout_ms if body_timeout_ms
@@ -773,6 +822,9 @@ struct ConnHandle(Movable):
                 )
             self.body_total = cend
         if len(self.read_buf) < self.body_total:
+            if self._body_too_slow(config):
+                self._queue_error(408, "Request Timeout")
+                return Optional[StepResult](self._transition_to_writing())
             self._maybe_send_continue()
             var timeout = (
                 body_timeout_ms if body_timeout_ms
@@ -787,6 +839,7 @@ struct ConnHandle(Movable):
             )
         # Complete: the next request's clock starts at its first byte.
         self.request_started_ms = 0
+        self.body_started_ms = 0
         return Optional[StepResult]()
 
     @always_inline
@@ -868,6 +921,10 @@ struct ConnHandle(Movable):
             step = self._serve_next(handler, config, False)
             served += 1
         self._merge_batch()
+        if self.state == STATE_READING and len(self.write_buf) > self.write_pos:
+            # The batch ended on a request that isn't complete yet. Send
+            # the responses it already has instead of holding them.
+            return self._transition_to_writing()
         return step
 
     def _serve_next[
@@ -890,6 +947,8 @@ struct ConnHandle(Movable):
         Returns:
             A ``StepResult`` describing the new reactor-interest state.
         """
+        if self.state == STATE_LINGERING:
+            return self._linger_read()
         if self.state != STATE_READING:
             return StepResult(
                 want_read=False, want_write=self.state == STATE_WRITING
@@ -949,8 +1008,8 @@ struct ConnHandle(Movable):
                     self.headers_end,
                     req.trailers,
                 )
-        except:
-            self._queue_error(400, "Bad Request")
+        except e:
+            self._queue_parse_error(String(e))
             return self._transition_to_writing()
 
         # h2c upgrade detection (RFC 7540 §3.2). Hot-path-aware: 99.99 %
@@ -1020,7 +1079,11 @@ struct ConnHandle(Movable):
             # forever re-announcing the upgrade (a busy spin), so both
             # cases serve the request as HTTP/1.1 and ignore Upgrade.
             var settings_payload = Optional[List[UInt8]]()
-            if self.h2c_upgrade_allowed and not self.tls:
+            if (
+                self.on_unified_loop
+                and config.h2.allow_h2c_upgrade
+                and not self.tls
+            ):
                 try:
                     settings_payload = self._h2c_upgrade_decode_settings(
                         req.headers
@@ -1143,8 +1206,8 @@ struct ConnHandle(Movable):
                     self.headers_end,
                     req.trailers,
                 )
-        except:
-            self._queue_error(400, "Bad Request")
+        except e:
+            self._queue_parse_error(String(e))
             return self._transition_to_writing()
 
         var final_close = self._apply_keepalive_policy(config, close_after)
@@ -1222,8 +1285,8 @@ struct ConnHandle(Movable):
                     self.headers_end,
                     req.trailers,
                 )
-        except:
-            self._queue_error(400, "Bad Request")
+        except e:
+            self._queue_parse_error(String(e))
             return self._transition_to_writing()
 
         var close_after = _compute_close_after(req.headers, req.version)
@@ -1323,8 +1386,8 @@ struct ConnHandle(Movable):
                 )
                 self._queue_error(mapped.status, mapped.reason)
                 return self._transition_to_writing()
-        except:
-            self._queue_error(400, "Bad Request")
+        except e:
+            self._queue_parse_error(String(e))
             return self._transition_to_writing()
 
         var keepalive = not self.should_close
@@ -1349,6 +1412,8 @@ struct ConnHandle(Movable):
             step = self._serve_static_next(resp, config, False)
             served += 1
         self._merge_batch()
+        if self.state == STATE_READING and len(self.write_buf) > self.write_pos:
+            return self._transition_to_writing()
         return step
 
     def _serve_static_next(
@@ -1465,12 +1530,40 @@ struct ConnHandle(Movable):
         var end = self.headers_end
         if end < 0:
             end = _find_crlfcrlf(self.read_buf, 0)
+            # has_buffered_request only saw a whole head. The body must be
+            # here too: a request still waiting for its body would leave
+            # the responses set aside below unsent, and its own response
+            # would later overwrite them.
+            if not self._body_is_buffered(end):
+                self.state = STATE_WRITING
+                return False
         if _has_header_line(self.read_buf, end, "upgrade:"):
             self.state = STATE_WRITING
             return False
         self.batch_out.extend(Span[UInt8, _](self.write_buf))
         self.write_buf.clear()
         return True
+
+    def _body_is_buffered(self, head_end: Int) -> Bool:
+        """True when the whole body of the request whose head ends at
+        ``head_end`` is in ``read_buf``. False for framing this check
+        can't settle (the normal path then answers it on its own)."""
+        var te = request_te_framing(
+            Span[UInt8, _](self.read_buf), head_end, False
+        )
+        if te == TE_CHUNKED:
+            var cursor = head_end
+            var decoded = 0
+            var chunked_end = scan_chunked_resume(
+                Span[UInt8, _](self.read_buf), cursor, decoded, Int(1) << 62
+            )
+            return chunked_end >= 0
+        if te != TE_ABSENT:
+            return False
+        var length = _scan_content_length(self.read_buf, head_end)
+        if length < 0:
+            return False
+        return len(self.read_buf) >= head_end + length
 
     def _merge_batch(mut self):
         """Put the batch's earlier responses ahead of the last one."""
@@ -1526,9 +1619,10 @@ struct ConnHandle(Movable):
             A ``StepResult`` describing the new reactor-interest state.
         """
         if self.state != STATE_WRITING:
-            return StepResult(
-                want_read=self.state == STATE_READING, want_write=False
+            var reading = (
+                self.state == STATE_READING or self.state == STATE_LINGERING
             )
+            return StepResult(want_read=reading, want_write=False)
 
         # Flush, and while a chunk source is attached, refill and flush
         # again. Buffered responses have ``body_src == None`` and leave
@@ -1617,6 +1711,10 @@ struct ConnHandle(Movable):
             )
 
         if self.should_close:
+            # Lingering needs a loop that keeps reading and arms timers:
+            # the unified loop does, for cleartext connections.
+            if self.linger_on_close and self.on_unified_loop and not self.tls:
+                return self._start_lingering()
             return StepResult(want_read=False, want_write=False, done=True)
 
         # Keep-alive: back to reading, possibly on already-buffered next
@@ -1806,7 +1904,7 @@ struct ConnHandle(Movable):
             != 0
         ):
             return _WS_NOT_HANDSHAKE
-        if config.ws.reactor and self.h2c_upgrade_allowed:
+        if config.ws.reactor and self.on_unified_loop:
             self._ws_prebuf = List[UInt8]()
             if self.body_total >= 0 and self.body_total < len(self.read_buf):
                 self._ws_prebuf.extend(
@@ -1890,14 +1988,76 @@ struct ConnHandle(Movable):
         if self.headers_end < 0:
             self.head_request = _starts_with_head(self.read_buf)
 
+    def _body_too_slow(self, config: ServerConfig) -> Bool:
+        """True when the body has been arriving for longer than the grace
+        period at less than ``config.min_body_rate`` bytes a second."""
+        if config.min_body_rate <= 0 or self.body_started_ms == 0:
+            return False
+        var elapsed = _monotonic_ms() - self.body_started_ms
+        if elapsed <= MIN_BODY_RATE_GRACE_MS:
+            return False
+        var received = len(self.read_buf) - self.headers_end
+        return received * 1000 < config.min_body_rate * elapsed
+
+    def _queue_parse_error(mut self, message: String) -> None:
+        """Answer a request the parser refused, with the status its
+        message names (400 unless it is a 413, 414, 417, 431, 501 or 505)."""
+        var status = parse_error_status(message)
+        self._queue_error(status, _status_reason(status))
+
     def _queue_error(mut self, status: Int, reason: String) -> None:
         """Build a minimal error response into ``write_buf`` and mark close.
 
         The response is serialised with ``self.head_request`` so an error
         answering a HEAD request carries no content (APP-05)."""
         self.should_close = True
+        # A client that timed out is slow by definition; lingering would
+        # only let it hold the connection longer.
+        self.linger_on_close = status != 408
         var resp = build_error_response(status, reason)
         self._serialize_response(resp, False)
+
+    def _start_lingering(mut self) -> StepResult:
+        """Half-close after an error response and start dropping input.
+
+        Closing outright while the client is still sending makes the
+        kernel answer with a reset, which can destroy the response before
+        the client reads it.
+        """
+        _ = _shutdown(self.fd(), SHUT_WR)
+        self.state = STATE_LINGERING
+        self.read_buf.clear()
+        self.linger_started_ms = _monotonic_ms()
+        return StepResult(
+            want_read=True,
+            want_write=False,
+            idle_timeout_ms=LINGER_READ_TIMEOUT_MS,
+        )
+
+    def _linger_read(mut self) -> StepResult:
+        """Read and drop input while lingering. Done when the peer
+        closes, on a read error, or after ``LINGER_TOTAL_MS``."""
+        var chunk = stack_allocation[8192, UInt8]()
+        # Bounded per event so a fast sender can't hold the worker.
+        for _ in range(64):
+            var got = _recv(self.fd(), chunk, c_size_t(8192), c_int(0))
+            if got > 0:
+                continue
+            if got == 0:
+                return StepResult(done=True)
+            var e = get_errno()
+            if e == ErrNo.EINTR:
+                continue
+            if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
+                break
+            return StepResult(done=True)
+        if _monotonic_ms() - self.linger_started_ms > LINGER_TOTAL_MS:
+            return StepResult(done=True)
+        return StepResult(
+            want_read=True,
+            want_write=False,
+            idle_timeout_ms=LINGER_READ_TIMEOUT_MS,
+        )
 
     def _serialize_static(
         mut self,

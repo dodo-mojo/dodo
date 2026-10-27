@@ -74,7 +74,7 @@ def test_parse_request_with_peer() raises:
 
 
 def test_parse_request_default_peer_when_omitted() raises:
-    var raw = "GET / HTTP/1.1\r\n\r\n"
+    var raw = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
     var data = raw.as_bytes()
     var req = _parse_http_request_bytes(Span[UInt8, _](data))
     # Default loopback 127.0.0.1:0

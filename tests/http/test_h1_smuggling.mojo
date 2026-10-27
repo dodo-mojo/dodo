@@ -516,7 +516,7 @@ def test_bare_lf_reactor_and_parser_agree() raises:
     assert_equal(te[0], "chunked")
     var te_first = _parsed_framing(
         (
-            "POST / HTTP/1.1\nTransfer-Encoding: chunked\r\n\r\n"
+            "POST / HTTP/1.1\nTransfer-Encoding: chunked\r\nHost: a\r\n\r\n"
             "5\r\nhello\r\n0\r\n\r\n"
         ),
         lenient,
@@ -616,7 +616,7 @@ def test_method_must_be_a_token() raises:
     )
     assert_false(_parses("G\x01T / HTTP/1.1\r\nHost: a\r\n\r\n"))
     assert_false(_parses(" / HTTP/1.1\r\nHost: a\r\n\r\n"))
-    assert_true(_parses("M-SEARCH * HTTP/1.1\r\nHost: a\r\n\r\n"))
+    assert_true(_parses("M-SEARCH / HTTP/1.1\r\nHost: a\r\n\r\n"))
 
 
 def test_target_must_be_visible_ascii() raises:

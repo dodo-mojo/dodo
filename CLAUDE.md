@@ -2,7 +2,7 @@
 
 A Mojo web framework where HTTP, AI models (MAX), GPU kernels and agent harnesses run in one process. Built for humans and AI agents. Apache-2.0. GitHub: `dodo-mojo/dodo` (public). Work and PRs go to `dev` (the default branch); `production` is for releases.
 
-**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Next: audit fixes F1–F10, then the performance pass.
+**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done except F7 (offload pool, ADR-0004 proposed). Next: the performance pass.
 
 ## Read first
 
@@ -31,6 +31,7 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels and agent harnesse
 - The GPU is an RTX 5070, verified working.
 - Reference clones live in WSL under `~/src/`.
 - WSL2's wall clock jumps 2–3 s when it resyncs. Time benchmarks with a monotonic clock, or rerun any `wrk` run with a p99 around 1–2 s.
+- **Stale builds after Windows-side edits:** WSL can keep old memory-mapped pages of a file edited from Windows, and Mojo compiles that old code. Before building, run `wsl -d Ubuntu-24.04 -u root -- sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"`. Never trust a binary from a build whose exit status you didn't check.
 
 ## Rules that bite
 
