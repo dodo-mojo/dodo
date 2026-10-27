@@ -4,13 +4,13 @@ Status: draft v0.1, 2026-10-26. The first user is the author. This document is t
 
 ## 1. What dodo is
 
-A production web framework written in Mojo, where the HTTP server, AI model inference and GPU kernels run **in one process, in one language**. You get systems-level control with Python-like code, and it is built to be driven equally well by humans and AI coding agents.
+A production web framework written in Mojo, where the HTTP server, AI model inference, GPU kernels, computer vision and agents run **in one process, in one language**. You get systems-level control with Python-like code, and it is built to be driven equally well by humans and AI coding agents.
 
 ### Principles
 
 1. **Never crash on input.** No request bytes, client behavior or load pattern may take down the process. Every Lightbug finding (see [lightbug-audit.md](lightbug-audit.md)) becomes a permanent regression test.
-2. **Fast by default, measurable always.** Profiling is built in, not bolted on.
-3. **AI and GPU are first-class.** Serving a model or running a kernel inside a request handler is a normal, documented path. So is building an agent harness: models, tools, prompts, evals and traces are native parts (§5.1).
+2. **Fast by default, measurable always.** Profiling is built in from the start.
+3. **AI, GPU and vision are first-class.** Serving a model, running a kernel or processing an image inside a request handler is a normal, documented path (§5, §5.2). So is building an agent harness: models, tools, prompts, evals and traces are native parts (§5.1).
 4. **Agent-native.** Every action is a CLI command with JSON output, every doc page is plain Markdown, and dodo ships its own MCP server and AGENTS.md.
 5. **Boring where it should be.** HTTP/1.1 done strictly and well before anything fancy. Strict RFC 9110/9112 behavior is the default.
 6. **The author's daily experience is the test.** If something is annoying to use, it's a bug.
@@ -38,7 +38,8 @@ HTTP/3, a built-in ORM, an HTML templating engine (prompt templates are in, see 
  dodo.app    App, Router (radix tree), Request/Response, extractors,
              middleware, JSON, static files, errors (problem+json)
  dodo.ai     model hosting via MAX, request batching, SSE token streams   ┐ optional:
- dodo.gpu    DeviceContext ownership per worker, buffer pools, helpers    ┘ depends on `max`
+ dodo.gpu    DeviceContext ownership per worker, buffer pools, helpers    │ depends on `max`
+ dodo.vision image/video decode, GPU pre/postprocessing, vision models   ┘
  dodo.agent  model clients, tool + prompt templates, agent loop, MCP,
              evals, traces (remote-API models need no `max`)
  dodo.prof   spans, per-route histograms, /_dodo/metrics, perf/nsys hooks
@@ -51,7 +52,7 @@ HTTP/3, a built-in ORM, an HTML templating engine (prompt templates are in, see 
              per-target constants)
 ```
 
-The networking layers start as an imported fork (ADR-0003), so their package names follow the import (`dodo.net`, `dodo.runtime`, `dodo.http`, `dodo.tls`, and so on) rather than this sketch. The core depends only on the Mojo stdlib. `dodo.ai` and `dodo.gpu` depend on `max`, so a plain web service doesn't pull in about 1 GB of MAX.
+The networking layers start as an imported fork (ADR-0003), so their package names follow the import (`dodo.net`, `dodo.runtime`, `dodo.http`, `dodo.tls`, and so on) rather than this sketch. The core depends only on the Mojo stdlib. `dodo.ai`, `dodo.gpu` and `dodo.vision` depend on `max`, so a plain web service doesn't pull in about 1 GB of MAX.
 
 ### 3.1 Concurrency model: thread-per-core with offload
 
@@ -178,6 +179,26 @@ A harness is everything around the model: assembling prompts, calling models, ru
 - Flare's template engine and its JSON library, `ehsanmok/json`, which has schema and reflection modules.
 - Phase 0 must confirm that Mojo 1.2's compile-time reflection can list struct fields for schema generation.
 
+### 5.2 Computer vision (`dodo.vision`)
+
+Images and video go from the request to a model and back inside one process. Frames stay in pooled buffers from decode to response, on the GPU when there is one.
+
+| Piece | What you get |
+|---|---|
+| **Input** | Image uploads (raw body or multipart), video file uploads, and live frame streams over WebSocket. |
+| **Decode** | JPEG: libjpeg-turbo on CPU, nvJPEG on NVIDIA GPUs. PNG: Wuffs (memory-safe, faster than libpng). WebP: libwebp. AVIF: libavif with dav1d. Video: hardware decoders first, so frames land in GPU memory: NVDEC on NVIDIA (through the MIT-licensed `nv-codec-headers`), VideoToolbox on macOS, VA-API on Intel and AMD. Software fallback with permissive licenses: dav1d (AV1), libvpx (VP9), OpenH264 (H.264). No FFmpeg. dodo's own MP4 and WebM demuxer, written in Mojo as a sans-I/O parser and fuzzed like the HTTP parser. All C libraries are wrapped like the existing `dodo/*/ffi/` libraries. |
+| **Tensors** | Decoded frames land in pooled CPU or device buffers as tensors. Decode, preprocessing and the model share them without copies. |
+| **Preprocessing** | Resize (nearest, linear, bicubic), pad and crop come from the MAX kernel library (`max/kernels/src/nn`), which runs on CPU and GPU. dodo writes what MAX lacks: YUV and BGR to RGB conversion, per-channel mean/std normalization (MAX's normalization kernels are layer and RMS norm), and one fused kernel that converts, resizes, letterboxes and normalizes a frame in a single pass over memory. |
+| **Models** | Detection, classification, segmentation, OCR, embeddings and vision-language models through MAX. Frames from concurrent requests share the `dodo.ai` batching queue. |
+| **Postprocessing** | Non-maximum suppression and ROI align from the MAX kernel library. dodo writes box decoding (it depends on the model's output format) and mask run-length encoding. |
+| **Pipelines** | A `Pipeline` of stages (decode, preprocess, infer, postprocess). Each stage reports its time and device to `dodo.prof` (`dodo profile vision`). |
+| **Output** | JSON results (boxes, labels, scores, masks), annotated images, and per-frame results streamed over SSE or WebSocket. Each stream has a fixed-size frame queue; when a client falls behind, the oldest frames are dropped. |
+| **Agents** | Vision tools for `dodo.agent`: detect, OCR, and describe an image with a vision-language model. |
+| **Safety** | Decoders check limits before allocating: max pixels, max frame size, max frames per stream, and a guard against decompression bombs. Every decoder is fuzzed. A corrupt image returns a 4xx. |
+| **CPU fallback** | With no accelerator, vision routes run on CPU or return a clear 503 with a reason, like `dodo.ai`. |
+
+**To confirm in Phase 0:** which vision model formats MAX loads and runs today; the decoders' speed on our own images (the choices above follow published benchmarks); the fused preprocessing kernel against a chain of MAX kernels; and each decoder's license and packaging on the conda channels we use. H.264 and HEVC are patented: hardware decoders are licensed by their vendors, and OpenH264 is covered only through Cisco's prebuilt binary, so confirm before 1.0.
+
 ## 6. Profiling and observability (`dodo.prof`)
 
 | Layer | What you get | Command |
@@ -186,6 +207,8 @@ A harness is everything around the model: assembling prompts, calling models, ru
 | Metrics | Per-route latency histograms, status counts, in-flight requests, loop lag, GPU queue depth. Prometheus format at `/_dodo/metrics`. | `dodo stats` (live TUI, `--json` too) |
 | CPU | Sampling profile and flamegraph via `perf` (Linux) or `samply` | `dodo profile cpu --duration 30s` |
 | GPU | Request spans (`max.runtime.tracing.Trace`) and kernel launches on one timeline in Nsight Systems | `dodo profile gpu` (wraps `nsys`) |
+| Computer vision | Per-stage timings for image and video pipelines (decode, preprocess, inference, postprocess), frames per second, and where each stage ran (CPU or GPU) | `dodo profile vision` |
+| Harness | Each agent step as a span: model calls, tool calls, tokens in and out, cost, latency, cache hits, prompt version (see §5.1 Tracing) | `dodo profile harness` |
 | Memory | Allocations per request and pool hit rates (dev mode) | `dodo profile mem` |
 | Load | Built-in load generator and benchmark reports compared against a saved baseline | `dodo bench` |
 
@@ -218,12 +241,13 @@ All profiling output is saved as files plus a JSON summary, so an agent can read
 
 | Phase | Goal | Done when |
 |---|---|---|
-| 0. Spikes | Settle the unknowns | Threads + epoll loop from Mojo 1.2; port `c/` FFI with per-target constants; measure compile/rebuild times; confirm `nsys` CLI inside WSL; compile-time struct reflection for tool schemas; Python interop: run a LangGraph graph (asyncio) inside a worker thread and pass it a Mojo function as a tool |
-| 1. Core server | Import the forked networking core as dodo's own (ADR-0003; imported 2026-10-27: cut, renamed, restyled), fix audit findings F1–F10, add the offload pool, then a profiling pass on the hot path | All kept tests and fuzzers pass under the dodo names; no upstream name in code outside `THIRD_PARTY_NOTICES.md`; audit findings fixed and tested; fastest Mojo HTTP server on bare-metal plaintext and JSON benchmarks, with zero allocations per plaintext request |
+| 0. Spikes | Settle the unknowns | Threads + epoll loop from Mojo 1.2; port `c/` FFI with per-target constants; measure compile/rebuild times; confirm `nsys` CLI inside WSL; compile-time struct reflection for tool schemas; Python interop: run a LangGraph graph (asyncio) inside a worker thread and pass it a Mojo function as a tool; run a vision model through MAX on a decoded image |
+| 1. Core server | Import the forked networking core as dodo's own (ADR-0003; imported 2026-10-27: cut, renamed, restyled), fix audit findings F1–F10, add the offload pool, then a profiling pass on the hot path | All kept tests and fuzzers pass under the dodo names; no upstream name in code outside `THIRD_PARTY_NOTICES.md`; audit findings fixed and tested; benchmarked on bare-metal plaintext and JSON tests against other Mojo frameworks and the fastest Rust and Go servers, with zero allocations per plaintext request |
 | 2. App + CLI + agents | Router, extractors, JSON, middleware, static files; `dodo new/dev/run/test/routes`; AGENTS.md; `dodo mcp` | The author builds a small real app with an AI agent using only the docs |
 | 3. AI + GPU + streaming | `dodo.ai`, `dodo.gpu`, SSE, WebSockets | Example: LLM chat endpoint plus a custom-kernel endpoint in one file, benchmarked against FastAPI + vLLM |
 | 3b. Harness kit | `dodo.agent`: model clients, tool and prompt templates, agent loop, MCP client and server, `dodo eval`, `dodo trace`, Python harness adapters | The author rebuilds one of their existing agents on dodo in a day, with evals passing in CI |
-| 4. Profiling | `dodo.prof`, `dodo profile cpu/gpu/mem`, `dodo bench` | One command produces a joint request + GPU timeline |
+| 3c. Vision | `dodo.vision`: decoders, GPU preprocessing and postprocessing kernels, pipelines, frame streams over WebSocket | Example: object detection on uploaded images and on a live WebSocket video stream in one file, benchmarked against FastAPI + PyTorch + OpenCV |
+| 4. Profiling | `dodo.prof`, `dodo profile cpu/gpu/vision/harness/mem`, `dodo bench` | One command produces a joint timeline of requests, CPU, GPU, vision stages and agent steps |
 | 5. Edge | Native TLS, HTTP/2 | Passes h2spec; TLS tested with testssl.sh |
 | 6. 1.0 | Stable API, docs site, package on the modular-community channel | Used in production by someone other than the author |
 

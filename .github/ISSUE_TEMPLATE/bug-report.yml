@@ -1,0 +1,29 @@
+name: Bug report
+description: Something is broken
+labels: [bug]
+body:
+  - type: input
+    attributes:
+      label: dodo commit
+      placeholder: d265cee
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Platform
+      placeholder: Ubuntu 24.04 x86_64, macOS 15 arm64, WSL
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: How to reproduce
+      description: The smallest code or request that shows the bug.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected
+  - type: textarea
+    attributes:
+      label: Actual
+      description: Output, error or crash log.

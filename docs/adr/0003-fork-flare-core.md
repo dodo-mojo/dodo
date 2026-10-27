@@ -18,7 +18,7 @@ We hard-fork Flare v0.13.0 (commit `8fe83c5`) into dodo. From then on the code i
    - **Kept:** the reactor and scheduler (`runtime`), sockets (`net`, `tcp`, `uds`, `io`), `dns`, `http` (server, router, middleware, extractors, SSE, client), `http2`, `ws`, `tls`, `crypto`, `utils`, `testing`. The HTTP client, DNS and TLS stay because `dodo.agent` calls remote model APIs over HTTPS. Unix sockets stay because proxy → app over a Unix socket is faster than TCP.
    - **Cut:** `quic`, `http3`, `qpack` and `udp` (about 22k lines; this also removes the Rust toolchain from the build), `grpc`, `openapi` (dodo generates OpenAPI from its own compile-time reflection), `prelude` (dodo has its own).
    - **Not imported:** docs, benchmarks, examples, agent and editor configs, and the Lean proofs (`formal/`, which need a Lean toolchain; revisit later).
-5. **Fastest Mojo framework.** Speed is a release requirement, not a later goal:
+5. **Fast.** Speed is a release requirement from the first release:
    - The HTTP/1.1 hot path pays nothing for HTTP/2, TLS or WebSocket support it isn't using.
    - We profile before cutting. Allocations, copies and syscalls per request are measured, and anything slow on the hot path is rewritten or removed.
    - Benchmarks run on bare-metal Linux (WSL2's clock and network distort results), against every other Mojo HTTP framework and, as the real bar, the fastest Rust and Go servers on TechEmpower-style plaintext and JSON tests.

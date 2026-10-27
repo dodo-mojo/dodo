@@ -36,7 +36,7 @@ elif cfg.idle > 0:
 
 ## 3. Performance
 
-dodo aims to be the fastest Mojo framework, so speed is reviewed like correctness.
+dodo aims to be fast, so speed is reviewed like correctness.
 
 - **Measure first.** Profile before optimizing, and before removing something for speed. Any PR that touches the request hot path shows benchmark numbers from before and after.
 - **The hot path stays lean.** No allocation per request on the plaintext path, no needless copies, and as few syscalls per request as possible. A feature that isn't in use costs nothing.

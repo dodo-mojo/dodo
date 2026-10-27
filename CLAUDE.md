@@ -1,6 +1,6 @@
 # dodo
 
-A Mojo web framework where HTTP, AI models (MAX), GPU kernels and agent harnesses run in one process. Built for humans and AI agents. Apache-2.0. GitHub: `dodo-mojo/dodo` (public). Work and PRs go to `dev` (the default branch); `production` is for releases.
+A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision and agent harnesses run in one process. Built for humans and AI agents. Apache-2.0. GitHub: `dodo-mojo/dodo` (public). Work and PRs go to `dev` (the default branch); `production` is for releases.
 
 **Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done except F7 (offload pool, ADR-0004 proposed). Next: the performance pass.
 
@@ -21,6 +21,8 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels and agent harnesse
 | `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`), naming, standards, ADRs |
 | `research/` | Throwaway spikes and audit harnesses (probe servers, fuzzers). Not shipped. |
 | `packaging/recipe.yaml` | Draft modular-community recipe for the `dodo` package |
+| `.github/` | CI (`pixi run tests` on Ubuntu and macOS), issue and PR templates, Dependabot for actions |
+| `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md` | Community files. README stays short: the vision and roadmap, no walls of text. |
 
 ## Toolchain
 
@@ -36,10 +38,12 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels and agent harnesse
 ## Rules that bite
 
 - Commits: `type: one line`, with no em dashes, no body, and **no Claude co-author trailer**. Only commit when asked.
+- All doc changes from one session go in one `docs:` commit.
+- Every feature or fix gets a branch from `dev` (`type/short-name`) and a PR into `dev`, as in `CONTRIBUTING.md`. Never delete branches, even after merge.
 - Ask the human one decision at a time, with a recommendation.
 - Offloaded blocking work (`block_in_pool`, `resolve_async`) uses `ThreadHandle.spawn_os`, never a pool task: joining a pool task from a reactor worker can run the task on that worker.
 - Simple, readable code over clever code. No dense one-liners.
-- Goal: the fastest Mojo framework. Profile before optimizing; show before/after numbers on hot-path PRs; delete code nothing on the roadmap uses.
+- Goal: a fast framework. Profile before optimizing; show before/after numbers on hot-path PRs; delete code nothing on the roadmap uses.
 - Major decision → write an ADR. Anything smaller → `TODO.md`.
 - Test every UI input and button against its edge cases in the built-in browser.
 - In imported code, fix slow code and workarounds for old Mojo bugs as you find them (measure the claim first; Mojo 1.2.0 fixed many). Delete changelog-style or personal comments ("v0.11:", "C7:", "Step 2") whenever you touch a file. Never follow the original project's conventions.
