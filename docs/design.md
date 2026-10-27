@@ -60,7 +60,7 @@ The networking layers start as an imported fork (ADR-0003), so their package nam
 - Each connection is a non-blocking state machine: `reading_head → reading_body → handling → writing → keep_alive_idle → …`. This keeps Lightbug's state names, but nothing blocks.
 - Timeouts on every state: header read 10 s, body idle 30 s, keep-alive idle 5 s, write 30 s, all configurable. This fixes C3/C5.
 - **The catch:** a slow synchronous handler stalls its core's other connections. Mitigations:
-  - `app.blocking(...)` runs work on an offload thread pool and wakes the loop through an eventfd.
+  - `Offload(handler)` runs a handler on an offload thread pool and wakes the loop through its wake fd (ADR-0004).
   - GPU work is enqueued on the worker's `DeviceContext` stream, and completion is polled from the loop, so the CPU never sits waiting on the GPU.
   - In dev mode `dodo.prof` flags handlers that hold a loop longer than a threshold.
 - If Mojo gains stable async later, handlers can become `async def` without changing the I/O layer.

@@ -10,7 +10,6 @@
   - Optional: `dodo-mojo.github.io` is free with the org.
 - [ ] **Claim social handles** (optional). Free on 2026-10-26: X `@dodo_mojo`, Bluesky `dodomojo.bsky.social`, YouTube `@dodo-mojo`. Taken: X `@dodomojo`, YouTube `@dodomojo`, Bluesky `dodo`.
 - [ ] **Trademark search** for "dodo" in software (class 9/42) in your country, before 1.0.
-- [ ] **Review ADR-0004** (offload pool for blocking handlers, audit F7). It is proposed, not accepted; Claude builds it once you approve the API.
 
 ## Claude (after the items above are unblocked)
 
@@ -20,7 +19,7 @@
 - [ ] Publish `0.0.1` and open the modular-community PR using `packaging/recipe.yaml`. This claims the `dodo` package name and needs a minimal working server.
 - [ ] Enable GitHub Pages for docs at `dodo-mojo.github.io/dodo`.
 - [ ] PyPI `dodo-mojo`: only if we ship a pip-installable CLI.
-- [ ] Audit F7: build the offload pool once ADR-0004 is accepted. F1–F6 and F8–F10 are fixed (see `docs/flare-audit.md`).
+- [ ] `Offload` runs on the pool only in the unified loop. `serve_cancellable` and the streaming loop still run it inline, on the worker.
 - [ ] Rebuild the live-server checks the import dropped (they needed upstream's benchmark and example servers): h2spec, the Autobahn WebSocket suite, curl/h2load interop, and ASan/TSan runs. Each needs a small test server under `tests/`. The audit probes (`research/flare-audit/probe.py`) belong there too.
 - [ ] Lingering close (after an early error response) runs only on the unified loop for cleartext. The HTTP/1.1-only loops (`serve_cancellable`, io_uring) and TLS still close at once.
 - [ ] `H1LeniencyConfig.allow_lf_only_line_endings` only reaches the parser: the reactor frames on CRLFCRLF, so a bare-LF head never completes. Support it in the reactor or drop the flag.

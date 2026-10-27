@@ -2,7 +2,7 @@
 
 A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision and agent harnesses run in one process. Built for humans and AI agents. Apache-2.0. GitHub: `dodo-mojo/dodo` (public). Work and PRs go to `dev` (the default branch); `production` is for releases.
 
-**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done except F7 (offload pool, ADR-0004 proposed). Next: the performance pass.
+**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done; F7 is `Offload(handler)`, a pool for blocking handlers on the unified loop (ADR-0004). Next: the performance pass.
 
 ## Read first
 
@@ -41,7 +41,7 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 - All doc changes from one session go in one `docs:` commit.
 - Every feature or fix gets a branch from `dev` (`type/short-name`) and a PR into `dev`, as in `CONTRIBUTING.md`. Never delete branches, even after merge.
 - Ask the human one decision at a time, with a recommendation.
-- Offloaded blocking work (`block_in_pool`, `resolve_async`) uses `ThreadHandle.spawn_os`, never a pool task: joining a pool task from a reactor worker can run the task on that worker.
+- Offloaded blocking work (`Offload`, `block_in_pool`, `resolve_async`) uses `ThreadHandle.spawn_os`, never a pool task: joining a pool task from a reactor worker can run the task on that worker.
 - Simple, readable code over clever code. No dense one-liners.
 - Goal: a fast framework. Profile before optimizing; show before/after numbers on hot-path PRs; delete code nothing on the roadmap uses.
 - Major decision → write an ADR. Anything smaller → `TODO.md`.
