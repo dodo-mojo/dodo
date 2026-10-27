@@ -319,6 +319,12 @@ from test_ws_handshake_request import (
 from test_ws_multicore import (
     test_ws_multicore_serve_4_workers_echo_round_trip as test_ws_multicore__test_ws_multicore_serve_4_workers_echo_round_trip,
 )
+from test_ws_multicore import (
+    test_ws_multicore_serves_while_another_process_holds_the_listener as test_ws_multicore__test_ws_multicore_serves_while_another_process_holds_the_listener,
+)
+from test_ws_multicore import (
+    test_ws_multicore_accepts_connections_made_while_workers_start as test_ws_multicore__test_ws_multicore_accepts_connections_made_while_workers_start,
+)
 from test_ws_permessage_deflate import (
     test_parse_simple_offer_round_trips as test_ws_permessage_deflate__test_parse_simple_offer_round_trips,
 )
@@ -683,6 +689,12 @@ def main() raises:
     # tests/ws/test_ws_multicore.mojo
     suite.test[
         test_ws_multicore__test_ws_multicore_serve_4_workers_echo_round_trip
+    ]()
+    suite.test[
+        test_ws_multicore__test_ws_multicore_serves_while_another_process_holds_the_listener
+    ]()
+    suite.test[
+        test_ws_multicore__test_ws_multicore_accepts_connections_made_while_workers_start
     ]()
     # tests/ws/test_ws_permessage_deflate.mojo
     suite.test[
