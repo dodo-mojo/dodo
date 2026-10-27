@@ -43,9 +43,7 @@ from dodo.http import (
     Response,
     WithCancel,
     ok,
-    precompute_response,
 )
-from dodo.http.handler import WithViewCancel
 from dodo.net import SocketAddr
 
 
@@ -210,8 +208,8 @@ def _child_exit_code(pid: Int) -> Int:
     return -1
 
 
-def _serve_variant_on_two_listeners(method: Int) raises -> Int:
-    """Run one serve variant in a forked child on a two-address server.
+def _serve_cancellable_on_two_listeners() raises -> Int:
+    """Run ``serve_cancellable`` in a forked child on a two-address server.
 
     The child exits 7 if the method raised and 3 if it returned. A method
     that ignores the extra listener and serves the primary one runs until
@@ -224,12 +222,7 @@ def _serve_variant_on_two_listeners(method: Int) raises -> Int:
     var pid = fork()
     if pid == 0:
         try:
-            if method == 0:
-                srv.serve_cancellable(WithCancel(FnHandler(_hello)))
-            elif method == 1:
-                srv.serve_view(WithViewCancel(FnHandler(_hello)))
-            else:
-                srv.serve_static(precompute_response(200, "text/plain", "hi"))
+            srv.serve_cancellable(WithCancel(FnHandler(_hello)))
         except:
             exit(7)
         exit(3)
@@ -239,16 +232,7 @@ def _serve_variant_on_two_listeners(method: Int) raises -> Int:
 
 
 def test_serve_cancellable_rejects_extra_listeners() raises:
-    """DOC-05: it used to serve the primary address and ignore the rest."""
-    assert_equal(_serve_variant_on_two_listeners(0), 7)
-
-
-def test_serve_view_rejects_extra_listeners() raises:
-    assert_equal(_serve_variant_on_two_listeners(1), 7)
-
-
-def test_serve_static_rejects_extra_listeners() raises:
-    assert_equal(_serve_variant_on_two_listeners(2), 7)
+    assert_equal(_serve_cancellable_on_two_listeners(), 7)
 
 
 def main() raises:
@@ -257,6 +241,4 @@ def main() raises:
     test_bind_list_empty_addrs_raises()
     test_bind_list_multi_worker_serves_every_address()
     test_serve_cancellable_rejects_extra_listeners()
-    test_serve_view_rejects_extra_listeners()
-    test_serve_static_rejects_extra_listeners()
-    print("test_multi_listener: 7 passed")
+    print("test_multi_listener: 5 passed")

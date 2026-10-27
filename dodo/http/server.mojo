@@ -21,7 +21,7 @@ from ..runtime.reuseport import bind_reuseport_if_free
 from std.collections import Optional
 from std.sys import stderr
 
-from .handler import Handler, CancelHandler, ViewHandler
+from .handler import Handler, CancelHandler
 from .cancel import Cancel
 from .streaming_server import StreamHandler
 from .intern import intern_method_bytes
@@ -29,7 +29,6 @@ from .request import Request, Method
 from .response import Response, Status
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string, ascii_eq_ignore_case
-from .static_response import StaticResponse
 from ._server.config import (
     ServerConfig,
     WsUpgrade,
@@ -458,11 +457,8 @@ struct HttpServer(Movable):
           highest steady-state throughput). Export
           ``DODO_REUSEPORT_WORKERS=0`` before launch to switch
           back to the single shared listener with
-          ``EPOLLEXCLUSIVE`` (Linux >= 4.5), which trades
-          7-22 % req/s (handler vs static fast path) for a
-          uniformly tighter p99.99 σ under sustained load; see
-          ``docs/benchmark.md``. The exclusive wakeup goes to one
-          waiting worker per event, so connections are not spread
+          ``EPOLLEXCLUSIVE`` (Linux >= 4.5). The exclusive wakeup
+          goes to one waiting worker per event, so connections are not spread
           evenly: a lightly loaded server may keep landing them on the
           same worker (see ``Reactor.register_exclusive``).
 
@@ -603,13 +599,10 @@ struct HttpServer(Movable):
     def _reject_extra_listeners(self, method: String) raises:
         """Raise when :meth:`bind` was given several addresses.
 
-        ``serve_cancellable``, ``serve_view`` and ``serve_static`` run a
-        reactor over ``self._listener`` alone; only :meth:`serve` (and
-        ``serve_streaming``'s own check) drive the extra listeners. Serving
-        just the first address would leave the others bound -- connections
-        complete in the kernel backlog -- and never answered, with no error.
-        Rejecting is the smaller change than a multi-listener variant of
-        each loop, and it is what ``docs/features.md`` promises.
+        ``serve_cancellable`` runs a reactor over ``self._listener`` alone;
+        only :meth:`serve` drives the extra listeners. Serving just the
+        first address would leave the others bound (connections complete
+        in the kernel backlog) and never answered, with no error.
         """
         if len(self._extra_listener_fds) > 0:
             raise Error(
@@ -904,7 +897,7 @@ struct HttpServer(Movable):
         Raises:
             NetworkError: On fatal listener errors.
             Error: If a TLS context is bound, or ``bind`` was given several
-                addresses (these loops serve one listener; use ``serve``).
+                addresses (this loop serves one listener; use ``serve``).
         """
         if self._tls_ctx:
             raise Error(
@@ -919,194 +912,6 @@ struct HttpServer(Movable):
         run_reactor_loop_cancel(
             self._listener, self.config, handler, self._stopping
         )
-
-    def serve_view[
-        VH: ViewHandler
-    ](mut self, var handler: VH,) raises:
-        """Run the view-aware reactor loop with a ``ViewHandler``.
-
-        Single-threaded entry point. Per-request the reactor:
-
-        1. Reads bytes into ``ConnHandle.read_buf``.
-        2. Parses the request as a ``RequestView`` borrowing into
-           ``read_buf`` (no per-header String alloc, no body copy).
-        3. Dispatches into ``handler.serve_view(view, cancel)`` —
-           ``view.body()`` returns ``Span[UInt8, origin]`` directly.
-        4. Serialises the response and resets ``read_buf`` for
-           the next pipelined request.
-
-        Use this entry point for handlers that benefit from
-        zero-copy reads — multipart upload parsers, large-body
-        echos, anything that scans the body without re-encoding
-        it. For ``Handler.serve(req: Request)`` plug-in,
-        wrap with ``WithViewCancel[H](inner=h)`` (the adapter
-        does ``view.into_owned()`` and forwards).
-
-        Args:
-            handler: View-aware request handler (ownership
-                transferred).
-
-        Raises:
-            NetworkError: On fatal listener errors.
-            Error: If a TLS context is bound, or ``bind`` was given several
-                addresses (these loops serve one listener; use ``serve``).
-        """
-        if self._tls_ctx:
-            raise Error(
-                "HttpServer.serve_view: TLS is not wired into this loop; use"
-                " serve() on a bind_tls server"
-            )
-        self._reject_extra_listeners("serve_view")
-        from ._server_reactor_impl import run_reactor_loop_view
-
-        self._stopping = False
-        self._resolve_max_connections(1)
-        run_reactor_loop_view(
-            self._listener, self.config, handler, self._stopping
-        )
-
-    def serve_static(
-        mut self,
-        resp: StaticResponse,
-        num_workers: Int = 1,
-        pin_cores: Bool = True,
-    ) raises:
-        """Run the reactor loop in static-response mode.
-
-        Every parsed request — regardless of path, method, or body — is
-        answered with the pre-encoded ``resp`` bytes. The reactor:
-
-        1. Reads until the end of the headers (``\\r\\n\\r\\n``).
-        2. Consumes the declared ``Content-Length`` bytes and discards
-           them (no ``Request`` struct, no handler call).
-        3. Writes ``resp.keepalive_bytes`` or ``resp.close_bytes`` into
-           the write queue in a single ``memcpy``, then returns the
-           socket to readable-interest for the next pipelined request.
-
-        Intended for health-check endpoints, TFB plaintext benchmarks,
-        and any workload where the response body is genuinely static.
-        For heterogeneous routes that happen to share static bodies,
-        combine ``serve_static`` under a reverse-proxy router upstream
-        of the dodo process.
-
-        Args:
-            resp: Pre-encoded static response from
-                ``precompute_response(...)``.
-            num_workers: Reactor workers. Above 1 the response is served by
-                ``num_workers`` threads, each with its own listener.
-            pin_cores: Pin worker N to core N % num_cpus (Linux only).
-
-        Raises:
-            NetworkError: On fatal listener errors; per-connection
-                errors close the offending connection silently.
-            Error: If a TLS context is bound, or ``bind`` was given several
-                addresses (these loops serve one listener; use ``serve``).
-        """
-        if self._tls_ctx:
-            raise Error(
-                "HttpServer.serve_static: TLS is not wired into this loop; use"
-                " serve() on a bind_tls server"
-            )
-        self._reject_extra_listeners("serve_static")
-        self._resolve_max_connections(num_workers)
-        if num_workers > 1:
-            self._serve_static_multicore(resp.copy(), num_workers, pin_cores)
-            return
-        from ._server_reactor_impl import (
-            run_reactor_loop_static,
-            run_uring_reactor_loop_static,
-        )
-        from dodo.runtime.uring_reactor import use_uring_backend
-        from std.sys.info import CompilationTarget
-
-        self._stopping = False
-        # Route the static-response path through
-        # the io_uring reactor when the kernel exposes io_uring AND
-        # the contributor hasn't set ``DODO_DISABLE_IO_URING=1`` for
-        # an A/B comparison run. The two loops are functional twins:
-        # same on_readable_static / on_writable per-conn state
-        # machine, same StaticResponse memcpy, same keep-alive
-        # framing — only the readiness notifier differs (epoll_wait
-        # / kqueue vs IORING_OP_POLL_ADD multishot). See the long
-        # comment above ``run_uring_reactor_loop_static`` for the
-        # design tradeoffs.
-        comptime if CompilationTarget.is_linux():
-            if use_uring_backend():
-                run_uring_reactor_loop_static(
-                    self._listener, self.config, resp, self._stopping
-                )
-                return
-        run_reactor_loop_static(
-            self._listener, self.config, resp, self._stopping
-        )
-
-    def _serve_static_multicore(
-        mut self,
-        var resp: StaticResponse,
-        num_workers: Int,
-        pin_cores: Bool = True,
-    ) raises:
-        """Multi-worker twin of :meth:`serve_static`.
-
-        Spawns ``num_workers`` workers via
-        :class:`dodo.runtime.Scheduler` parameterized over
-        :class:`dodo.http.StaticHttpFrontend`, each running
-        ``run_reactor_loop_static_shared``. Per-request work in
-        each worker collapses to ``recv -> _scan_content_length ->
-        unsafe_memcpy(resp.bytes) -> send`` -- no parser, no handler, no
-        Response struct allocation, no header lookups, no body
-        re-serialisation. This is the fastest path dodo exposes for
-        the gate-defining TFB plaintext bench; it scales near-linearly
-        across cores because each worker owns its own conns dict +
-        write buffers (no cross-thread state).
-
-        The HttpServer's bound listener is closed before spawning;
-        the Scheduler then binds its own listener(s) at the
-        same address. By default each worker pre-binds its own
-        ``SO_REUSEPORT`` listener (highest throughput; matches
-        actix_web's listener strategy). Export
-        ``DODO_REUSEPORT_WORKERS=0`` before launch to switch
-        back to a single shared listener with
-        ``EPOLLEXCLUSIVE`` -- trades 7-22 % req/s (handler vs
-        static fast path) for a uniformly tighter p99.99 σ
-        under sustained load; see ``docs/benchmark.md``.
-
-        Caller is expected to hold the scheduler reference
-        returned via ``self._stopping`` indirectly -- in practice,
-        callers run this until SIGINT and let the process exit.
-
-        Args:
-            resp: Pre-encoded response bytes (copied per worker).
-            num_workers: Number of worker threads. ``1..=256``.
-            pin_cores: Pin worker N to core ``N % num_cpus``. No-op
-                on macOS.
-
-        Raises:
-            NetworkError: On fatal listener errors.
-            Error: If a worker fails to spawn (rare); partially-
-                started workers are best-effort joined before raise.
-        """
-        from ..runtime import Scheduler
-        from ..runtime._libc_time import libc_nanosleep_ms
-        from .frontend import StaticHttpFrontend
-
-        var addr = self._listener.local_addr()
-        self._listener.close()
-
-        var frontend = StaticHttpFrontend(self.config.copy(), resp^)
-        var scheduler = Scheduler[StaticHttpFrontend].start(
-            addr=addr,
-            frontend=frontend^,
-            num_workers=num_workers,
-            pin_cores=pin_cores,
-        )
-
-        # Block until self._stopping flips. Same 50 ms sleep loop the
-        # generic _serve_multicore uses.
-        while not self._stopping and scheduler.is_running():
-            _ = libc_nanosleep_ms(50)
-
-        scheduler.shutdown()
 
     def local_addr(self) -> SocketAddr:
         """Return the local address the server is bound to."""
@@ -1234,7 +1039,6 @@ from ._server.responses import (
     unauthorized,
 )
 from ._server.write import (
-    _append_int,
     _append_str,
     _ascii_lower,
     _status_reason,

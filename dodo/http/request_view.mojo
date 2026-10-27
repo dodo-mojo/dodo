@@ -18,22 +18,9 @@ Pieces in place:
   ``Request`` for handlers that need to keep request
   state past one event-loop iteration.
 
-Pieces that **come later**:
-
-- A ``ViewHandler`` trait whose ``serve_view`` takes
-  ``RequestView[origin]`` directly. Today's ``Handler.serve``
-  signature stays as-is; the reactor's read path can adopt a
-  view-based ``run_reactor_loop_view`` once the trait surface
-  lands.
-- Replacing ``_parse_http_request_bytes`` with the view parser
-  inside the cancel-aware reactor path. The view parser exists
-  here as a standalone public function; the reactor will adopt
-  it once the trait integration is settled.
-
-The shape and public API of ``RequestView`` are stable; the
-integration step is purely "switch the reactor's internal call
-site," which lands without breaking handlers. The integration
-portion is a follow-up alongside the reactor surgery.
+No server loop parses into ``RequestView`` yet. The performance pass
+decides whether the unified loop adopts it or it is deleted (see
+``TODO.md``).
 
 Example:
 

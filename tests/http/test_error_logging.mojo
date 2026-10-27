@@ -19,9 +19,8 @@ from dodo.errors import (
     log_handler_error,
 )
 from dodo.http import Extracted, Handler, QueryInt, Request, Response, ok
-from dodo.http.handler import CancelHandler, FnHandler, ViewHandler
+from dodo.http.handler import CancelHandler, FnHandler
 from dodo.http.cancel import Cancel
-from dodo.http.request_view import RequestView
 from dodo.http.server import ServerConfig
 from dodo.http._server_reactor_impl import ConnHandle
 from dodo.net import SocketAddr
@@ -45,14 +44,6 @@ def _status_error(req: Request) raises -> Response:
 struct _CancelBoom(CancelHandler, Copyable):
     def serve(self, req: Request, cancel: Cancel) raises -> Response:
         raise Error("cancel-secret")
-
-
-@fieldwise_init
-struct _ViewBoom(Copyable, ViewHandler):
-    def serve_view[
-        origin: Origin
-    ](self, req: RequestView[origin], cancel: Cancel) raises -> Response:
-        raise Error("view-secret")
 
 
 @fieldwise_init
@@ -200,25 +191,6 @@ def _run_cancel[H: CancelHandler](ref h: H, req: String) raises -> _Result:
     return _Result(c.finish(), log^)
 
 
-def _run_view[H: ViewHandler](ref h: H, req: String) raises -> _Result:
-    var c = _Conn(req)
-    var cfg = _cfg()
-    var cap = _Capture()
-    var failure = String("")
-    try:
-        for _ in range(100):
-            usleep(10000)
-            _ = c.ch.on_readable_view(h, cfg)
-            if c.done():
-                break
-    except e:
-        failure = String(e)
-    var log = cap.finish()
-    if failure.byte_length() > 0:
-        raise Error(failure)
-    return _Result(c.finish(), log^)
-
-
 def _has_line(log: String, *needles: String) -> Bool:
     for ln in log.split("\n"):
         var all = True
@@ -271,16 +243,6 @@ def test_cancel_path_handler_error_is_logged_with_request_id() raises:
     assert_true(r.wire.startswith("HTTP/1.1 500"))
     assert_true(
         _has_line(r.log, "[dodo:handler-error]", "rid-cancel", "cancel-secret"),
-        "log: " + r.log,
-    )
-
-
-def test_view_path_handler_error_is_logged_with_request_id() raises:
-    var h = _ViewBoom()
-    var r = _run_view(h, _request("rid-view"))
-    assert_true(r.wire.startswith("HTTP/1.1 500"))
-    assert_true(
-        _has_line(r.log, "[dodo:handler-error]", "rid-view", "view-secret"),
         "log: " + r.log,
     )
 

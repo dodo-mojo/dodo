@@ -22,10 +22,11 @@
 - [ ] PyPI `dodo-mojo`: only if we ship a pip-installable CLI.
 - [ ] Audit F7: build the offload pool once ADR-0004 is accepted. F1–F6 and F8–F10 are fixed (see `docs/flare-audit.md`).
 - [ ] Rebuild the live-server checks the import dropped (they needed upstream's benchmark and example servers): h2spec, the Autobahn WebSocket suite, curl/h2load interop, and ASan/TSan runs. Each needs a small test server under `tests/`. The audit probes (`research/flare-audit/probe.py`) belong there too.
-- [ ] Lingering close (after an early error response) runs only on the unified loop for cleartext. The HTTP/1.1-only loops (`serve_cancellable`, `serve_view`, `serve_static`, io_uring) and TLS still close at once.
+- [ ] Lingering close (after an early error response) runs only on the unified loop for cleartext. The HTTP/1.1-only loops (`serve_cancellable`, io_uring) and TLS still close at once.
 - [ ] `H1LeniencyConfig.allow_lf_only_line_endings` only reaches the parser: the reactor frames on CRLFCRLF, so a bare-LF head never completes. Support it in the reactor or drop the flag.
-- [ ] The io_uring buffer-ring loop is never chosen with the default config (it needs every timeout off and `max_connections < 0`). Decide whether it should arm timers or be removed.
+- [ ] The io_uring buffer-ring loop is never chosen with the default config (it needs every timeout off and `max_connections < 0`). Decide whether it should arm timers or be removed. It also sets `Request.peer` to a loopback placeholder.
+- [ ] `RequestView` (zero-copy request) has no server loop since `serve_view` was removed. The performance pass decides whether the unified loop parses into it or it is deleted.
 - [ ] Keep-alive idle timeout defaults to 500 ms; `docs/design.md` says 5 s. Settle it in the performance pass (short is cheaper under load, long saves reconnects).
-- [ ] Dedupe the status reason-phrase tables: three copies (`_server/write.mojo`, `streaming_serialize.mojo`, `static_response.mojo`).
+- [ ] Dedupe the status reason-phrase tables: two copies (`_server/write.mojo`, `streaming_serialize.mojo`).
 - [ ] Decide on `json` and `mozz` (git dependencies from the upstream author): keep, vendor, or replace.
 - [ ] Dedupe `_monotonic_ms`: four copies (`client_pool`, `tls_pool`, `keepalive_scan`, `runtime._libc_time`), and the client-pool ones allocate on every call.

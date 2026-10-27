@@ -11,16 +11,12 @@ flavoured frontend dodo needs:
   HTTP/1.1-only loop, the unified HTTP/1.1 + HTTP/2 preface-peek
   loop, and the io_uring buffer-ring loop based on its config
   flags + the runtime backend probe.
-- :class:`StaticHttpFrontend` — the pre-encoded
-  :class:`StaticResponse` frontend. Dedicated fast path for
-  workloads whose every response is identical (the TFB plaintext
-  gate; production health-check / fixed-response endpoints).
-  Replaces the prior ``StaticScheduler`` type which baked the
-  same dispatch into the runtime layer.
+- :class:`StreamFrontend[H]`: the :trait:`StreamHandler` frontend
+  behind multi-worker ``serve_streaming``.
 
-The runtime no longer imports anything from :mod:`dodo.http`;
-both frontends here import the reactor entry points and serve as
-the inversion boundary. See :mod:`dodo.runtime.frontend` for the
+The runtime imports nothing from :mod:`dodo.http`; the frontends
+here import the reactor entry points and serve as the inversion
+boundary. See :mod:`dodo.runtime.frontend` for the
 trait contract.
 """
 
@@ -31,12 +27,10 @@ from dodo.http.handler import Handler
 from dodo.http.server import ServerConfig
 from dodo.http._server_reactor_impl import (
     run_reactor_loop_shared,
-    run_reactor_loop_static_shared,
     run_uring_bufring_reactor_loop_shared,
 )
 from dodo.http._stream_reactor_impl import run_stream_reactor_loop_shared
 from dodo.http._unified_reactor_impl import run_unified_reactor_loop_shared
-from dodo.http.static_response import StaticResponse
 from dodo.http.streaming_server import StreamHandler
 from dodo.http2.server import Http2Config
 from dodo.runtime.frontend import Frontend
@@ -254,71 +248,6 @@ struct StreamFrontend[H: StreamHandler & Copyable](Copyable, Frontend):
                 stats_addr=stats_addr,
                 max_in_flight=self.max_in_flight,
                 retry_after_s=self.retry_after_s,
-            )
-        except:
-            pass
-
-
-struct StaticHttpFrontend(Copyable, Frontend):
-    """Pre-encoded :class:`StaticResponse` frontend.
-
-    Replaces the prior runtime-side ``StaticScheduler`` type. The
-    serving loop is the static fast-path
-    :func:`run_reactor_loop_static_shared`; every accepted
-    connection emits the same canned bytes, sized once at startup.
-
-    Used by :meth:`HttpServer.serve_static` for the TFB plaintext
-    gate and any production endpoint that returns a fixed body.
-    """
-
-    var config: ServerConfig
-    var resp: StaticResponse
-
-    def __init__(
-        out self,
-        var config: ServerConfig,
-        var resp: StaticResponse,
-    ):
-        """Build a static-response frontend.
-
-        Args:
-            config: Server configuration; cloned per worker.
-            resp: Pre-encoded response bytes; cloned per worker.
-        """
-        self.config = config^
-        self.resp = resp^
-
-    def requires_per_worker_listener(self) -> Bool:
-        """The static path is fine with either listener strategy.
-
-        It honours the ``DODO_REUSEPORT_WORKERS`` env knob
-        directly (per-worker SO_REUSEPORT by default; shared
-        EPOLLEXCLUSIVE listener when the knob is ``0``).
-        """
-        return False
-
-    def run_worker(
-        mut self,
-        listener_fd: Int,
-        mut stopping: Bool,
-        stats_addr: Int,
-        extra_fds: List[Int] = List[Int](),
-    ):
-        """Drive the static-response fast path.
-
-        ``extra_fds`` is refused rather than ignored -- see
-        :meth:`StreamFrontend.run_worker` for why. ``serve_static``
-        binds one address.
-        """
-        if extra_fds:
-            return
-        try:
-            run_reactor_loop_static_shared(
-                listener_fd,
-                self.config,
-                self.resp,
-                stopping,
-                stats_addr,
             )
         except:
             pass

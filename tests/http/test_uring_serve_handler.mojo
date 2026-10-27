@@ -24,8 +24,7 @@ those reverted attempts hit:
    ``_cleanup_conn_uring_br`` eliminates the kernel race
    between conn close and reaccept on the same fd.
 
-Topology mirrors :mod:`tests.test_uring_serve_static`: parent
-runs the TCP clients + assertions, child runs
+The parent runs the TCP clients and assertions; the child runs
 ``HttpServer.serve(handler)`` and is SIGKILL'd at the end.
 Linux + io_uring-only; skipped on macOS or kernels that don't
 expose io_uring.
@@ -92,7 +91,7 @@ def _setenv(name: String, value: String, overwrite: c_int = c_int(1)) -> c_int:
     )
 
 
-# ── POSIX shims (same shape as test_uring_serve_static.mojo) ────────────────
+# ── POSIX shims ─────────────────────────────────────────────────────────────
 
 
 # ── Loopback client helpers ──────────────────────────────────────────────────

@@ -51,5 +51,4 @@ from .write_path import (
     build_error_response,
     queue_h2c_upgrade_101,
     serialize_response_into,
-    serialize_static_into,
 )

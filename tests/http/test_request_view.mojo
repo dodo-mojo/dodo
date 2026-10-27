@@ -7,11 +7,8 @@ caller-owned buffer rather than allocating ``String`` /
 materialises a ``Request`` for handlers that need owned
 state.
 
-The reactor's read path doesn't yet use this view directly — that
-integration step (a ``ViewHandler`` trait + a parallel
-``run_reactor_loop_view``) lands as a follow-up alongside the
-streaming-body work in S2.7. Today's reactor still calls
-``_parse_http_request_bytes`` and constructs an owned Request.
+No server loop parses into this view yet; they call
+``_parse_http_request_bytes`` and construct an owned Request.
 
 Covers:
 

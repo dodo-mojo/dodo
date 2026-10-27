@@ -43,17 +43,10 @@ and the shared stopping flag. The frontend value is moved
 users should wrap their handler's expensive state behind an
 ``Pointer`` or a similar shared-reference holder).
 
-The scheduler used to import directly from
-:mod:`dodo.http._server_reactor_impl`,
-:mod:`dodo.http._unified_reactor_impl`,
-:mod:`dodo.http.handler`, :mod:`dodo.http.server`,
-:mod:`dodo.http.static_response`, and :mod:`dodo.http2.server`.
-That layering violation (runtime depending on protocol modules)
-is gone now; the scheduler depends only on the
-:trait:`dodo.runtime.Frontend` trait and concrete impls live
-where their protocol does
-(:class:`dodo.http.HttpFrontend` /
-:class:`dodo.http.StaticHttpFrontend`).
+The scheduler depends only on the :trait:`dodo.runtime.Frontend`
+trait; concrete impls live where their protocol does
+(:class:`dodo.http.frontend.HttpFrontend`,
+:class:`dodo.http.frontend.StreamFrontend`).
 
 Known limitations:
 
