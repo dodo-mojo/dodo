@@ -2398,13 +2398,25 @@ from test_offload import (
     test_h1_shutdown_gives_up_after_its_timeout_bufring as test_offload__test_h1_shutdown_gives_up_after_its_timeout_bufring,
 )
 from test_offload import (
-    test_h1_shutdown_waits_for_a_borrowed_handler as test_offload__test_h1_shutdown_waits_for_a_borrowed_handler,
+    test_h1_shutdown_gives_up_after_its_timeout_move_only as test_offload__test_h1_shutdown_gives_up_after_its_timeout_move_only,
+)
+from test_offload import (
+    test_h1_shutdown_gives_up_after_its_timeout_cancel_move_only as test_offload__test_h1_shutdown_gives_up_after_its_timeout_cancel_move_only,
 )
 from test_offload import (
     test_cancel_handler_sees_timeout_through_its_cancel_argument as test_offload__test_cancel_handler_sees_timeout_through_its_cancel_argument,
 )
 from test_offload import (
     test_stream_full_queue_answers_503_at_once as test_offload__test_stream_full_queue_answers_503_at_once,
+)
+from test_offload import (
+    test_stream_one_connection_offloads_two_requests_at_once as test_offload__test_stream_one_connection_offloads_two_requests_at_once,
+)
+from test_offload import (
+    test_stream_timeout_of_one_offload_keeps_the_order as test_offload__test_stream_timeout_of_one_offload_keeps_the_order,
+)
+from test_offload import (
+    test_stream_client_close_cancels_every_offload as test_offload__test_stream_client_close_cancels_every_offload,
 )
 from test_offload import (
     test_stream_blocking_driver_runs_the_offload_in_place as test_offload__test_stream_blocking_driver_runs_the_offload_in_place,
@@ -5995,11 +6007,23 @@ def main() raises:
     suite.test[
         test_offload__test_h1_shutdown_gives_up_after_its_timeout_bufring
     ]()
-    suite.test[test_offload__test_h1_shutdown_waits_for_a_borrowed_handler]()
+    suite.test[
+        test_offload__test_h1_shutdown_gives_up_after_its_timeout_move_only
+    ]()
+    suite.test[
+        test_offload__test_h1_shutdown_gives_up_after_its_timeout_cancel_move_only
+    ]()
     suite.test[
         test_offload__test_cancel_handler_sees_timeout_through_its_cancel_argument
     ]()
     suite.test[test_offload__test_stream_full_queue_answers_503_at_once]()
+    suite.test[
+        test_offload__test_stream_one_connection_offloads_two_requests_at_once
+    ]()
+    suite.test[
+        test_offload__test_stream_timeout_of_one_offload_keeps_the_order
+    ]()
+    suite.test[test_offload__test_stream_client_close_cancels_every_offload]()
     suite.test[
         test_offload__test_stream_blocking_driver_runs_the_offload_in_place
     ]()

@@ -196,9 +196,9 @@ def _router(prefix: String) raises -> Router:
     return r^
 
 
-struct _Borrowed(Handler):
-    """A top-level handler that is not ``Copyable``: the pool can't keep
-    a copy, so its jobs run on the worker's own handler."""
+struct _MoveOnly(Handler):
+    """A top-level handler that is not ``Copyable``; ``serve`` shares it
+    with the pool through ``SharedHandler``."""
 
     var inner: Router
 
@@ -215,23 +215,73 @@ struct _Borrowed(Handler):
         return self.inner.blocking(req)
 
 
+struct _MoveOnlyCancel(CancelHandler):
+    """``_CancelGate`` behind a ``CancelHandler`` that is not
+    ``Copyable``."""
+
+    var inner: _CancelGate
+
+    def __init__(out self, var inner: _CancelGate):
+        self.inner = inner^
+
+    def serve(self, req: Request, cancel: Cancel) raises -> Response:
+        return self.inner.serve(req, cancel)
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
+
 struct _StreamFront(Copyable, StreamHandler):
     """A streaming front over ``_router``: reads the request line, then
     hands a request the router marks ``blocking`` to ``conn.offload``
-    and answers any other inline. ``on_offload_done`` keeps its
-    default: send the response, close."""
+    and answers any other inline. ``on_offload_done`` sends the
+    response and closes.
+
+    ``/pair/<a>/<b>`` offloads ``/slow/<a>`` and ``/slow/<b>`` on the
+    one connection and answers with both bodies, joined by a comma in
+    the order ``on_offload_done`` saw them."""
 
     var stack: Router
+    var pairs: Dict[Int, List[String]]
+    """Bodies collected so far, by connection id, for ``/pair``."""
 
     def __init__(out self, prefix: String) raises:
         self.stack = _router(prefix)
+        self.pairs = Dict[Int, List[String]]()
 
     def on_open(mut self, mut conn: StreamConn) raises:
-        var req = Request("GET", _read_target(conn))
+        var target = _read_target(conn)
+        if target.startswith("/pair/"):
+            var names = target.split("/")
+            conn.offload(self.stack, Request("GET", "/slow/" + names[2]))
+            conn.offload(self.stack, Request("GET", "/slow/" + names[3]))
+            self.pairs[conn.id()] = List[String]()
+            return
+        var req = Request("GET", target)
         if self.stack.blocking(req):
             conn.offload(self.stack, req^)
             return
         conn.send_response(self.stack.serve(req))
+        conn.request_close()
+
+    def on_offload_done(
+        mut self, mut conn: StreamConn, var resp: Response
+    ) raises:
+        if conn.id() not in self.pairs:
+            conn.send_response(resp)
+            conn.request_close()
+            return
+        var part = String(resp.status)
+        if resp.status == 200:
+            part = resp.text()
+        self.pairs[conn.id()].append(part)
+        if len(self.pairs[conn.id()]) < 2:
+            return
+        var parts = self.pairs.pop(conn.id())
+        conn.send_response(ok(parts[0] + "," + parts[1]))
         conn.request_close()
 
 
@@ -290,12 +340,12 @@ def _spawn_server(
     var config: ServerConfig,
     tls: Bool = False,
     workers: Int = 1,
-    borrowed: Bool = False,
     loop: String = "unified",
 ) raises -> Tuple[Int, UInt16]:
-    """Fork a server running ``_router`` (inside ``_Borrowed`` when
-    ``borrowed``) on ``loop``: ``unified`` (``serve``), ``cancel``
-    (``serve_cancellable`` with ``_CancelGate`` in front), ``stream``
+    """Fork a server running ``_router`` on ``loop``: ``unified``
+    (``serve``), ``moveonly`` (``serve`` with ``_MoveOnly`` around it),
+    ``cancel`` (``serve_cancellable`` with ``_CancelGate`` in front),
+    ``cancel-moveonly`` (that inside ``_MoveOnlyCancel``), ``stream``
     (``serve_streaming`` with ``_StreamFront``), ``h1`` (the
     HTTP/1.1-only loop) or ``bufring`` (the io_uring buffer ring).
     Returns (pid, port). With one worker, writing
@@ -331,6 +381,8 @@ def _spawn_server(
             t.detach()
             if loop == "cancel":
                 srv.serve_cancellable(_CancelGate(prefix))
+            elif loop == "cancel-moveonly":
+                srv.serve_cancellable(_MoveOnlyCancel(_CancelGate(prefix)))
             elif loop == "stream":
                 srv.serve_streaming(_StreamFront(prefix))
             elif loop == "h1":
@@ -348,8 +400,8 @@ def _spawn_server(
                     run_uring_bufring_reactor_loop(
                         srv._listener, srv.config, h, srv._stopping
                     )
-            elif borrowed:
-                srv.serve(_Borrowed(_router(prefix)))
+            elif loop == "moveonly":
+                srv.serve(_MoveOnly(_router(prefix)))
             else:
                 srv.serve(_router(prefix))
             _touch(prefix + "exited")
@@ -1171,34 +1223,14 @@ def test_h1_shutdown_gives_up_after_its_timeout_bufring() raises:
     _h1_shutdown_gives_up_after_its_timeout(False, loop="bufring")
 
 
-def test_h1_shutdown_waits_for_a_borrowed_handler() raises:
-    """A handler that is not ``Copyable`` is borrowed by its jobs, so the
-    worker waits for the running one even past ``shutdown_timeout_ms``;
-    the connection is still closed at the deadline."""
-    var prefix = _prefix("h1borrow")
-    var names = List[String]()
-    names.append("b")
-    var srv = _spawn_server(
-        prefix, ServerConfig(shutdown_timeout_ms=200), borrowed=True
-    )
-    var closed = False
-    var exited_before_release = True
-    try:
-        var s = _Conn(srv[1])
-        s.get("/stubborn/b")
-        _wait_file(prefix + "started-b")
-        _touch(prefix + "stop")
-        closed = s.closed_by_server()
-        # Room for serve to return, if it wrongly did not wait.
-        usleep(100_000)
-        exited_before_release = exists(prefix + "exited")
-        _touch(prefix + "release-b")
-        _wait_file(prefix + "exited")
-    finally:
-        _stop_server(srv[0])
-        _cleanup(prefix, names)
-    assert_true(closed)
-    assert_false(exited_before_release)
+def test_h1_shutdown_gives_up_after_its_timeout_move_only() raises:
+    """A handler that is not ``Copyable`` is shared with the pool, so the
+    worker still returns at the deadline while its job runs on."""
+    _h1_shutdown_gives_up_after_its_timeout(False, loop="moveonly")
+
+
+def test_h1_shutdown_gives_up_after_its_timeout_cancel_move_only() raises:
+    _h1_shutdown_gives_up_after_its_timeout(False, loop="cancel-moveonly")
 
 
 def test_cancel_handler_sees_timeout_through_its_cancel_argument() raises:
@@ -1267,6 +1299,90 @@ def test_stream_full_queue_answers_503_at_once() raises:
     assert_true(r1.endswith("done d1"), r1)
     assert_true(r2.endswith("done d2"), r2)
     assert_false(d3_ran, "a refused request must not run")
+
+
+def test_stream_one_connection_offloads_two_requests_at_once() raises:
+    """A front may offload several requests on one connection. They run
+    side by side, and ``on_offload_done`` gets them in the order they
+    were offloaded even when the second finishes first."""
+    var prefix = _prefix("streampair")
+    var names = List[String]()
+    names.append("p1")
+    names.append("p2")
+    var srv = _spawn_server(
+        prefix, ServerConfig(offload_threads=2), loop="stream"
+    )
+    var got = String("")
+    try:
+        var c = _Conn(srv[1])
+        c.get("/pair/p1/p2")
+        _wait_file(prefix + "started-p1")
+        _wait_file(prefix + "started-p2")
+        _touch(prefix + "release-p2")
+        _wait_file(prefix + "finished-p2")
+        _touch(prefix + "release-p1")
+        got = c.response()
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, names)
+    assert_true(got.endswith("done p1,done p2"), got)
+
+
+def test_stream_timeout_of_one_offload_keeps_the_order() raises:
+    """The first of two offloaded requests runs out of time: its 503
+    still comes first, and the second, already finished, follows."""
+    var prefix = _prefix("streampairto")
+    var names = List[String]()
+    names.append("t1")
+    names.append("t2")
+    _touch(prefix + "release-t2")
+    var srv = _spawn_server(
+        prefix,
+        ServerConfig(offload_threads=2, handler_timeout_ms=300),
+        loop="stream",
+    )
+    var got = String("")
+    var reason = String("")
+    try:
+        var c = _Conn(srv[1])
+        c.get("/pair/t1/t2")
+        got = c.response()
+        _wait_file(prefix + "cancel-t1")
+        reason = _read_file(prefix + "cancel-t1")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, names)
+    assert_true(got.endswith("503,done t2"), got)
+    assert_equal(reason, String(CancelReason.TIMEOUT))
+
+
+def test_stream_client_close_cancels_every_offload() raises:
+    """A client that leaves with two offloaded requests out cancels
+    both with ``PEER_CLOSED``."""
+    var prefix = _prefix("streampairgone")
+    var names = List[String]()
+    names.append("g1")
+    names.append("g2")
+    var srv = _spawn_server(
+        prefix, ServerConfig(offload_threads=2), loop="stream"
+    )
+    var r1 = String("")
+    var r2 = String("")
+    try:
+        var c = _Conn(srv[1])
+        c.get("/pair/g1/g2")
+        _wait_file(prefix + "started-g1")
+        _wait_file(prefix + "started-g2")
+        c.close()
+        _wait_file(prefix + "cancel-g1")
+        _wait_file(prefix + "cancel-g2")
+        r1 = _read_file(prefix + "cancel-g1")
+        r2 = _read_file(prefix + "cancel-g2")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, names)
+    assert_equal(r1, String(CancelReason.PEER_CLOSED))
+    assert_equal(r2, String(CancelReason.PEER_CLOSED))
 
 
 def test_stream_blocking_driver_runs_the_offload_in_place() raises:
