@@ -29,7 +29,6 @@ from ._reactor import (
     StepResult,
     ConnHandle,
     _detect_h2c_upgrade_inline,
-    _monotonic_ms,
     _is_content_length,
     _is_date,
     _is_connection,
@@ -86,6 +85,7 @@ from ._reactor.lifecycle import (
     _adopt_handed_off_h1,
     ListenerGate,
 )
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 def _handler_conn_event[
@@ -206,7 +206,7 @@ def _run_handler_loop_impl[
             none. Inflight and exit-status counters are published to it.
     """
     var reactor = Reactor()
-    var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
+    var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()
 
@@ -237,14 +237,14 @@ def _run_handler_loop_impl[
         if settle_deadline == 0 and load_stop_flag(stopping_addr):
             if offload_outstanding(offload_port) == 0:
                 break
-            settle_deadline = _monotonic_ms() + max(
+            settle_deadline = monotonic_now_ms() + max(
                 config.shutdown_timeout_ms, 0
             )
             begin_offload_settle_h1(
                 offload_port, listener_fd, conns, reactor, wheel, timers
             )
         if settle_deadline != 0:
-            if offload_settled_h1(conns) or _monotonic_ms() >= settle_deadline:
+            if offload_settled_h1(conns) or monotonic_now_ms() >= settle_deadline:
                 break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         events.clear()
@@ -254,7 +254,7 @@ def _run_handler_loop_impl[
             exit_status = WORKER_STATUS_CRASHED
             break
 
-        var now_ms = UInt64(_monotonic_ms())
+        var now_ms = UInt64(monotonic_now_ms())
         var fired_fds = List[Int]()
         var fired_ids = List[UInt64]()
         _collect_fired_timers(now_ms, wheel, timers, fired_fds, fired_ids)
@@ -497,7 +497,7 @@ def run_reactor_loop_cancel[
     var listener_fd = listener._socket.fd
 
     var reactor = Reactor()
-    var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
+    var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()
 
@@ -523,14 +523,14 @@ def run_reactor_loop_cancel[
         if settle_deadline == 0 and load_stop_flag(stopping_addr):
             if offload_outstanding(offload_port) == 0:
                 break
-            settle_deadline = _monotonic_ms() + max(
+            settle_deadline = monotonic_now_ms() + max(
                 config.shutdown_timeout_ms, 0
             )
             begin_offload_settle_h1(
                 offload_port, Int(listener_fd), conns, reactor, wheel, timers
             )
         if settle_deadline != 0:
-            if offload_settled_h1(conns) or _monotonic_ms() >= settle_deadline:
+            if offload_settled_h1(conns) or monotonic_now_ms() >= settle_deadline:
                 break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         events.clear()
@@ -540,7 +540,7 @@ def run_reactor_loop_cancel[
             exit_status = WORKER_STATUS_CRASHED
             break
 
-        var now_ms = UInt64(_monotonic_ms())
+        var now_ms = UInt64(monotonic_now_ms())
         var fired_fds = List[Int]()
         var fired_ids = List[UInt64]()
         _collect_fired_timers(now_ms, wheel, timers, fired_fds, fired_ids)

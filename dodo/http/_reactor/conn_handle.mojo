@@ -89,7 +89,6 @@ from .keepalive_scan import (
     _is_content_length,
     _is_date,
     _has_header_line,
-    _monotonic_ms,
     _wants_close,
 )
 from dodo.http.proto.chunked import (
@@ -115,6 +114,7 @@ from dodo.tls._server_ffi import (
     SSL_IO_WANT_READ,
     SSL_IO_WANT_WRITE,
 )
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 # ── Dispatch-config comptime tags ─────────────────────────────────────────────
@@ -753,7 +753,7 @@ struct ConnHandle(Movable):
             config.request_timeout_ms > 0 or config.header_timeout_ms > 0
         )
         if len(self.read_buf) > 0 and timed:
-            var now = _monotonic_ms()
+            var now = monotonic_now_ms()
             if self.request_started_ms == 0:
                 self.request_started_ms = now
             else:
@@ -796,7 +796,7 @@ struct ConnHandle(Movable):
                 )
             self.headers_end = end
             if config.min_body_rate > 0:
-                self.body_started_ms = _monotonic_ms()
+                self.body_started_ms = monotonic_now_ms()
             var te = request_te_framing(
                 Span[UInt8, _](self.read_buf),
                 self.headers_end,
@@ -2091,7 +2091,7 @@ struct ConnHandle(Movable):
         period at less than ``config.min_body_rate`` bytes a second."""
         if config.min_body_rate <= 0 or self.body_started_ms == 0:
             return False
-        var elapsed = _monotonic_ms() - self.body_started_ms
+        var elapsed = monotonic_now_ms() - self.body_started_ms
         if elapsed <= MIN_BODY_RATE_GRACE_MS:
             return False
         var received = len(self.read_buf) - self.headers_end
@@ -2125,7 +2125,7 @@ struct ConnHandle(Movable):
         _ = _shutdown(self.fd(), SHUT_WR)
         self.state = STATE_LINGERING
         self.read_buf.clear()
-        self.linger_started_ms = _monotonic_ms()
+        self.linger_started_ms = monotonic_now_ms()
         return StepResult(
             want_read=True,
             want_write=False,
@@ -2149,7 +2149,7 @@ struct ConnHandle(Movable):
             if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
                 break
             return StepResult(done=True)
-        if _monotonic_ms() - self.linger_started_ms > LINGER_TOTAL_MS:
+        if monotonic_now_ms() - self.linger_started_ms > LINGER_TOTAL_MS:
             return StepResult(done=True)
         return StepResult(
             want_read=True,

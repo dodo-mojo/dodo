@@ -45,7 +45,6 @@ from .keepalive_scan import (
     _is_connection,
     _is_content_length,
     _is_date,
-    _monotonic_ms,
     _wants_close,
 )
 from .write_path import (

@@ -41,10 +41,9 @@ Expected behaviour: ``0 failed, 0 slow`` across every iteration.
 from std.memory import Pointer
 from std.os import getenv
 
-from dodo.http._server_reactor_impl import _monotonic_ms
 from dodo.net import SocketAddr
 from dodo.runtime import Frontend, Scheduler
-from dodo.runtime._libc_time import libc_nanosleep_ms
+from dodo.runtime._libc_time import libc_nanosleep_ms, monotonic_now_ms
 from dodo.runtime.scheduler import load_stop_flag
 
 
@@ -120,7 +119,7 @@ def _run_one(mut rng: UInt64, iter_idx: Int) raises -> Int:
 
     var addr = SocketAddr.localhost(0)
 
-    var t_start = _monotonic_ms()
+    var t_start = monotonic_now_ms()
     var s = Scheduler[_NopFrontend].start(
         addr=addr,
         frontend=_NopFrontend(iter_idx),
@@ -132,7 +131,7 @@ def _run_one(mut rng: UInt64, iter_idx: Int) raises -> Int:
     # ``_stopping_addr == 0`` no-op branches in ``Scheduler.shutdown``.
     for _ in range(extra_churn):
         s.shutdown()
-    var t_end = _monotonic_ms()
+    var t_end = monotonic_now_ms()
 
     return t_end - t_start
 

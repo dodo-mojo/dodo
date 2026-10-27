@@ -54,7 +54,8 @@ Reactor adoption: same as example 24 — wires through the existing
 
 from std.collections import Optional
 
-from ._reactor.keepalive_scan import _monotonic_ms
+from dodo.runtime._libc_time import monotonic_now_ms
+
 from .body import Body, ChunkSource, ChunkedBody, InlineBody
 from .cancel import Cancel
 from .response import Response, stream_response
@@ -285,7 +286,7 @@ struct SseChannel(ChunkSource, Copyable):
         if self._next_idx >= len(self._events):
             if self._closed:
                 return Optional[List[UInt8]]()
-            var now = _monotonic_ms()
+            var now = monotonic_now_ms()
             if (
                 self._last_beat_ms >= 0
                 and now - self._last_beat_ms < SSE_HEARTBEAT_MS

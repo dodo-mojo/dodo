@@ -71,11 +71,11 @@ from ._reactor.tls_transport import TlsTransport
 
 from ._server_reactor_impl import (
     StepResult,
-    _monotonic_ms,
     STATE_READING,
     STATE_WRITING,
     STATE_CLOSING,
 )
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 # ── Http2ConnHandle ────────────────────────────────────────────────────────────
@@ -1068,7 +1068,7 @@ struct Http2ConnHandle(Movable):
         self.offloads[sid] = job
         if config.handler_timeout_ms > 0:
             self.offload_deadlines[sid] = (
-                _monotonic_ms() + config.handler_timeout_ms
+                monotonic_now_ms() + config.handler_timeout_ms
             )
 
     def _abandon_stream(mut self, sid: Int, reason: Int) raises:
@@ -1153,7 +1153,7 @@ struct Http2ConnHandle(Movable):
         with ``TIMEOUT``. A connection waiting to close gives up on the
         rest once ``close_deadline_ms`` has passed.
         """
-        var now = _monotonic_ms()
+        var now = monotonic_now_ms()
         var overdue = List[Int]()
         for entry in self.offload_deadlines.items():
             if entry.value <= now:
@@ -1178,7 +1178,7 @@ struct Http2ConnHandle(Movable):
                 earliest = entry.value
         if earliest == 0:
             return 0
-        return max(earliest - _monotonic_ms(), 1)
+        return max(earliest - monotonic_now_ms(), 1)
 
     def _next_step(mut self, config: ServerConfig) -> StepResult:
         """Reactor interest after queueing output: write while bytes are
@@ -1188,7 +1188,7 @@ struct Http2ConnHandle(Movable):
         if self.should_close and len(self.offloads) > 0:
             if self.close_deadline_ms == 0:
                 self.close_deadline_ms = (
-                    _monotonic_ms() + config.shutdown_timeout_ms
+                    monotonic_now_ms() + config.shutdown_timeout_ms
                 )
         if len(self.write_buf) > self.write_pos:
             self.state = STATE_WRITING

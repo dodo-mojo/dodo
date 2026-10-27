@@ -27,7 +27,8 @@ from dodo.tcp import TcpStream, TcpListener, accept_fd
 from dodo.http.cancel import CancelReason
 
 from .conn_handle import ConnHandle
-from .keepalive_scan import StepResult, _monotonic_ms
+from .keepalive_scan import StepResult
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 @always_inline
@@ -43,7 +44,7 @@ def _poll_timeout_ms(imm wheel: TimerWheel, cap_ms: Int = 100) -> Int:
     scan, independent of the active-timer count.
     """
     var nf = wheel.next_fire_ms()
-    var now = UInt64(_monotonic_ms())
+    var now = UInt64(monotonic_now_ms())
     if nf <= now:
         return 1
     var delta = Int(nf - now)

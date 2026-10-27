@@ -24,47 +24,22 @@ POSIX semantics:
 """
 
 from std.ffi import external_call
-from std.time import sleep
-from std.memory import Pointer, stack_allocation
-from std.sys.info import CompilationTarget
-
-# ``CLOCK_MONOTONIC`` clock id is NOT portable: it is ``1`` on Linux but
-# ``6`` on Darwin/macOS (where ``1`` is undefined, so ``clock_gettime``
-# returns -1 and leaves the timespec at 0 -- the clock would read a
-# constant 0 and elapsed math would silently collapse). Pick at compile
-# time so each platform gets its real steady clock.
-comptime _CLOCK_MONOTONIC: Int32 = Int32(
-    6
-) if CompilationTarget.is_macos() else Int32(1)
+from std.time import monotonic, sleep
 
 
 @always_inline
 def monotonic_now_ms() -> Int:
-    """Return the monotonic clock in milliseconds.
+    """The steady clock in milliseconds, for deadlines and elapsed time.
 
-    Canonical ``dodo.runtime`` wrapper over
-    ``clock_gettime(CLOCK_MONOTONIC, ...)`` for deadline math in the
-    streaming reactor and elsewhere. The clock is steady (never jumps
-    backwards), so ``monotonic_now_ms() - start`` is a sound elapsed
-    measure. ``CLOCK_MONOTONIC`` is id ``1`` on Linux and ``6`` on
-    macOS (see ``_CLOCK_MONOTONIC``).
+    The clock never jumps backwards, so ``monotonic_now_ms() - start``
+    is a sound elapsed measure. It wraps the stdlib clock, which reads
+    ``CLOCK_MONOTONIC`` without allocating.
 
     Returns:
         Milliseconds since an unspecified but fixed epoch.
     """
-    var ts = stack_allocation[2, Int64]()
-    ts[unsafe_offset=0] = Int64(0)
-    ts[unsafe_offset=1] = Int64(0)
-    var ts_ext = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(ts))
-    _ = external_call[
-        "clock_gettime",
-        Int32,
-        Int32,
-        Pointer[Int64, MutUntrackedOrigin],
-    ](_CLOCK_MONOTONIC, ts_ext)
-    return (
-        Int(ts[unsafe_offset=0]) * 1000 + Int(ts[unsafe_offset=1]) // 1_000_000
-    )
+    var nanoseconds = Int(monotonic())
+    return nanoseconds // 1_000_000
 
 
 @always_inline
