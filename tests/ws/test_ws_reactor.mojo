@@ -221,19 +221,21 @@ def test_idle_connection_is_dropped() raises:
 
 def test_active_connection_outlives_the_idle_timeout() raises:
     """Messages keep pushing the idle deadline back: a connection that
-    talks every 100 ms outlives a 200 ms idle timeout many times over."""
-    var s = _serve(idle_ms=200)
+    talks every 100 ms outlives a 500 ms idle timeout over twice. The
+    timeout is five gaps long because a slow CI runner can stall one
+    100 ms sleep past 200 ms."""
+    var s = _serve(idle_ms=500)
     var ok = 0
     try:
         var ws = WsClient.connect(_url(s[1]))
-        for i in range(8):
+        for i in range(12):
             usleep(100_000)
             ws.send_text("m" + String(i))
             if ws.recv().text_payload() == "m" + String(i):
                 ok += 1
     finally:
         _stop(s[0])
-    assert_equal(ok, 8)
+    assert_equal(ok, 12)
 
 
 def main() raises:
