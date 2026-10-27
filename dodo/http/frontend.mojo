@@ -53,9 +53,10 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
        :func:`run_unified_reactor_loop_shared`. Per-connection
        preface peek selects the protocol.
     3. **HTTP/1.1 only** (default):
-       :func:`run_reactor_loop_shared`. A handler whose
-       ``may_block()`` is True always takes path 2, the one loop
-       with the offload pool.
+       :func:`run_reactor_loop_shared`.
+
+    Every path runs a handler's ``Offload`` requests on the offload
+    pool.
 
     The frontend is :class:`Copyable` so the scheduler can clone
     it once per worker before pthread spawn; expensive shared
@@ -132,7 +133,6 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
                 use_uring_backend()
                 and self.config.use_bufring
                 and self.tls_ctx_addr == 0
-                and not self.handler.may_block()
             ):
                 return True
         return False
@@ -152,7 +152,6 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
                     and self.config.use_bufring
                     and self.tls_ctx_addr == 0
                     and len(extra_fds) == 0
-                    and not self.handler.may_block()
                 ):
                     # The buffer-ring loop registers exactly one
                     # listener, so it is not eligible once this worker
@@ -166,11 +165,7 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
                         stats_addr,
                     )
                     return
-            # Only the unified loop runs offloaded handlers on the pool.
-            var unified = self.auto_protocol or self.tls_ctx_addr != 0
-            if extra_fds or self.handler.may_block():
-                unified = True
-            if unified:
+            if self.auto_protocol or self.tls_ctx_addr != 0 or extra_fds:
                 var ws = Optional[WsH2Hooks](None)
                 if self.ws_hooks:
                     ws = self.ws_hooks.value().clone()
@@ -215,16 +210,20 @@ struct StreamFrontend[H: StreamHandler & Copyable](Copyable, Frontend):
     var handler: Self.H
     var max_in_flight: Int
     var retry_after_s: Int
+    var config: ServerConfig
+    """Offload pool settings for ``StreamConn.offload``."""
 
     def __init__(
         out self,
         var handler: Self.H,
         max_in_flight: Int = 0,
         retry_after_s: Int = 1,
+        var config: ServerConfig = ServerConfig(),
     ):
         self.handler = handler^
         self.max_in_flight = max_in_flight
         self.retry_after_s = retry_after_s
+        self.config = config^
 
     def requires_per_worker_listener(self) -> Bool:
         """Streaming is fine with either listener strategy (honours the
@@ -256,6 +255,7 @@ struct StreamFrontend[H: StreamHandler & Copyable](Copyable, Frontend):
                 stats_addr=stats_addr,
                 max_in_flight=self.max_in_flight,
                 retry_after_s=self.retry_after_s,
+                config=self.config,
             )
         except:
             pass

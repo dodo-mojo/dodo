@@ -525,12 +525,10 @@ struct HttpServer(Movable):
         var per_worker = (files - SPARE_FILES) // max(workers, 1)
         self.config.max_connections = max(per_worker, 16)
 
-    def _resolve_bufring(mut self, may_block: Bool):
+    def _resolve_bufring(mut self):
         """Decide once, at startup, whether the io_uring buffer-ring loop
         serves: when opted into (``DODO_BUFRING_HANDLER=1`` or
-        ``use_bufring``) and the config and handler need nothing that
-        loop lacks. ``may_block`` is the handler's ``may_block()``: that
-        loop has no offload pool."""
+        ``use_bufring``) and the config needs nothing that loop lacks."""
         if not self.config.use_bufring:
             self.config.use_bufring = _resolve_bufring_handler_env()
         if not self.config.use_bufring:
@@ -538,8 +536,6 @@ struct HttpServer(Movable):
         var gap = bufring_gap(self.config)
         if not gap and self._ws_h2_hooks:
             gap = "WebSocket upgrades"
-        if not gap and may_block:
-            gap = "Offload"
         if gap:
             print(
                 "dodo: the io_uring buffer ring does not enforce",
@@ -559,7 +555,7 @@ struct HttpServer(Movable):
 
         self._stopping = False
         self._resolve_max_connections(1)
-        self._resolve_bufring(handler.may_block())
+        self._resolve_bufring()
         comptime if CompilationTarget.is_linux():
             if (
                 use_uring_backend()
@@ -667,6 +663,12 @@ struct HttpServer(Movable):
         Single-listener, single-worker. Extra ``bind(List[SocketAddr])`` listeners
         and multi-worker mode are not supported here yet.
 
+        A front hands a blocking request to the offload pool with
+        ``conn.offload(stack, req)`` and gets the response in
+        ``on_offload_done``; the server's ``offload_threads``,
+        ``offload_queue_depth``, ``handler_timeout_ms`` and
+        ``shutdown_timeout_ms`` apply.
+
         Args:
             handler: The streaming front (ownership transferred). One
                 instance services every connection.
@@ -694,6 +696,7 @@ struct HttpServer(Movable):
             self._stopping,
             max_in_flight=max_in_flight,
             retry_after_s=retry_after_s,
+            config=self.config,
         )
 
     def serve_streaming[
@@ -758,6 +761,7 @@ struct HttpServer(Movable):
             handler^,
             max_in_flight=max_in_flight,
             retry_after_s=retry_after_s,
+            config=self.config.copy(),
         )
         var scheduler = Scheduler[StreamFrontend[H]].start(
             addr=addr,
@@ -828,7 +832,7 @@ struct HttpServer(Movable):
 
         # Before the config is handed to the worker threads.
         self._resolve_max_connections(num_workers)
-        self._resolve_bufring(handler.may_block())
+        self._resolve_bufring()
 
         var frontend = HttpFrontend[H](
             handler^,

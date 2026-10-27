@@ -58,6 +58,18 @@ from dodo.runtime.scheduler import (
 )
 
 
+from dodo.http._offload_pool import (
+    offload_outstanding,
+    offload_port_open,
+    offload_port_open_cancel,
+)
+from ._reactor.offload_loop import (
+    begin_offload_settle_h1,
+    close_offload_port,
+    deliver_offloads_h1,
+    offload_settled_h1,
+    offload_timeout_h1,
+)
 from ._reactor.lifecycle import (
     _poll_timeout_ms,
     _collect_fired_timers,
@@ -76,6 +88,81 @@ from ._reactor.lifecycle import (
 )
 
 
+def _handler_conn_event[
+    H: Handler
+](
+    fd: Int,
+    readable: Bool,
+    writable: Bool,
+    ref handler: H,
+    config: ServerConfig,
+    mut conns: Dict[Int, Int],
+    mut reactor: Reactor,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+):
+    """Drive one connection of the HTTP/1.1 handler loop through a
+    readable or writable event, closing it when it is done."""
+    var addr = conns.get(fd)
+    if not addr:
+        return
+    var ch_ptr = _conn_ptr_from_int(addr.value())
+    var step_done = False
+    try:
+        var last_step = StepResult()
+        if readable:
+            last_step = ch_ptr[].on_readable(handler, config)
+            step_done = last_step.done
+            # Fast path: while the state machine is cycling (readable ->
+            # writable on request, writable -> readable on keep-alive),
+            # drive the next step inline rather than bouncing through the
+            # reactor. Capped at 3 cycles so pipelining can't starve
+            # other fds.
+            var cycles = 0
+            while (not step_done) and cycles < 3:
+                cycles += 1
+                if (
+                    last_step.want_write
+                    and len(ch_ptr[].write_buf) > ch_ptr[].write_pos
+                ):
+                    last_step = ch_ptr[].on_writable(config)
+                    step_done = last_step.done
+                elif (
+                    last_step.want_read
+                    and len(ch_ptr[].read_buf) > 0
+                    and ch_ptr[].state == STATE_READING
+                ):
+                    last_step = ch_ptr[].on_readable(handler, config)
+                    step_done = last_step.done
+                else:
+                    break
+        elif writable:
+            last_step = ch_ptr[].on_writable(config)
+            step_done = last_step.done
+            # A response just finished flushing; any pipelined request
+            # behind it is already in read_buf and will raise no readable
+            # event of its own.
+            if not step_done and ch_ptr[].has_buffered_request():
+                last_step = ch_ptr[].on_readable(handler, config)
+                step_done = last_step.done
+        if (
+            not step_done
+            and last_step.want_read
+            and ch_ptr[].has_buffered_request()
+        ):
+            # The cycle cap stopped us with a whole request still
+            # buffered: ask for a writable edge, which a level-triggered
+            # socket raises at once, so the branch above serves it on the
+            # next poll.
+            last_step.want_write = True
+        if not step_done:
+            _apply_step(fd, last_step, reactor, wheel, timers, ch_ptr)
+    except:
+        step_done = True
+    if step_done:
+        _cleanup_conn(fd, conns, timers, reactor, wheel)
+
+
 def _run_handler_loop_impl[
     H: Handler, is_shared: Bool
 ](
@@ -85,7 +172,7 @@ def _run_handler_loop_impl[
     ref stopping: Bool,
     stats_addr: Int = 0,
 ) raises:
-    """Shared epoll/kqueue event-loop body for the dynamic-handler path.
+    """Shared epoll/kqueue event-loop body for the HTTP/1.1 handler path.
 
     Drives the multi-worker shared-listener entry point
     (``run_reactor_loop_shared``); that public surface is a thin wrapper
@@ -97,6 +184,11 @@ def _run_handler_loop_impl[
     (the wakeup pattern degrades to "wake-all, one-wins" but
     practical behaviour is similar because non-blocking ``accept``
     returns ``EAGAIN`` on the losers).
+
+    A handler that may block gets a port to the offload pool, as on the
+    unified loop: an offloaded request parks its connection until the
+    pool answers, and a stop waits up to ``shutdown_timeout_ms`` for
+    such requests.
 
     Args:
         listener_fd: Listener fd. The dedicated path obtains it from
@@ -130,7 +222,30 @@ def _run_handler_loop_impl[
     var events = List[Event]()
     var exit_status = WORKER_STATUS_CLEAN
     var stopping_addr = Int(Pointer[Bool, _](to=stopping))
-    while not load_stop_flag(stopping_addr):
+    var offload_port = 0
+    if handler.may_block():
+        offload_port = offload_port_open(
+            handler,
+            reactor.wake_fd(),
+            config.offload_threads,
+            config.offload_queue_depth,
+        )
+    # Non-zero once the stop flag is seen with offloaded requests out:
+    # the loop keeps serving their connections until this deadline.
+    var settle_deadline = 0
+    while True:
+        if settle_deadline == 0 and load_stop_flag(stopping_addr):
+            if offload_outstanding(offload_port) == 0:
+                break
+            settle_deadline = _monotonic_ms() + max(
+                config.shutdown_timeout_ms, 0
+            )
+            begin_offload_settle_h1(
+                offload_port, listener_fd, conns, reactor, wheel, timers
+            )
+        if settle_deadline != 0:
+            if offload_settled_h1(conns) or _monotonic_ms() >= settle_deadline:
+                break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         events.clear()
         try:
@@ -149,84 +264,72 @@ def _run_handler_loop_impl[
             if evt.is_wakeup():
                 continue
             if evt.token == LISTENER_TOKEN:
-                _accept_loop_fd(
-                    listener_fd,
-                    reactor,
+                if settle_deadline == 0:
+                    _accept_loop_fd(
+                        listener_fd,
+                        reactor,
+                        conns,
+                        wheel,
+                        timers,
+                        config.idle_timeout_ms,
+                        config.max_connections,
+                        offload_port=offload_port,
+                    )
+                continue
+            _handler_conn_event(
+                Int(evt.token),
+                evt.is_readable(),
+                evt.is_writable(),
+                handler,
+                config,
+                conns,
+                reactor,
+                wheel,
+                timers,
+            )
+
+        if offload_outstanding(offload_port) > 0:
+            var ready = deliver_offloads_h1(
+                offload_port, conns, reactor, wheel, timers
+            )
+            for i in range(len(ready)):
+                # Flush now rather than wait a poll for the writable edge.
+                _handler_conn_event(
+                    ready[i],
+                    False,
+                    True,
+                    handler,
+                    config,
                     conns,
+                    reactor,
                     wheel,
                     timers,
-                    config.idle_timeout_ms,
-                    config.max_connections,
                 )
-                continue
-            var fd = Int(evt.token)
-            if fd not in conns:
-                continue
-            var ch_ptr = _conn_ptr_from_int(conns[fd])
-            var step_done = False
-            try:
-                var last_step = StepResult()
-                if evt.is_readable():
-                    last_step = ch_ptr[].on_readable(handler, config)
-                    step_done = last_step.done
-                    # Fast path: while the state machine is cycling
-                    # (readable -> writable on request, writable ->
-                    # readable on keep-alive), drive the next step
-                    # inline rather than bouncing through the
-                    # reactor. The single biggest win on TFB
-                    # plaintext with keep-alive. Cap at 3 cycles so
-                    # malicious pipelining can't starve other fds.
-                    var cycles = 0
-                    while (not step_done) and cycles < 3:
-                        cycles += 1
-                        if (
-                            last_step.want_write
-                            and len(ch_ptr[].write_buf) > ch_ptr[].write_pos
-                        ):
-                            last_step = ch_ptr[].on_writable(config)
-                            step_done = last_step.done
-                        elif (
-                            last_step.want_read
-                            and len(ch_ptr[].read_buf) > 0
-                            and ch_ptr[].state == STATE_READING
-                        ):
-                            last_step = ch_ptr[].on_readable(handler, config)
-                            step_done = last_step.done
-                        else:
-                            break
-                elif evt.is_writable():
-                    last_step = ch_ptr[].on_writable(config)
-                    step_done = last_step.done
-                    # A response just finished flushing; any pipelined
-                    # request behind it is already in read_buf and will
-                    # raise no readable event of its own.
-                    if not step_done and ch_ptr[].has_buffered_request():
-                        last_step = ch_ptr[].on_readable(handler, config)
-                        step_done = last_step.done
-                if (
-                    not step_done
-                    and last_step.want_read
-                    and ch_ptr[].has_buffered_request()
-                ):
-                    # The cycle cap stopped us with a whole request still
-                    # buffered: ask for a writable edge, which a
-                    # level-triggered socket raises at once, so the
-                    # branch above serves it on the next poll.
-                    last_step.want_write = True
-                if not step_done:
-                    _apply_step(fd, last_step, reactor, wheel, timers, ch_ptr)
-            except:
-                step_done = True
-            if step_done:
-                _cleanup_conn(fd, conns, timers, reactor, wheel)
 
         # Deadlines that passed while this poll's events were pending are
         # enforced only now: a connection that had a request waiting was
         # served above and re-armed its timer, so it is spared.
         var expired = _expired_idle_conns(fired_fds, fired_ids, conns, timers)
         for i in range(len(expired)):
-            _cleanup_conn(expired[i], conns, timers, reactor, wheel)
-        gate.sync(reactor, len(conns), config.max_connections)
+            var fd = expired[i]
+            if offload_port != 0 and offload_timeout_h1(
+                fd, conns, reactor, wheel, timers
+            ):
+                _handler_conn_event(
+                    fd,
+                    False,
+                    True,
+                    handler,
+                    config,
+                    conns,
+                    reactor,
+                    wheel,
+                    timers,
+                )
+                continue
+            _cleanup_conn(fd, conns, timers, reactor, wheel)
+        if settle_deadline == 0:
+            gate.sync(reactor, len(conns), config.max_connections)
 
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)
 
@@ -239,6 +342,7 @@ def _run_handler_loop_impl[
         leftover.append(kv.key)
     for i in range(len(leftover)):
         _cleanup_conn(leftover[i], conns, timers, reactor, wheel)
+    close_offload_port(offload_port, reactor)
 
 
 def run_reactor_loop_shared[
@@ -282,6 +386,76 @@ def run_reactor_loop_shared[
     )
 
 
+def _cancel_conn_event[
+    CH: CancelHandler
+](
+    fd: Int,
+    readable: Bool,
+    writable: Bool,
+    ref handler: CH,
+    config: ServerConfig,
+    mut conns: Dict[Int, Int],
+    mut reactor: Reactor,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+):
+    """Drive one connection of the cancel-aware loop through a readable
+    or writable event, closing it when it is done."""
+    var addr = conns.get(fd)
+    if not addr:
+        return
+    var ch_ptr = _conn_ptr_from_int(addr.value())
+    var step_done = False
+    try:
+        var last_step = StepResult()
+        if readable:
+            last_step = ch_ptr[].on_readable_cancel(handler, config)
+            step_done = last_step.done
+            var cycles = 0
+            while (not step_done) and cycles < 3:
+                cycles += 1
+                if (
+                    last_step.want_write
+                    and len(ch_ptr[].write_buf) > ch_ptr[].write_pos
+                ):
+                    last_step = ch_ptr[].on_writable(config)
+                    step_done = last_step.done
+                elif (
+                    last_step.want_read
+                    and len(ch_ptr[].read_buf) > 0
+                    and ch_ptr[].state == STATE_READING
+                ):
+                    last_step = ch_ptr[].on_readable_cancel(handler, config)
+                    step_done = last_step.done
+                else:
+                    break
+        elif writable:
+            last_step = ch_ptr[].on_writable(config)
+            step_done = last_step.done
+            # A response just finished flushing; any pipelined request
+            # behind it is already in read_buf and will raise no readable
+            # event of its own.
+            if not step_done and ch_ptr[].has_buffered_request():
+                last_step = ch_ptr[].on_readable_cancel(handler, config)
+                step_done = last_step.done
+        if (
+            not step_done
+            and last_step.want_read
+            and ch_ptr[].has_buffered_request()
+        ):
+            # The cycle cap stopped us with a whole request still
+            # buffered: ask for a writable edge, which a level-triggered
+            # socket raises at once, so the branch above serves it on the
+            # next poll.
+            last_step.want_write = True
+        if not step_done:
+            _apply_step(fd, last_step, reactor, wheel, timers, ch_ptr)
+    except:
+        step_done = True
+    if step_done:
+        _cleanup_conn(fd, conns, timers, reactor, wheel)
+
+
 def run_reactor_loop_cancel[
     CH: CancelHandler
 ](
@@ -291,19 +465,23 @@ def run_reactor_loop_cancel[
     ref stopping: Bool,
     stats_addr: Int = 0,
 ) raises:
-    """Cancel-aware variant of ``run_reactor_loop_shared``.
+    """Cancel-aware HTTP/1.1 loop behind ``serve_cancellable``.
 
-    Identical control flow to ``run_reactor_loop_shared`` but drives each
-    connection through ``ConnHandle.on_readable_cancel(handler,
-    config)`` instead of ``on_readable``, so the handler receives
-    a ``Cancel`` token bound to the connection's per-request
-    ``CancelCell``.
+    Drives each connection through ``ConnHandle.on_readable_cancel``, so
+    the handler receives a ``Cancel`` token bound to the connection's
+    per-request ``CancelCell``. The reactor flips that cell on:
 
-    The reactor flips that cell on:
-    - ``CancelReason.PEER_CLOSED`` — peer FIN observed before the
+    - ``CancelReason.PEER_CLOSED``: peer FIN observed before the
       response was queued.
-    - ``CancelReason.TIMEOUT`` — wired in commit 5 of .
-    - ``CancelReason.SHUTDOWN`` — wired in commit 6 of .
+    - ``CancelReason.TIMEOUT``: an offloaded request outlived
+      ``handler_timeout_ms``.
+    - ``CancelReason.SHUTDOWN``: the loop is stopping.
+
+    A handler that may block gets a port to the offload pool: a request
+    it marks ``blocking`` runs on a pool thread while the connection is
+    parked, as on the unified loop. A stop with such requests out keeps
+    serving their connections until they are answered or
+    ``shutdown_timeout_ms`` passes.
 
     Args:
         listener: Bound and listening ``TcpListener`` (caller-owned;
@@ -330,7 +508,30 @@ def run_reactor_loop_cancel[
     var events = List[Event]()
     var exit_status = WORKER_STATUS_CLEAN
     var stopping_addr = Int(Pointer[Bool, _](to=stopping))
-    while not load_stop_flag(stopping_addr):
+    var offload_port = 0
+    if handler.may_block():
+        offload_port = offload_port_open_cancel(
+            handler,
+            reactor.wake_fd(),
+            config.offload_threads,
+            config.offload_queue_depth,
+        )
+    # Non-zero once the stop flag is seen with offloaded requests out:
+    # the loop keeps serving their connections until this deadline.
+    var settle_deadline = 0
+    while True:
+        if settle_deadline == 0 and load_stop_flag(stopping_addr):
+            if offload_outstanding(offload_port) == 0:
+                break
+            settle_deadline = _monotonic_ms() + max(
+                config.shutdown_timeout_ms, 0
+            )
+            begin_offload_settle_h1(
+                offload_port, Int(listener_fd), conns, reactor, wheel, timers
+            )
+        if settle_deadline != 0:
+            if offload_settled_h1(conns) or _monotonic_ms() >= settle_deadline:
+                break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         events.clear()
         try:
@@ -349,95 +550,83 @@ def run_reactor_loop_cancel[
             if evt.is_wakeup():
                 continue
             if evt.token == LISTENER_TOKEN:
-                _accept_loop(
-                    listener,
-                    reactor,
+                if settle_deadline == 0:
+                    _accept_loop(
+                        listener,
+                        reactor,
+                        conns,
+                        wheel,
+                        timers,
+                        config.idle_timeout_ms,
+                        config.max_connections,
+                        offload_port,
+                    )
+                continue
+            _cancel_conn_event(
+                Int(evt.token),
+                evt.is_readable(),
+                evt.is_writable(),
+                handler,
+                config,
+                conns,
+                reactor,
+                wheel,
+                timers,
+            )
+
+        if offload_outstanding(offload_port) > 0:
+            var ready = deliver_offloads_h1(
+                offload_port, conns, reactor, wheel, timers
+            )
+            for i in range(len(ready)):
+                # Flush now rather than wait a poll for the writable edge.
+                _cancel_conn_event(
+                    ready[i],
+                    False,
+                    True,
+                    handler,
+                    config,
                     conns,
+                    reactor,
                     wheel,
                     timers,
-                    config.idle_timeout_ms,
-                    config.max_connections,
                 )
-                continue
-            var fd = Int(evt.token)
-            if fd not in conns:
-                continue
-            var ch_ptr = _conn_ptr_from_int(conns[fd])
-            var step_done = False
-            try:
-                var last_step = StepResult()
-                if evt.is_readable():
-                    last_step = ch_ptr[].on_readable_cancel(handler, config)
-                    step_done = last_step.done
-                    var cycles = 0
-                    while (not step_done) and cycles < 3:
-                        cycles += 1
-                        if (
-                            last_step.want_write
-                            and len(ch_ptr[].write_buf) > ch_ptr[].write_pos
-                        ):
-                            last_step = ch_ptr[].on_writable(config)
-                            step_done = last_step.done
-                        elif (
-                            last_step.want_read
-                            and len(ch_ptr[].read_buf) > 0
-                            and ch_ptr[].state == STATE_READING
-                        ):
-                            last_step = ch_ptr[].on_readable_cancel(
-                                handler, config
-                            )
-                            step_done = last_step.done
-                        else:
-                            break
-                elif evt.is_writable():
-                    last_step = ch_ptr[].on_writable(config)
-                    step_done = last_step.done
-                    # A response just finished flushing; any pipelined
-                    # request behind it is already in read_buf and will
-                    # raise no readable event of its own.
-                    if not step_done and ch_ptr[].has_buffered_request():
-                        last_step = ch_ptr[].on_readable_cancel(handler, config)
-                        step_done = last_step.done
-                if (
-                    not step_done
-                    and last_step.want_read
-                    and ch_ptr[].has_buffered_request()
-                ):
-                    # The cycle cap stopped us with a whole request still
-                    # buffered: ask for a writable edge, which a
-                    # level-triggered socket raises at once, so the
-                    # branch above serves it on the next poll.
-                    last_step.want_write = True
-                if not step_done:
-                    _apply_step(fd, last_step, reactor, wheel, timers, ch_ptr)
-            except:
-                step_done = True
-            if step_done:
-                _cleanup_conn(fd, conns, timers, reactor, wheel)
 
         # Deadlines that passed while this poll's events were pending are
         # enforced only now: a connection that had a request waiting was
         # served above and re-armed its timer, so it is spared.
         var expired = _expired_idle_conns(fired_fds, fired_ids, conns, timers)
         for i in range(len(expired)):
-            _cleanup_conn(expired[i], conns, timers, reactor, wheel)
-        gate.sync(reactor, len(conns), config.max_connections)
+            var fd = expired[i]
+            if offload_port != 0 and offload_timeout_h1(
+                fd, conns, reactor, wheel, timers
+            ):
+                _cancel_conn_event(
+                    fd,
+                    False,
+                    True,
+                    handler,
+                    config,
+                    conns,
+                    reactor,
+                    wheel,
+                    timers,
+                )
+                continue
+            _cleanup_conn(fd, conns, timers, reactor, wheel)
+        if settle_deadline == 0:
+            gate.sync(reactor, len(conns), config.max_connections)
 
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)
 
-    # Graceful shutdown: walk every active conn and flip its
-    # CancelCell to SHUTDOWN before closing. Cancel-aware
-    # handlers (CancelHandler) observe the flip and short-circuit
-    # at their next ``cancel.cancelled()`` poll. Plain Handlers
-    # (which don't observe Cancel) run to completion as before.
-    # The flip is in-thread (the worker walks its own conns,
-    # not via cross-thread atomics) — handles the cross-thread
-    # cancel-flip without exposing the per-worker registry across
-    # threads.
+    # Flip every live connection's cell to SHUTDOWN before closing it, so
+    # a cancel-aware handler still running on the pool sees the stop.
     var leftover = List[Int]()
     for kv in conns.items():
         leftover.append(kv.key)
     for i in range(len(leftover)):
         var ch_ptr = _conn_ptr_from_int(conns[leftover[i]])
         ch_ptr[].cancel_cell.flip(CancelReason.SHUTDOWN)
+        ch_ptr[].offload_abandon(CancelReason.SHUTDOWN)
         _cleanup_conn(leftover[i], conns, timers, reactor, wheel)
+    close_offload_port(offload_port, reactor)

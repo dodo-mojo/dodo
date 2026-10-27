@@ -439,6 +439,19 @@ trait CancelHandler(Deinitable, Movable):
         """
         ...
 
+    def may_block(self) -> Bool:
+        """Whether any request may run on the offload pool; see
+        :meth:`Handler.may_block`. ``False`` by default."""
+        return False
+
+    def blocking(self, req: Request) raises -> Bool:
+        """Whether ``req`` runs on the offload pool; see
+        :meth:`Handler.blocking`. An offloaded request reaches
+        ``serve`` on a pool thread, with ``cancel`` bound to the job, so
+        it sees ``TIMEOUT`` and ``PEER_CLOSED`` while it runs.
+        ``False`` by default."""
+        return False
+
 
 @fieldwise_init
 struct WithCancel[H: Handler & Copyable](CancelHandler, Copyable):
@@ -500,6 +513,12 @@ struct WithCancel[H: Handler & Copyable](CancelHandler, Copyable):
             erased ``Response``.
         """
         return self.inner.serve(req).lower()
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
 
 
 # ── WithRaises: HandlerInfallible -> Handler adapter ─────────────────────────

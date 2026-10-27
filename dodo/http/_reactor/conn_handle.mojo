@@ -164,6 +164,16 @@ def _wants_offload[H: Handler](ref handler: H, req: Request) -> Bool:
         return False
 
 
+def _wants_offload_cancel[
+    CH: CancelHandler
+](ref handler: CH, req: Request) -> Bool:
+    """:func:`_wants_offload` for a ``CancelHandler``."""
+    try:
+        return handler.blocking(req)
+    except:
+        return False
+
+
 def _is_ws_version_mismatch(req: Request) -> Bool:
     """A WebSocket handshake (GET, ``Upgrade: websocket``, a key) whose
     ``Sec-WebSocket-Version`` is not 13."""
@@ -1019,6 +1029,17 @@ struct ConnHandle(Movable):
             return StepResult(want_read=True, want_write=True)
         return self._parked_step()
 
+    def _parked_bytes(mut self, bytes: Span[UInt8, _]) -> StepResult:
+        """Keep bytes the io_uring loop received while parked, for after
+        the response, up to ``PARKED_READ_LIMIT``. That loop sees the
+        client leave on its own, from the receive completion."""
+        self.read_buf.extend(bytes)
+        if len(self.read_buf) > PARKED_READ_LIMIT:
+            self.read_buf.clear()
+            self.offload_close = True
+            self.should_close = True
+        return self._parked_step()
+
     def offload_abandon(mut self, reason: Int):
         """Give up on the parked job: flip its cancel cell to ``reason``
         and forget it, so its result is dropped when it comes back."""
@@ -1360,6 +1381,8 @@ struct ConnHandle(Movable):
             A ``StepResult`` describing the new reactor-interest
             state.
         """
+        if self.state == STATE_PARKED:
+            return self._parked_bytes(bytes)
         if self.state != STATE_READING:
             return StepResult(
                 want_read=False, want_write=self.state == STATE_WRITING
@@ -1421,6 +1444,8 @@ struct ConnHandle(Movable):
             return self._transition_to_writing()
 
         var final_close = self._apply_keepalive_policy(config, close_after)
+        if self.offload_port != 0 and _wants_offload(handler, req):
+            return self._offload(req^, final_close, config)
         var expose_errors = req.expose_errors
         var request_id = req.headers.get("x-request-id")
         var resp: Response
@@ -1443,7 +1468,11 @@ struct ConnHandle(Movable):
         request, flipped to ``PEER_CLOSED`` on ``recv == 0``
         observed before the handler runs, and a ``Cancel`` handle
         bound to the cell is passed to ``CH.serve(req, cancel)``.
+        A request the handler marks ``blocking`` goes to the offload
+        pool instead, which binds ``cancel`` to the job.
         """
+        if self.state == STATE_PARKED:
+            return self._parked_read()
         if self.state != STATE_READING:
             return StepResult(
                 want_read=False, want_write=self.state == STATE_WRITING
@@ -1501,6 +1530,8 @@ struct ConnHandle(Movable):
 
         var close_after = _compute_close_after(req.headers, req.version)
         var final_close = self._apply_keepalive_policy(config, close_after)
+        if self.offload_port != 0 and _wants_offload_cancel(handler, req):
+            return self._offload(req^, final_close, config)
         var expose_errors = req.expose_errors
         var request_id = req.headers.get("x-request-id")
         var resp: Response

@@ -242,9 +242,7 @@ struct ServerConfig(Copyable):
     a mid-flight env-var flip cannot reroute live connections.
     Linux-only, HTTP/1.1-only, single-listener-only -- the
     field is silently ignored on macOS / for HTTP/2 / for
-    a multi-address ``HttpServer.bind(List[SocketAddr])``.
-    That loop has no offload pool, so a handler whose
-    ``may_block()`` is True is served by the reactor loop."""
+    a multi-address ``HttpServer.bind(List[SocketAddr])``."""
     var h1_leniency: H1LeniencyConfig
     """HTTP/1.1 parser leniency configuration. Strict by default
     (every flag off); each named flag relaxes a specific RFC 9112

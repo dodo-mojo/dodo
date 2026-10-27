@@ -60,7 +60,6 @@ from dodo.http._offload_pool import (
     offload_free,
     offload_job,
     offload_outstanding,
-    offload_port_close,
     offload_port_open,
     offload_take_done,
 )
@@ -105,6 +104,7 @@ from ._h2_conn_handle import (
     _pending_conn_free_addr,
     _pending_conn_ptr_from_int,
 )
+from ._reactor.offload_loop import close_offload_port
 from ._reactor.lifecycle import (
     _collect_fired_timers,
     _expired_idle_conns,
@@ -410,8 +410,6 @@ def _cleanup_conn_unified(
         if k == KIND_PENDING:
             _pending_conn_free_addr(a)
         elif k == KIND_H1:
-            # A request still on the offload pool has no one to answer.
-            _conn_ptr_from_int(a)[].offload_abandon(CancelReason.PEER_CLOSED)
             _conn_free_addr(a)
         elif k == KIND_H2:
             _h2_conn_ptr_from_int(a)[].offload_abandon_all(
@@ -1187,7 +1185,9 @@ def _deliver_offloads[
                 try:
                     var step = ch[].offload_done(job)
                     if step:
-                        _apply_step(fd, step.value(), reactor, wheel, timers, ch)
+                        _apply_step(
+                            fd, step.value(), reactor, wheel, timers, ch
+                        )
                         queued = True
                 except:
                     finished = True
@@ -1317,27 +1317,6 @@ def _offload_settled(conns: Dict[Int, Int]) raises -> Bool:
             if h2[].has_parked_streams() or h2[].state == STATE_WRITING:
                 return False
     return True
-
-
-def _close_offload_port(port: Int, mut reactor: Reactor):
-    """Wait for every job this worker sent to come back, then free the
-    port. Queued jobs are skipped once cancelled; a running one holds the
-    worker until its handler returns, since it uses the worker's handler.
-    """
-    if port == 0:
-        return
-    offload_cancel_all(port, CancelReason.SHUTDOWN)
-    var events = List[Event]()
-    while offload_outstanding(port) > 0:
-        events.clear()
-        try:
-            _ = reactor.poll(10, events)
-        except:
-            pass
-        var jobs = offload_take_done(port)
-        for i in range(len(jobs)):
-            offload_free(jobs[i])
-    offload_port_close(port)
 
 
 # ── Unified reactor loop -- single listener (single-worker) ────────────────
@@ -1574,7 +1553,7 @@ def _run_unified_loop_for_fd[
     var still_live = _drain_remaining_conns_unified(
         conns, timers, reactor, wheel
     )
-    _close_offload_port(offload_port, reactor)
+    close_offload_port(offload_port, reactor)
     store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, still_live)
 
 

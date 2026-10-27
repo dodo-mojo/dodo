@@ -81,7 +81,10 @@ from std.memory import unsafe_memcpy
 
 from .async_body import ChunkPoll, UpstreamChunkSource
 from .cancel import Cancel, CancelCell, CancelReason
+from .handler import Handler
+from .request import Request
 from .response import Response
+from ._offload_pool import OffloadCall
 from ._server.write import frame_h1_stream_head_into
 from dodo.net import NetworkError
 from dodo.net._libc import _recv, _send, _strerror, MSG_NOSIGNAL
@@ -190,6 +193,11 @@ struct StreamConn(Movable):
     lifetime (closes it on teardown) and ``relay_upstream`` drains it --
     the front never touches a file descriptor or a per-connection table.
     Empty when the front manages its own upstream via the raw-fd overload."""
+    var _offload_call: Optional[OffloadCall]
+    """A request the front handed to ``offload``, not yet queued. The
+    loop queues it once the current callback returns."""
+    var _offload_job: Int
+    """The offload pool job this connection waits on, or 0."""
 
     def __init__(out self, var client: TcpStream, id: Int = 0) raises:
         """Adopt ``client`` into a fresh per-connection handle."""
@@ -210,6 +218,8 @@ struct StreamConn(Movable):
         self._inbound_enabled = False
         self._write_syscalls = 0
         self._upstream = None
+        self._offload_call = None
+        self._offload_job = 0
 
     @always_inline
     def id(self) -> Int:
@@ -242,6 +252,37 @@ struct StreamConn(Movable):
     def is_closing(self) -> Bool:
         """True once ``request_close`` has been called."""
         return self._close_requested
+
+    # ── Offload pool (ADR-0004) ────────────────────────────────────
+
+    def offload[
+        H: Handler & Copyable
+    ](mut self, handler: H, var req: Request) raises:
+        """Run ``handler.serve(req)`` on the offload pool instead of in
+        this callback, which would stall every connection on the worker.
+
+        For a request the stack marks ``blocking`` (it reaches an
+        ``Offload``): the front calls ``conn.offload(stack, req)`` and
+        returns. The job runs on its own copy of ``stack``; this
+        connection gets no ``on_writable`` edges meanwhile, and its
+        ``StreamHandler.on_offload_done`` receives the response. A full
+        queue or ``handler_timeout_ms`` answers 503, a handler error its
+        mapped status. The job's ``req.cancel`` flips to ``PEER_CLOSED``
+        when the client leaves and to ``TIMEOUT`` at the deadline.
+
+        One request at a time per connection.
+
+        Raises:
+            Error: When this connection already has a request out.
+        """
+        if self.offload_pending():
+            raise Error("StreamConn.offload: a request is already offloaded")
+        self._offload_call = OffloadCall(handler, req^)
+
+    @always_inline
+    def offload_pending(self) -> Bool:
+        """True while an offloaded request has not come back."""
+        return Bool(self._offload_call) or self._offload_job != 0
 
     # ── Upstream attachment ────────────────────────────────────────
 
@@ -768,6 +809,17 @@ trait StreamHandler(Deinitable, Movable):
         the framework has nothing to release."""
         pass
 
+    def on_offload_done(
+        mut self, mut conn: StreamConn, var resp: Response
+    ) raises:
+        """Called with the response to a request the front passed to
+        ``conn.offload``: the handler's, its mapped error status, or 503
+        (queue full, ``handler_timeout_ms``).
+
+        Defaults to sending it and closing the connection."""
+        conn.send_response(resp)
+        conn.request_close()
+
 
 # ── Single-connection blocking driver ──────────────────────────────────────
 
@@ -788,8 +840,21 @@ def run_stream_connection[
     """
     var conn = StreamConn(client^, id)
     handler.on_open(conn)
+    _run_offload_here(handler, conn)
     conn.flush_blocking()
     while not conn.is_closing():
         handler.on_writable(conn)
+        _run_offload_here(handler, conn)
         conn.flush_blocking()
     handler.on_close(conn)
+
+
+def _run_offload_here[
+    H: StreamHandler
+](mut handler: H, mut conn: StreamConn) raises:
+    """This driver has no pool and nothing else to serve while it
+    waits, so an offloaded request runs in place."""
+    while conn._offload_call:
+        var call = conn._offload_call.take()
+        var resp = call.run_here()
+        handler.on_offload_done(conn, resp^)

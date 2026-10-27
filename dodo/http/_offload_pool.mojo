@@ -11,8 +11,8 @@ Pieces:
 - ``OffloadJob``: one request on its way through the pool. It owns the
   request, the request's cancel cell and, once the handler returns, the
   response.
-- ``OffloadPort``: one per worker. The address of the worker's handler
-  and its serve thunk, the completion list, and the wake fd.
+- ``OffloadPort``: one per worker. A copy of the worker's handler and
+  its serve thunk, the completion list, and the wake fd.
 - The pool itself: a bounded job queue and a fixed set of OS threads
   (``ThreadHandle.spawn_os``), started by the first worker that needs it
   and shared by every worker in the process.
@@ -22,15 +22,19 @@ on the completion list, whether it was delivered or dropped. A
 connection that gives up on a job (timeout, client gone) only flips its
 cancel cell and forgets it; the job stays alive until the pool hands it
 back, so a job's address is never reused while a pool thread can still
-touch it.
+touch it. A worker that stops with jobs still running closes its port
+without waiting: those jobs are freed by the pool thread that finishes
+them, and the last one frees the port.
 
-Closures can't cross threads in Mojo, so a job carries the handler's
-address and a thunk monomorphised for the handler type instead.
+Closures can't cross threads in Mojo, so a job runs the handler through
+an address and a thunk monomorphised for the handler type. The port
+keeps its own copy of the handler, so a job can outlive the worker.
 """
 
 from std.atomic import Atomic, Ordering
 from std.collections import List, Optional
 from std.ffi import _get_global, c_int, c_size_t, external_call
+from std.iter import downcast
 from std.memory import Layout, OptionalPointer, Pointer, alloc, stack_allocation
 from std.sys.info import CompilationTarget
 
@@ -39,7 +43,7 @@ from dodo.runtime._thread import ThreadHandle, _OpaquePtr, _null_ptr, num_cpus
 from dodo.runtime.pool import Pool
 
 from .cancel import CancelCell, CancelReason
-from .handler import Handler
+from .handler import CancelHandler, Handler
 from .request import Request
 from .response import Response
 
@@ -170,6 +174,37 @@ struct _Ring(Movable):
         self._set(1, count - 1)
         return v
 
+    def free(self):
+        Pointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=self.addr
+        ).unsafe_free()
+
+
+struct _Counter(Movable):
+    """One ``Int`` shared between threads, in its own heap cell so every
+    read goes to memory; the caller holds the lock that guards it."""
+
+    var addr: Int
+
+    def __init__(out self):
+        var p = alloc(Layout[Int64](count=1)).unsafe_leak()
+        p[] = Int64(0)
+        self.addr = Int(p)
+
+    def _cell(self) -> Pointer[Scalar[DType.int64], MutUntrackedOrigin]:
+        return Pointer[Scalar[DType.int64], MutUntrackedOrigin](
+            unsafe_from_address=self.addr
+        )
+
+    def get(self) -> Int:
+        return Int(Atomic[Int64].load[ordering=Ordering.ACQUIRE](self._cell()))
+
+    def set(self, v: Int):
+        Atomic[Int64].store[ordering=Ordering.RELEASE](self._cell(), Int64(v))
+
+    def free(self):
+        self._cell().unsafe_free()
+
 
 # ── Job ───────────────────────────────────────────────────────────────────
 
@@ -189,6 +224,10 @@ struct OffloadJob(Movable):
 
     var serve: def(Int, Request) raises thin -> Response
     """Runs the handler at ``handler_addr``."""
+
+    var drop_handler: def(Int) thin -> None
+    """Frees the handler at ``handler_addr`` with the job: a copy the job
+    owns (:func:`offload_submit_owned`), else nothing."""
 
     var port: Int
     """Address of the worker's ``OffloadPort``."""
@@ -213,6 +252,7 @@ struct OffloadJob(Movable):
         var req: Request,
         handler_addr: Int,
         serve: def(Int, Request) raises thin -> Response,
+        drop_handler: def(Int) thin -> None,
         port: Int,
         fd: Int,
         sid: Int,
@@ -223,6 +263,7 @@ struct OffloadJob(Movable):
         self.cell = cell^
         self.handler_addr = handler_addr
         self.serve = serve
+        self.drop_handler = drop_handler
         self.port = port
         self.fd = fd
         self.sid = sid
@@ -310,9 +351,7 @@ struct _OffloadPool(Movable):
         return job
 
 
-def _pool_cell_init() -> (
-    OptionalPointer[NoneType, UntrackedOrigin[mut=True]]
-):
+def _pool_cell_init() -> OptionalPointer[NoneType, UntrackedOrigin[mut=True]]:
     var raw = alloc(Layout[Int64](count=1)).unsafe_leak()
     raw.unsafe_write(Int64(0))
     return Pointer[NoneType, UntrackedOrigin[mut=True]](
@@ -327,9 +366,7 @@ def _pool_cell_keep(p: OptionalPointer[NoneType, UntrackedOrigin[mut=True]]):
 def _pool_slot() -> Pointer[Scalar[DType.int64], MutUntrackedOrigin]:
     """The process-wide cell holding the pool's address (0 before the
     first start)."""
-    var p = _get_global[
-        "dodo_offload_pool", _pool_cell_init, _pool_cell_keep
-    ]()
+    var p = _get_global["dodo_offload_pool", _pool_cell_init, _pool_cell_keep]()
     return Pointer[Scalar[DType.int64], MutUntrackedOrigin](
         unsafe_from_address=Int(p.value())
     )
@@ -380,8 +417,9 @@ def _pool_start(threads: Int, depth: Int) raises -> Int:
 struct OffloadPort(Movable):
     """One worker's link to the pool.
 
-    Pool threads touch only ``mu``, ``done`` and ``wake_fd``; everything
-    else belongs to the worker thread.
+    Pool threads touch only ``mu``, ``done``, ``abandoned`` and
+    ``wake_fd``; everything else belongs to the worker thread until the
+    worker closes the port.
     """
 
     var mu: Pointer[UInt8, MutUntrackedOrigin]
@@ -391,10 +429,21 @@ struct OffloadPort(Movable):
     var cap: Int
     """Jobs this worker may have out at once: everything the pool can
     hold (queue plus threads)."""
+    var abandoned: _Counter
+    """One cell: how many jobs were still out when the worker closed the
+    port, counted down as they come back (0 while the worker owns it).
+    The pool thread that brings back the last one frees the port."""
     var wake_fd: Int
     var pool: Int
     var handler_addr: Int
+    """The handler jobs run: the port's own copy, or the worker's
+    handler when its type is not ``Copyable``."""
     var serve: def(Int, Request) raises thin -> Response
+    var drop_handler: def(Int) thin -> None
+    """Frees the handler at ``handler_addr`` with the port."""
+    var owns_handler: Bool
+    """False when jobs borrow the worker's handler, so the worker must
+    wait for every job before it returns."""
     var live: List[Int]
     """Jobs submitted and not yet taken back (worker only)."""
 
@@ -403,69 +452,290 @@ struct OffloadPort(Movable):
         pool: Int,
         handler_addr: Int,
         serve: def(Int, Request) raises thin -> Response,
+        drop_handler: def(Int) thin -> None,
+        owns_handler: Bool,
         wake_fd: Int,
     ):
         var p = Pool[_OffloadPool].get_ptr(pool)
         self.cap = p[].queue.cap + p[].threads
         self.mu = _mutex_new()
         self.done = _Ring(self.cap)
+        self.abandoned = _Counter()
         self.wake_fd = wake_fd
         self.pool = pool
         self.handler_addr = handler_addr
         self.serve = serve
+        self.drop_handler = drop_handler
+        self.owns_handler = owns_handler
         self.live = List[Int]()
 
 
+def _port_free(port_addr: Int):
+    """Free a port, its handler copy and its locks."""
+    var port = Pool[OffloadPort].get_ptr(port_addr)
+    port[].drop_handler(port[].handler_addr)
+    port[].done.free()
+    port[].abandoned.free()
+    _ = external_call["pthread_mutex_destroy", Int32](
+        port[].mu.unsafe_bitcast[Int8]()
+    )
+    port[].mu.unsafe_free()
+    Pool[OffloadPort].free(port_addr)
+
+
 def _port_complete(port_addr: Int, job: Int):
-    """Hand ``job`` back to its worker (pool thread side). Writes the
-    wake fd only when the list was empty: the worker takes the whole
-    list on each wake, so one write per take is enough."""
+    """Hand ``job`` back to its worker (pool thread side).
+
+    Writes the wake fd only when the list was empty: the worker takes
+    the whole list on each wake, so one write per take is enough. The
+    write happens under the lock, so it never lands after the worker
+    closed the port and its wake fd.
+
+    On a port the worker already closed nobody waits for the job: it is
+    freed here, and the last one back frees the port.
+    """
     var port = Pool[OffloadPort].get_ptr(port_addr)
     _lock(port[].mu)
+    var left = port[].abandoned.get()
+    if left > 0:
+        port[].abandoned.set(left - 1)
+        _unlock(port[].mu)
+        offload_free(job)
+        if left == 1:
+            _port_free(port_addr)
+        return
     var was_empty = port[].done.count() == 0
     _ = port[].done.push(job)
-    _unlock(port[].mu)
     if was_empty:
         _wake(port[].wake_fd)
+    _unlock(port[].mu)
 
 
-def _offload_serve_thunk[H: Handler](addr: Int, req: Request) raises -> Response:
+def _offload_serve_thunk[
+    H: Handler
+](addr: Int, req: Request) raises -> Response:
     return Pool[H].get_ptr(addr)[].serve(req).lower()
+
+
+def _drop_handler_copy[H: Handler](addr: Int):
+    Pool[H].free(addr)
+
+
+def _drop_cancel_handler_copy[CH: CancelHandler](addr: Int):
+    Pool[CH].free(addr)
+
+
+def _keep_handler(addr: Int):
+    """The worker owns the handler; the port leaves it alone."""
+    pass
+
+
+def _offload_cancel_serve_thunk[
+    CH: CancelHandler
+](addr: Int, req: Request) raises -> Response:
+    return Pool[CH].get_ptr(addr)[].serve(req, req.cancel)
+
+
+def _open_port(
+    handler_addr: Int,
+    serve: def(Int, Request) raises thin -> Response,
+    drop_handler: def(Int) thin -> None,
+    owns_handler: Bool,
+    wake_fd: Int,
+    threads: Int,
+    depth: Int,
+) raises -> Int:
+    var pool = _pool_start(threads, depth)
+    return Pool[OffloadPort].alloc_move(
+        OffloadPort(
+            pool, handler_addr, serve, drop_handler, owns_handler, wake_fd
+        )
+    )
 
 
 def offload_port_open[
     H: Handler
-](
-    ref handler: H, wake_fd: Int, threads: Int, depth: Int
-) raises -> Int:
+](ref handler: H, wake_fd: Int, threads: Int, depth: Int) raises -> Int:
     """Open a port for a worker serving ``handler``, starting the pool if
-    this is its first user. Returns the port's address."""
-    var pool = _pool_start(threads, depth)
-    var handler_addr = Int(Pointer[H, _](to=handler))
-    return Pool[OffloadPort].alloc_move(
-        OffloadPort(pool, handler_addr, _offload_serve_thunk[H], wake_fd)
+    this is its first user. Returns the port's address.
+
+    A ``Copyable`` handler is copied into the port, so a job still
+    running when the worker stops keeps a live handler after the worker
+    returns. Any other handler is borrowed, and the worker waits for its
+    jobs before it returns."""
+    comptime if conforms_to(H, Copyable):
+        comptime C = downcast[H, Copyable & Handler]
+        var copy = rebind[C](handler).copy()
+        return _open_port(
+            Pool[C].alloc_move(copy^),
+            _offload_serve_thunk[C],
+            _drop_handler_copy[C],
+            True,
+            wake_fd,
+            threads,
+            depth,
+        )
+    else:
+        return _open_port(
+            Int(Pointer[H, _](to=handler)),
+            _offload_serve_thunk[H],
+            _keep_handler,
+            False,
+            wake_fd,
+            threads,
+            depth,
+        )
+
+
+def _no_serve(addr: Int, req: Request) raises -> Response:
+    raise Error("offload: this port has no handler of its own")
+
+
+def offload_port_open_bare(
+    wake_fd: Int, threads: Int, depth: Int
+) raises -> Int:
+    """Open a port whose jobs each bring their own handler copy
+    (:func:`offload_submit_call`), for the streaming loop."""
+    return _open_port(
+        0, _no_serve, _keep_handler, True, wake_fd, threads, depth
     )
+
+
+def offload_port_open_cancel[
+    CH: CancelHandler
+](ref handler: CH, wake_fd: Int, threads: Int, depth: Int) raises -> Int:
+    """:func:`offload_port_open` for a ``CancelHandler``. Jobs call
+    ``serve(req, req.cancel)``, so the handler sees the job's cancel
+    cell."""
+    comptime if conforms_to(CH, Copyable):
+        comptime C = downcast[CH, Copyable & CancelHandler]
+        var copy = rebind[C](handler).copy()
+        return _open_port(
+            Pool[C].alloc_move(copy^),
+            _offload_cancel_serve_thunk[C],
+            _drop_cancel_handler_copy[C],
+            True,
+            wake_fd,
+            threads,
+            depth,
+        )
+    else:
+        return _open_port(
+            Int(Pointer[CH, _](to=handler)),
+            _offload_cancel_serve_thunk[CH],
+            _keep_handler,
+            False,
+            wake_fd,
+            threads,
+            depth,
+        )
 
 
 def offload_submit(
     port_addr: Int, var req: Request, fd: Int, sid: Int
 ) raises -> Int:
-    """Queue ``req`` for the pool. Returns the job's address, or 0 when
-    the queue is full (the caller answers with
-    :func:`unavailable_response`)."""
+    """Queue ``req`` for the pool, to run on the port's handler. Returns
+    the job's address, or 0 when the queue is full (the caller answers
+    with :func:`unavailable_response`)."""
+    var port = Pool[OffloadPort].get_ptr(port_addr)
+    return _submit(
+        port_addr,
+        OffloadJob(
+            req^,
+            port[].handler_addr,
+            port[].serve,
+            _keep_handler,
+            port_addr,
+            fd,
+            sid,
+        ),
+    )
+
+
+struct OffloadCall(Movable):
+    """A request and its own copy of the handler to run it on, not yet
+    queued. A streaming front builds one with ``StreamConn.offload``; the
+    loop queues it with :func:`offload_submit_call`, or runs it in place
+    where there is no pool. Dropping it frees the handler copy."""
+
+    var req: Request
+    var handler_addr: Int
+    var serve: def(Int, Request) raises thin -> Response
+    var drop_handler: def(Int) thin -> None
+
+    def __init__[
+        H: Handler & Copyable
+    ](out self, handler: H, var req: Request) raises:
+        var copy = handler.copy()
+        self.handler_addr = Pool[H].alloc_move(copy^)
+        self.serve = _offload_serve_thunk[H]
+        self.drop_handler = _drop_handler_copy[H]
+        self.req = req^
+
+    def __deinit__(deinit self):
+        self.drop_handler(self.handler_addr)
+
+    def into_job(deinit self, port_addr: Int, fd: Int) raises -> OffloadJob:
+        """The job that runs this call; it owns the handler copy."""
+        return OffloadJob(
+            self.req^,
+            self.handler_addr,
+            self.serve,
+            self.drop_handler,
+            port_addr,
+            fd,
+            0,
+        )
+
+    def run_here(mut self) -> Response:
+        """Run the handler on this thread. A handler error becomes its
+        mapped status, as on the pool."""
+        var request_id = self.req.headers.get("x-request-id")
+        try:
+            return self.serve(self.handler_addr, self.req)
+        except e:
+            log_handler_error(request_id, String(e))
+            var mapped = map_handler_error(String(e), self.req.expose_errors)
+            return Response(status=mapped.status, reason=mapped.reason)
+
+
+def offload_submit_call(
+    port_addr: Int, var call: OffloadCall, fd: Int
+) raises -> Int:
+    """Queue ``call`` for the pool; the job takes over its handler copy.
+    Returns the job's address, or 0 when the queue is full (the copy is
+    then freed here)."""
+    var addr = call.handler_addr
+    var drop = call.drop_handler
+    var job = _submit(port_addr, call^.into_job(port_addr, fd))
+    if job == 0:
+        drop(addr)
+    return job
+
+
+def offload_job_response(job: Int) -> Response:
+    """The response job ``job`` came back with: the handler's, its error
+    status, or 503 when it never ran."""
+    var jp = offload_job(job)
+    if jp[].resp:
+        return jp[].resp.take()
+    if jp[].err_status != 0:
+        return Response(status=jp[].err_status, reason=jp[].err_reason)
+    return unavailable_response()
+
+
+def _submit(port_addr: Int, var job: OffloadJob) raises -> Int:
+    """Queue ``job``; 0 (and nothing queued) when this worker or the
+    pool is full. A job refused here does not free its handler."""
     var port = Pool[OffloadPort].get_ptr(port_addr)
     if len(port[].live) >= port[].cap:
         return 0
-    var job = Pool[OffloadJob].alloc_move(
-        OffloadJob(
-            req^, port[].handler_addr, port[].serve, port_addr, fd, sid
-        )
-    )
-    if not Pool[_OffloadPool].get_ptr(port[].pool)[].push(job):
-        Pool[OffloadJob].free(job)
+    var addr = Pool[OffloadJob].alloc_move(job^)
+    if not Pool[_OffloadPool].get_ptr(port[].pool)[].push(addr):
+        Pool[OffloadJob].free(addr)
         return 0
-    port[].live.append(job)
-    return job
+    port[].live.append(addr)
+    return addr
 
 
 def offload_take_done(port_addr: Int) -> List[Int]:
@@ -491,7 +761,9 @@ def _forget(mut live: List[Int], job: Int):
 
 
 def offload_free(job: Int):
-    """Free a job the worker took back."""
+    """Free a job the worker took back, and the handler copy it owns."""
+    var jp = offload_job(job)
+    jp[].drop_handler(jp[].handler_addr)
     Pool[OffloadJob].free(job)
 
 
@@ -510,8 +782,31 @@ def offload_cancel_all(port_addr: Int, reason: Int):
         offload_cancel(port[].live[i], reason)
 
 
+def offload_port_borrows_handler(port_addr: Int) -> Bool:
+    """Whether jobs on this port run the worker's own handler, so the
+    worker has to wait for them before it returns."""
+    if port_addr == 0:
+        return False
+    return not Pool[OffloadPort].get_ptr(port_addr)[].owns_handler
+
+
 def offload_port_close(port_addr: Int):
-    """Free a port with no jobs left out."""
+    """Close a worker's port. Jobs already back are freed; jobs still on
+    the pool are left to it, and the last one back frees the port. The
+    worker flips their cancel cells first (:func:`offload_cancel_all`)
+    and must not touch the port afterwards."""
     if port_addr == 0:
         return
-    Pool[OffloadPort].free(port_addr)
+    var port = Pool[OffloadPort].get_ptr(port_addr)
+    _lock(port[].mu)
+    var back = List[Int]()
+    while port[].done.count() > 0:
+        back.append(port[].done.pop())
+    var out = len(port[].live) - len(back)
+    if out > 0:
+        port[].abandoned.set(out)
+    _unlock(port[].mu)
+    for i in range(len(back)):
+        offload_free(back[i])
+    if out == 0:
+        _port_free(port_addr)

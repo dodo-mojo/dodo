@@ -27,10 +27,17 @@ Behaviour, set by ``ServerConfig``:
 
 The handler runs on a pool thread while other requests run on the
 workers, so its state must be safe to read from several threads at
-once. Middleware around it runs on the pool thread too.
+once. Middleware around it runs on the pool thread too. Each worker's
+port keeps its own copy of the server's handler, so a handler still
+running when the server stops finishes on that copy and ``serve``
+returns after ``shutdown_timeout_ms`` without waiting for it. A
+top-level handler that is not ``Copyable`` can't be copied: then
+``serve`` waits for it.
 
-Served by the unified loop (the default for ``serve``), cleartext and
-TLS. Other loops (the opt-in io_uring buffer ring) run it inline.
+Every server loop runs it on the pool: the unified HTTP/1.1 and HTTP/2
+loop, cleartext and TLS; ``serve_cancellable`` (wrap the stack in
+``WithCancel``); the HTTP/1.1-only multi-worker loop; and the opt-in
+io_uring buffer ring.
 """
 
 from .handler import Handler
