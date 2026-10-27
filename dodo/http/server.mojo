@@ -1065,7 +1065,6 @@ from ._server.responses import (
 from ._server.write import (
     _append_str,
     _ascii_lower,
-    _status_reason,
     _write_response,
     _write_response_buffered,
 )

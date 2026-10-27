@@ -243,7 +243,7 @@ def _h2_response_to_http(var h2: Http2Response) raises -> Response:
     :meth:`Http2ClientConnection.take_response`; here we just
     populate the regular headers + body. ``reason`` is left
     empty (HTTP/2 has no reason phrase per RFC 9113 §8.1.2.4);
-    the existing :func:`dodo.http._status_reason` helper fills
+    the existing :func:`dodo.http.status_reason.status_reason` helper fills
     it on serialise.
     """
     # Mojo's borrow checker rejects "move ``h2.body`` out + read

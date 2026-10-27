@@ -64,7 +64,7 @@ from dodo.http.server import (
 )
 from dodo.http._server.config import MIN_BODY_RATE_GRACE_MS
 from dodo.http._server.parse import parse_error_status
-from dodo.http._server.write import _status_reason
+from dodo.http.status_reason import status_reason
 from dodo.net import SocketAddr
 from dodo.net._libc import _recv, _send, _shutdown, MSG_NOSIGNAL, SHUT_WR
 from dodo.tcp import TcpStream
@@ -2101,7 +2101,7 @@ struct ConnHandle(Movable):
         """Answer a request the parser refused, with the status its
         message names (400 unless it is a 413, 414, 417, 431, 501 or 505)."""
         var status = parse_error_status(message)
-        self._queue_error(status, _status_reason(status))
+        self._queue_error(status, status_reason(status))
 
     def _queue_error(mut self, status: Int, reason: String) -> None:
         """Build a minimal error response into ``write_buf`` and mark close.

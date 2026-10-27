@@ -132,7 +132,7 @@ struct ResponseImpl[B: Body = InlineBody](Movable):
         Args:
             status: New status code (default 200).
             reason: New reason phrase (default empty —
-                    ``_status_reason`` will fill from the status
+                    ``status_reason`` will fill from the status
                     code at serialise time).
         """
         self.status = status

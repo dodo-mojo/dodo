@@ -23,10 +23,8 @@ from std.memory import unsafe_memcpy, Pointer
 
 from dodo.http.response import Response
 from dodo.http._scan import parse_content_length
-from dodo.http.server import (
-    _status_reason,
-    _append_str,
-)
+from dodo.http.server import _append_str
+from dodo.http.status_reason import status_reason
 from dodo.runtime import DateCache
 
 from .keepalive_scan import (
@@ -119,12 +117,12 @@ def _wire_reason(resp: Response, status: Int) -> String:
     """
     var reason = resp.reason
     if reason.byte_length() == 0 or status != resp.status:
-        return _status_reason(status)
+        return status_reason(status)
     var p = reason.unsafe_ptr()
     for i in range(reason.byte_length()):
         var c = p[unsafe_offset=i]
         if (c < 32 and c != 9) or c == 127:
-            return _status_reason(status)
+            return status_reason(status)
     return reason
 
 
