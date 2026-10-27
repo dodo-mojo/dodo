@@ -16,6 +16,7 @@ from std.ffi import c_int, c_uint, external_call
 from json import dumps, Value as JsonValue
 
 from ..runtime._libc_time import libc_nanosleep_ms, monotonic_now_ms
+from ..runtime.reuseport import bind_reuseport_if_free
 
 from std.collections import Optional
 from std.sys import stderr
@@ -165,6 +166,29 @@ struct HttpServer(Movable):
         # when an HTTPS context was bound; no-op otherwise.
         _ = self._tls_ctx^
 
+    def _hand_over_listeners(mut self) -> List[Int]:
+        """Give up every bound listener as bare fds, primary first, for
+        ``Scheduler.start`` to serve.
+
+        Worker 0 keeps serving them while the other workers bind their
+        own ``SO_REUSEPORT`` listeners next to them, so the port never
+        goes without a listener and connections already waiting in the
+        backlog are still answered. The server no longer closes them;
+        :meth:`local_addr` and :meth:`local_addrs` keep answering.
+
+        Returns an empty list when they were already handed over or
+        closed; the scheduler then binds every listener itself.
+        """
+        var fds = List[Int]()
+        var primary_fd = Int(self._listener.into_raw_fd())
+        if primary_fd < 0:
+            return fds^
+        fds.append(primary_fd)
+        for i in range(len(self._extra_listener_fds)):
+            fds.append(self._extra_listener_fds[i])
+        self._extra_listener_fds.clear()
+        return fds^
+
     def _close_extras(mut self):
         """Close every fd in :attr:`_extra_listener_fds` via
         libc ``close(2)``. Safe to call from ``__deinit__``; idempotent
@@ -195,7 +219,7 @@ struct HttpServer(Movable):
             AddressInUse: If the port is already bound.
             NetworkError: For any other OS error.
         """
-        var listener = TcpListener.bind(addr)
+        var listener = bind_reuseport_if_free(addr)
         return HttpServer(listener^, config^)
 
     @staticmethod
@@ -228,9 +252,9 @@ struct HttpServer(Movable):
         num_workers=M)`` on a multi-address server gives N addresses
         x M workers, where each pairing owns its own
         ``SO_REUSEPORT`` listener (N*M in total, bound serially on
-        the scheduler thread). The listeners created here are closed
-        first, because ``SO_REUSEPORT`` only composes with other
-        ``SO_REUSEPORT`` sockets and these are plain binds.
+        the scheduler thread). The listeners created here carry
+        ``SO_REUSEPORT`` and go to worker 0, so no address is ever
+        left without a listener.
 
         Still single-listener: ``serve_streaming``, which raises when
         extras are present rather than leaving an address unserved.
@@ -258,26 +282,22 @@ struct HttpServer(Movable):
         srv.serve(handler)
         ```
         """
-        from dodo.net.socket import INVALID_FD
-
         if len(addrs) == 0:
             raise Error("HttpServer.bind: addrs must be non-empty")
-        var primary = TcpListener.bind(addrs[0])
-        # Bind extras up-front; if any fails, the partially-bound
-        # ``TcpListener`` instances we already moved to ``primary``
-        # / consumed in this loop close themselves via __deinit__.
+        var primary = bind_reuseport_if_free(addrs[0])
+        # Extras are kept as bare fds (see ``_extra_listener_fds``), so
+        # a failed bind has to close the ones already bound itself.
         var extra_fds = List[Int]()
         var extra_addrs = List[SocketAddr]()
-        for i in range(1, len(addrs)):
-            var l = TcpListener.bind(addrs[i])
-            extra_fds.append(Int(l._socket.fd))
-            extra_addrs.append(l._socket.local_addr())
-            # Detach the fd from ``l`` so its __deinit__ doesn't close
-            # what HttpServer now owns. RawSocket lacks an explicit
-            # ``release_fd()``; setting ``fd = INVALID_FD`` is the
-            # equivalent contract used elsewhere (e.g. the move
-            # constructor) so the destructor sees "already closed".
-            l._socket.fd = INVALID_FD
+        try:
+            for i in range(1, len(addrs)):
+                var l = bind_reuseport_if_free(addrs[i])
+                extra_addrs.append(l.local_addr())
+                extra_fds.append(Int(l.into_raw_fd()))
+        except e:
+            for i in range(len(extra_fds)):
+                _ = external_call["close", Int32](Int32(extra_fds[i]))
+            raise e^
         var srv = HttpServer(primary^, config^)
         srv._extra_listener_fds = extra_fds^
         srv._extra_local_addrs = extra_addrs^
@@ -332,7 +352,7 @@ struct HttpServer(Movable):
             NetworkError: For any other OS error.
             Error: If the cert / key fails to load.
         """
-        var listener = TcpListener.bind(addr)
+        var listener = bind_reuseport_if_free(addr)
         var ctx = ServerCtx.new(cert_file, key_file)
         if len(alpn) > 0:
             var wire = List[UInt8]()
@@ -366,7 +386,7 @@ struct HttpServer(Movable):
         of :meth:`bind_tls` reached none of these. A misconfiguration
         raises here, at bind time.
         """
-        var listener = TcpListener.bind(addr)
+        var listener = bind_reuseport_if_free(addr)
         var certs = tls.sni_certs.copy()
         certs.append(TlsSniCert("", tls.cert_file, tls.key_file))
         var ctx = TlsAcceptor(tls^).into_ctx()
@@ -735,7 +755,6 @@ struct HttpServer(Movable):
         from .frontend import StreamFrontend
 
         var addr = self._listener.local_addr()
-        self._listener.close()
         self._stopping = False
 
         var frontend = StreamFrontend[H](
@@ -748,6 +767,7 @@ struct HttpServer(Movable):
             frontend=frontend^,
             num_workers=num_workers,
             pin_cores=pin_cores,
+            listener_fds=self._hand_over_listeners(),
         )
         while not self._stopping and scheduler.is_running():
             _ = libc_nanosleep_ms(50)
@@ -807,14 +827,7 @@ struct HttpServer(Movable):
         from .frontend import HttpFrontend
 
         var addr = self._listener.local_addr()
-        # N x M: each worker binds its own SO_REUSEPORT listener on
-        # every address, so every listener bound by a multi-address bind has to be
-        # closed first -- SO_REUSEPORT only composes with other
-        # SO_REUSEPORT sockets, and the list-bind originals are plain
-        # binds holding the address.
         var extra_addrs = self._extra_local_addrs.copy()
-        self._listener.close()
-        self._close_extras()
 
         # Before the config is handed to the worker threads.
         self._resolve_max_connections(num_workers)
@@ -834,6 +847,7 @@ struct HttpServer(Movable):
             num_workers=num_workers,
             pin_cores=pin_cores,
             extra_addrs=extra_addrs,
+            listener_fds=self._hand_over_listeners(),
         )
 
         # Block until the caller flips _stopping via close() or until

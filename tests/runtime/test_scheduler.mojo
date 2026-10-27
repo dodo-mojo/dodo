@@ -306,6 +306,107 @@ def test_start_raises_when_a_worker_listener_cannot_bind() raises:
     assert_true(raised, "start ran with workers missing their listeners")
 
 
+# ── Handed-over listeners ──────────────────────────────────────────────────
+
+
+def _bound_reuseport_fd() raises -> Tuple[Int, SocketAddr]:
+    """A listening SO_REUSEPORT socket released as a bare fd, the way
+    ``HttpServer`` hands its bound listener to the scheduler."""
+    from dodo.runtime.reuseport import bind_reuseport
+
+    var listener = bind_reuseport(SocketAddr.localhost(0))
+    var addr = listener.local_addr()
+    var fd = Int(listener.into_raw_fd())
+    return (fd, addr)
+
+
+def test_worker_0_serves_the_handed_over_listener() raises:
+    from dodo.runtime.scheduler import _heap_listener_fd
+
+    var bound = _bound_reuseport_fd()
+    var fds = List[Int]()
+    fds.append(bound[0])
+    var s = Scheduler[_NopFrontend].start(
+        addr=bound[1],
+        frontend=_NopFrontend(0),
+        num_workers=2,
+        pin_cores=False,
+        listener_fds=fds,
+    )
+    var worker_0_fd = _heap_listener_fd(s._per_worker_listener_addrs[0])
+    var listeners = len(s._per_worker_listener_addrs)
+    s.shutdown()
+    assert_equal(worker_0_fd, bound[0])
+    assert_equal(listeners, 2)
+    assert_true(not _fd_open(bound[0]), "shutdown left it open")
+
+
+def test_handed_over_listener_becomes_the_shared_listener() raises:
+    from std.os import setenv, unsetenv
+
+    _ = setenv("DODO_REUSEPORT_WORKERS", "0")
+    var bound = _bound_reuseport_fd()
+    var fds = List[Int]()
+    fds.append(bound[0])
+    var s = Scheduler[_NopFrontend].start(
+        addr=bound[1],
+        frontend=_NopFrontend(0),
+        num_workers=2,
+        pin_cores=False,
+        listener_fds=fds,
+    )
+    var shared_fd = s._shared_listener_fd
+    s.shutdown()
+    _ = unsetenv("DODO_REUSEPORT_WORKERS")
+    assert_equal(shared_fd, bound[0])
+    assert_true(not _fd_open(bound[0]), "shutdown left it open")
+
+
+def test_handed_over_listener_is_closed_when_start_raises() raises:
+    var bound = _bound_reuseport_fd()
+    var fds = List[Int]()
+    fds.append(bound[0])
+    var raised = False
+    try:
+        var s = Scheduler[_NopFrontend].start(
+            addr=bound[1],
+            frontend=_NopFrontend(0),
+            num_workers=0,
+            pin_cores=False,
+            listener_fds=fds,
+        )
+        s.shutdown()
+    except:
+        raised = True
+    assert_true(raised, "num_workers=0 must raise")
+    assert_true(not _fd_open(bound[0]), "the handed-over fd leaked")
+
+
+def test_listener_fds_must_cover_every_address() raises:
+    """One fd for two addresses is a caller bug: it raises, and the fd it
+    did get is still closed."""
+    var bound = _bound_reuseport_fd()
+    var fds = List[Int]()
+    fds.append(bound[0])
+    var extras = List[SocketAddr]()
+    extras.append(SocketAddr.localhost(0))
+    var raised = False
+    try:
+        var s = Scheduler[_NopFrontend].start(
+            addr=bound[1],
+            frontend=_NopFrontend(0),
+            num_workers=2,
+            pin_cores=False,
+            extra_addrs=extras,
+            listener_fds=fds,
+        )
+        s.shutdown()
+    except:
+        raised = True
+    assert_true(raised, "a short listener_fds list must raise")
+    assert_true(not _fd_open(bound[0]), "the handed-over fd leaked")
+
+
 # ── CONC-03: drain must not free the stop flag under a detached worker ──────
 
 
