@@ -31,3 +31,29 @@
 - [ ] Model workers (ADR-0005, proposed): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`. Accept the ADR first.
 - [ ] Outgoing calls on the event loop (ADR-0006, proposed): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer. Accept the ADR first.
 - [ ] Dedupe `_monotonic_ms`: four copies (`client_pool`, `tls_pool`, `keepalive_scan`, `runtime._libc_time`), and the client-pool ones allocate on every call.
+
+## Developer experience and AI agents (Phase 2 and later)
+
+Agents know little Mojo, and it changes fast, so these come first:
+
+- [ ] `dodo docs`: pull agent-friendly Markdown docs for the exact versions in use into the project (`.dodo/docs/mojo-1.2/`, `.dodo/docs/dodo-0.1/`). `dodo docs pull` takes the versions from the project; `dodo docs pull mojo@1.2 dodo@0.1` asks for others. The generated AGENTS.md points agents there. `dodo docs search "<query>"` searches them, with `--json`.
+- [ ] Mojo 1.x cheat sheet for agents in those docs: what changed (no `fn`, explicit `raises`, `comptime`, `std.` paths) with before and after examples.
+- [ ] `dodo fix`: rewrite outdated Mojo syntax automatically, like `cargo fix`.
+- [ ] Compiler error explainer: wrap `mojo build` and turn common errors into a plain cause and a fix, as text or JSON.
+- [ ] Claude Code plugin with skills ("add a route", "profile this", "debug a 500"), next to `dodo mcp`.
+
+Faster feedback:
+
+- [ ] `dodo verify`: build, tests, lints and a benchmark comparison in one command, with one JSON verdict.
+- [ ] `dodo why <request-id>`: every error response carries a request id; the command explains what happened to it (route, middleware, timings, error).
+- [ ] Record and replay: capture real requests in dev and replay them as snapshot tests (`dodo record`).
+- [ ] Hot reload that keeps models loaded: swap code on save while model workers (ADR-0005) keep their weights.
+
+Convenience:
+
+- [ ] Typed TypeScript and Python clients generated from the routes at compile time.
+- [ ] Fake models and GPUs: deterministic stand-ins so tests and CI run without a GPU or API keys.
+- [ ] Dev dashboard at `/_dodo` (dev only): routes, recent requests, traces, a "try it" box.
+- [ ] Starters: `dodo new --template chat|rag|vision|agent`.
+- [ ] One typed config file, overridden by environment variables, checked at startup; `dodo config --json` prints it.
+- [ ] `dodo port fastapi`: turn a FastAPI app's routes into a dodo skeleton.

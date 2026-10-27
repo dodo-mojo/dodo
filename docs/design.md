@@ -234,6 +234,7 @@ All profiling output is saved as files plus a JSON summary, so an agent can read
 | Piece | Details |
 |---|---|
 | `dodo` CLI | `new`, `dev` (rebuild and restart on save; the listening socket is kept open so no requests drop), `run`, `test`, `fuzz`, `bench`, `profile`, `routes`, `doctor` (checks toolchain, WSL, GPU, ports), `docs`. Every command supports `--json` and has stable exit codes. No interactive prompts without a TTY. |
+| Version-pinned docs | `dodo docs pull` fetches agent-friendly Markdown docs for the Mojo and dodo versions the project uses into `.dodo/docs/` (or the versions asked for: `dodo docs pull mojo@1.2 dodo@0.1`), with a Mojo 1.x cheat sheet of what changed. AGENTS.md points there, and `dodo docs search` searches them. Agents know little Mojo, so this comes first. |
 | AGENTS.md | In the dodo repo and generated in every new project: layout, commands, conventions, how to test, what not to touch. |
 | MCP server | `dodo mcp` exposes tools: `routes.list`, `request.send`, `test.run`, `logs.tail`, `profile.run`, `bench.run`, `docs.search`, `scaffold.add_route`. Agents get the same powers as the CLI, with structured results. |
 | Docs | Every page is Markdown in the repo, published with `llms.txt` and `llms-full.txt`. Every code example is compiled in CI, so docs can't drift. |
