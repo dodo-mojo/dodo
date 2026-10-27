@@ -39,7 +39,7 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 
 - Commits: `type: one line`, with no em dashes, no body, and **no Claude co-author trailer**. Only commit when asked.
 - All doc changes from one session go in one `docs:` commit.
-- Every feature or fix gets a branch from `dev` (`type/short-name`) and a PR into `dev`, as in `CONTRIBUTING.md`. Never delete branches, even after merge.
+- Every feature or fix gets a branch from `dev` (`type/short-name`) and a PR into `dev`, as in `CONTRIBUTING.md`. Small doc edits go straight to `dev`. Never delete branches, even after merge.
 - Ask the human one decision at a time, with a recommendation.
 - Offloaded blocking work (`block_in_pool`, `resolve_async`) uses `ThreadHandle.spawn_os`, never a pool task: joining a pool task from a reactor worker can run the task on that worker.
 - Simple, readable code over clever code. No dense one-liners.

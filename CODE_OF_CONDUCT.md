@@ -4,4 +4,4 @@ dodo follows the [Contributor Covenant, version 2.1](https://www.contributor-cov
 
 In short: be kind, assume good intent, and keep criticism about the code. Harassment of any kind is not tolerated.
 
-Report a problem privately to CONTACT_EMAIL. Reports are kept confidential.
+Report a problem privately to magicalfizz@gmail.com. Reports are kept confidential.
