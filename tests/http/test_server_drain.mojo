@@ -20,6 +20,7 @@ Covers:
   still in flight.
 """
 
+from std.atomic import Atomic, Ordering
 from std.memory import Pointer
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 from std.time import perf_counter_ns
@@ -137,12 +138,31 @@ def _serve_big_thread(
 
 
 struct _SlowReader(Movable):
+    """Reads slowly until ``fast`` is set, then as fast as it can.
+
+    Slow reading keeps the response in flight until drain starts. After
+    that the reader must not set the pace: on a slow CI runner a 5 ms
+    sleep can take 15 ms, and the 16 MB body then needs longer than the
+    drain timeout to arrive."""
+
     var conn: TcpStream
     var total: Int
+    var fast: Int64
 
     def __init__(out self, var conn: TcpStream):
         self.conn = conn^
         self.total = 0
+        self.fast = 0
+
+
+def _read_fast_flag(r: Pointer[_SlowReader, MutUntrackedOrigin]) -> Bool:
+    var flag = Pointer(to=r[].fast).unsafe_bitcast[Scalar[DType.int64]]()
+    return Atomic[Int64].load[ordering=Ordering.ACQUIRE](flag) != 0
+
+
+def _set_fast_flag(mut r: _SlowReader):
+    var flag = Pointer(to=r.fast).unsafe_bitcast[Scalar[DType.int64]]()
+    Atomic[Int64].store[ordering=Ordering.RELEASE](flag, 1)
 
 
 def _slow_read_thread(
@@ -159,7 +179,8 @@ def _slow_read_thread(
         if n <= 0:
             break
         r[].total += n
-        _ = libc_nanosleep_ms(5)  # a slow client, not a synchronisation
+        if not _read_fast_flag(r):
+            _ = libc_nanosleep_ms(5)  # a slow client, not a synchronisation
     return _null_ptr()
 
 
@@ -190,6 +211,8 @@ def test_drain_lets_an_in_flight_response_finish() raises:
     var started = rd.total > 0
     _ = libc_nanosleep_ms(100)
 
+    var before_drain = rd.total
+    _set_fast_flag(rd)
     var t0 = perf_counter_ns()
     _ = srv.drain(timeout_ms=3000)
     var drain_ms = Int((perf_counter_ns() - t0) // 1_000_000)
@@ -199,6 +222,10 @@ def test_drain_lets_an_in_flight_response_finish() raises:
     var total = rd.total
     rd.conn.close()
     assert_true(started, "no response bytes reached the client before drain")
+    assert_true(
+        before_drain < _BIG_BODY,
+        "the response was complete before drain started",
+    )
     assert_true(
         total >= _BIG_BODY,
         "the in-flight response was cut after " + String(total) + " bytes",
