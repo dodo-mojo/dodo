@@ -1,6 +1,6 @@
 # ADR-0004: Offload pool for blocking handlers
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-27
 
 ## Context
@@ -11,7 +11,7 @@ Each worker runs one event loop, and handlers run inline on it. A handler that b
 
 Mojo constraints: capturing closures can't be passed to another thread today, and there is no async/await. Work handed to a pool thread must be a function with no captures plus plain data, or a handler struct.
 
-## Decision (proposed)
+## Decision
 
 1. **API: wrap a handler struct.** `Offload(handler)` marks a handler as blocking. The handler struct carries its own state (a loaded model, a DB pool), so this lines up with typed state injection in the planned `App` API (`app.post("/chat", chat, state=..., blocking=True)` becomes `Offload` underneath). Router routes can take it like any other handler.
 2. **Mechanism.**
@@ -19,6 +19,7 @@ Mojo constraints: capturing closures can't be passed to another thread today, an
    - When an offloaded handler is reached, the worker queues the request and the handler's address, and parks the connection: it stops reading from it and arms a timer for `handler_timeout_ms`.
    - A pool thread runs `handler.serve(req)`, puts the response on the worker's completion queue, and writes the worker's wake eventfd (the reactor already has one).
    - The worker drains completions on wake-up and writes each response as usual.
+   - The pool's job queue is bounded by `ServerConfig.offload_queue_depth` (default 1024). When it is full, the request is not queued: the client gets `503 Service Unavailable` with `Retry-After: 1` at once, and the connection or stream goes on as after any other response.
 3. **Timeouts.** If `handler_timeout_ms` passes first, the client gets `503 Service Unavailable` and the request's `Cancel` is set to `TIMEOUT`, so a handler that checks it can stop early. The late result is dropped. Inline handlers still can't be interrupted; the docs say so.
 4. **Client gone.** If the client closes while the job runs, `Cancel` is set to `PEER_CLOSED` and the result is dropped.
 5. **Scope of v1.** HTTP/1.1 and HTTP/2, cleartext and TLS, on the unified loop (the default for `serve`).
@@ -30,6 +31,7 @@ Mojo constraints: capturing closures can't be passed to another thread today, an
 ## Consequences
 
 - One slow route no longer slows the whole worker, and `handler_timeout_ms` works for offloaded routes.
+- A burst of blocking requests can't grow memory without limit: past `offload_queue_depth`, clients are told to retry instead of waiting in a queue.
 - On HTTP/2, one slow stream no longer slows the other streams on its connection.
 - A pool thread costs memory and a context switch per offloaded request, so fast handlers should stay inline. `dodo.prof` will flag inline handlers that hold the loop too long.
 - Handlers run on two kinds of threads, so a handler's state must be safe to read from several threads at once.
