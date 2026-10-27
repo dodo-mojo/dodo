@@ -13,9 +13,12 @@ from std.ffi import external_call
 from std.os import remove
 from std.collections import Dict
 from std.os.path import exists
+from std.sys.info import CompilationTarget
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from dodo.http import (
+    Cancel,
+    CancelHandler,
     Handler,
     HttpServer,
     Logger,
@@ -23,10 +26,18 @@ from dodo.http import (
     Request,
     Response,
     Router,
+    StreamConn,
+    StreamHandler,
+    WithCancel,
     ok,
 )
+from dodo.http.streaming_server import run_stream_connection
 from dodo.http.cancel import CancelReason
 from dodo.http.server import ServerConfig
+from dodo.http._server_reactor_impl import (
+    run_reactor_loop_shared,
+    run_uring_bufring_reactor_loop,
+)
 from dodo.http2 import (
     Frame,
     FrameFlags,
@@ -40,9 +51,10 @@ from dodo.http2 import (
 )
 from dodo.net import SocketAddr
 from dodo.runtime import Pool
+from dodo.runtime.uring_reactor import use_uring_backend
 from dodo.runtime._thread import ThreadHandle, _OpaquePtr, _null_ptr
 from dodo.runtime.scheduler_stats import store_stop_flag
-from dodo.tcp import TcpStream
+from dodo.tcp import TcpListener, TcpStream
 from dodo.tls import TlsConfig, TlsStream
 from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 
@@ -84,12 +96,12 @@ def _wait_file(path: String, timeout_ms: Int = 10_000) raises:
 
 def _cleanup(prefix: String, names: List[String]):
     for i in range(len(names)):
-        for kind in ["started-", "release-", "cancel-"]:
+        for kind in ["started-", "release-", "cancel-", "finished-"]:
             try:
                 remove(prefix + kind + names[i])
             except:
                 pass
-    for extra in ["stop", "exited"]:
+    for extra in ["stop", "exited", "quit", "bye"]:
         try:
             remove(prefix + extra)
         except:
@@ -99,10 +111,28 @@ def _cleanup(prefix: String, names: List[String]):
 # ── Server side ────────────────────────────────────────────────────────────
 
 
+def _gate(
+    prefix: String, name: String, cancel: Cancel, stubborn: Bool
+) raises -> Response:
+    """Announce ``name``, then wait for the test to release it. Unless
+    ``stubborn``, stop early when ``cancel`` flips and record the
+    reason."""
+    _touch(prefix + "started-" + name)
+    var waited = 0
+    while not exists(prefix + "release-" + name):
+        if not stubborn and cancel.cancelled():
+            _touch(prefix + "cancel-" + name, String(cancel.reason()))
+            return ok("cancelled " + name)
+        if waited > 20_000:
+            return ok("gave up " + name)
+        usleep(1000)
+        waited += 1
+    _touch(prefix + "finished-" + name)
+    return ok("done " + name)
+
+
 struct _Gate(Copyable, Handler):
-    """Announces itself, then waits for the test to release it. Unless
-    ``stubborn``, it stops early when its request is cancelled and records
-    the reason."""
+    """Waits at the gate, watching ``req.cancel``."""
 
     var prefix: String
     var stubborn: Bool
@@ -112,21 +142,34 @@ struct _Gate(Copyable, Handler):
         self.stubborn = stubborn
 
     def serve(self, req: Request) raises -> Response:
-        var name = req.param("name")
-        _touch(self.prefix + "started-" + name)
-        var waited = 0
-        while not exists(self.prefix + "release-" + name):
-            if not self.stubborn and req.cancel.cancelled():
-                _touch(
-                    self.prefix + "cancel-" + name,
-                    String(req.cancel.reason()),
-                )
-                return ok("cancelled " + name)
-            if waited > 20_000:
-                return ok("gave up " + name)
-            usleep(1000)
-            waited += 1
-        return ok("done " + name)
+        return _gate(self.prefix, req.param("name"), req.cancel, self.stubborn)
+
+
+struct _CancelGate(CancelHandler, Copyable):
+    """A ``CancelHandler`` that offloads ``/cancel/<name>`` itself and
+    waits at the gate watching the ``cancel`` argument. Every other path
+    goes to ``_router`` through ``WithCancel``."""
+
+    var prefix: String
+    var rest: WithCancel[Router]
+
+    def __init__(out self, prefix: String) raises:
+        self.prefix = prefix
+        self.rest = WithCancel(_router(prefix))
+
+    def serve(self, req: Request, cancel: Cancel) raises -> Response:
+        if req.url.startswith("/cancel/"):
+            var name = String(req.url[byte=8:])
+            return _gate(self.prefix, name, cancel, False)
+        return self.rest.serve(req, cancel)
+
+    def may_block(self) -> Bool:
+        return True
+
+    def blocking(self, req: Request) raises -> Bool:
+        if req.url.startswith("/cancel/"):
+            return True
+        return self.rest.blocking(req)
 
 
 struct _Raiser(Copyable, Handler):
@@ -151,6 +194,60 @@ def _router(prefix: String) raises -> Router:
     api.get("/slow/:name", Logger(Offload(_Gate(prefix))))
     r.mount("/api", api^)
     return r^
+
+
+struct _Borrowed(Handler):
+    """A top-level handler that is not ``Copyable``: the pool can't keep
+    a copy, so its jobs run on the worker's own handler."""
+
+    var inner: Router
+
+    def __init__(out self, var inner: Router):
+        self.inner = inner^
+
+    def serve(self, req: Request) raises -> Response:
+        return self.inner.serve(req)
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
+
+struct _StreamFront(Copyable, StreamHandler):
+    """A streaming front over ``_router``: reads the request line, then
+    hands a request the router marks ``blocking`` to ``conn.offload``
+    and answers any other inline. ``on_offload_done`` keeps its
+    default: send the response, close."""
+
+    var stack: Router
+
+    def __init__(out self, prefix: String) raises:
+        self.stack = _router(prefix)
+
+    def on_open(mut self, mut conn: StreamConn) raises:
+        var req = Request("GET", _read_target(conn))
+        if self.stack.blocking(req):
+            conn.offload(self.stack, req^)
+            return
+        conn.send_response(self.stack.serve(req))
+        conn.request_close()
+
+
+def _read_target(mut conn: StreamConn) raises -> String:
+    """The request target, read blocking up to the end of the head."""
+    conn.set_nonblocking(False)
+    var buf = List[UInt8]()
+    while True:
+        if conn.recv(buf, 4096) == 0:
+            break
+        if "\r\n\r\n" in String(unsafe_from_utf8=Span[UInt8, _](buf)):
+            break
+    conn.set_nonblocking(True)
+    var head = String(unsafe_from_utf8=Span[UInt8, _](buf))
+    var line = head.split("\r\n")[0]
+    return String(line.split(" ")[1])
 
 
 struct _StopWatch(Movable):
@@ -193,10 +290,28 @@ def _spawn_server(
     var config: ServerConfig,
     tls: Bool = False,
     workers: Int = 1,
+    borrowed: Bool = False,
+    loop: String = "unified",
 ) raises -> Tuple[Int, UInt16]:
-    """Fork a server running ``_router``. Returns (pid, port). With one
-    worker, writing ``<prefix>stop`` stops it gracefully and it writes
-    ``<prefix>exited`` once ``serve`` returns."""
+    """Fork a server running ``_router`` (inside ``_Borrowed`` when
+    ``borrowed``) on ``loop``: ``unified`` (``serve``), ``cancel``
+    (``serve_cancellable`` with ``_CancelGate`` in front), ``stream``
+    (``serve_streaming`` with ``_StreamFront``), ``h1`` (the
+    HTTP/1.1-only loop) or ``bufring`` (the io_uring buffer ring).
+    Returns (pid, port). With one worker, writing
+    ``<prefix>stop`` stops it gracefully and it writes ``<prefix>exited``
+    once ``serve`` returns. The process then stays up until the test
+    writes ``<prefix>quit``, and writes ``<prefix>bye`` on its way out,
+    so a test can see that the pool finished cleanly after ``serve``."""
+    if loop == "bufring":
+        # That loop arms no other timers and no connection cap.
+        config.idle_timeout_ms = 0
+        config.write_timeout_ms = 0
+        config.read_body_timeout_ms = 0
+        config.request_timeout_ms = 0
+        config.header_timeout_ms = 0
+        config.min_body_rate = 0
+        config.max_connections = -1
     var srv = _bind(config^, tls)
     var port = UInt16(srv.local_addr().port)
     var pid = fork()
@@ -214,8 +329,32 @@ def _spawn_server(
                 _OpaquePtr(unsafe_from_address=watch)
             )
             t.detach()
-            srv.serve(_router(prefix))
+            if loop == "cancel":
+                srv.serve_cancellable(_CancelGate(prefix))
+            elif loop == "stream":
+                srv.serve_streaming(_StreamFront(prefix))
+            elif loop == "h1":
+                srv._listener._socket.set_nonblocking(True)
+                var h = _router(prefix)
+                run_reactor_loop_shared(
+                    Int(srv._listener._socket.fd),
+                    srv.config,
+                    h,
+                    srv._stopping,
+                )
+            elif loop == "bufring":
+                comptime if CompilationTarget.is_linux():
+                    var h = _router(prefix)
+                    run_uring_bufring_reactor_loop(
+                        srv._listener, srv.config, h, srv._stopping
+                    )
+            elif borrowed:
+                srv.serve(_Borrowed(_router(prefix)))
+            else:
+                srv.serve(_router(prefix))
             _touch(prefix + "exited")
+            _wait_file(prefix + "quit", 20_000)
+            _touch(prefix + "bye")
         except:
             pass
         exit()
@@ -470,6 +609,19 @@ struct _H2(Movable):
         self.s.close()
 
 
+def _loop_tag(loop: String) -> String:
+    if loop == "unified":
+        return ""
+    return "-" + loop
+
+
+def _have_bufring() -> Bool:
+    """Whether this host can run the io_uring buffer-ring loop."""
+    comptime if not CompilationTarget.is_linux():
+        return False
+    return use_uring_backend()
+
+
 def _tag(tls: Bool) -> String:
     if tls:
         return "-tls"
@@ -499,13 +651,35 @@ def test_router_without_offload_never_blocks() raises:
 # ── HTTP/1.1 ───────────────────────────────────────────────────────────────
 
 
-def _h1_offloaded_response_and_keep_alive(tls: Bool) raises:
+def test_bufring_keeps_serving_a_handler_that_may_block() raises:
+    """The io_uring buffer ring has the pool, so opting into it with an
+    ``Offload`` route keeps it."""
+    if not _have_bufring():
+        return
+    var config = ServerConfig(
+        idle_timeout_ms=0,
+        write_timeout_ms=0,
+        read_body_timeout_ms=0,
+        request_timeout_ms=0,
+        header_timeout_ms=0,
+        min_body_rate=0,
+        max_connections=-1,
+        use_bufring=True,
+    )
+    var srv = HttpServer.bind(SocketAddr.localhost(0), config^)
+    srv._resolve_bufring()
+    assert_true(srv.config.use_bufring)
+
+
+def _h1_offloaded_response_and_keep_alive(
+    tls: Bool, loop: String = "unified"
+) raises:
     """The offloaded response arrives, through a mounted router and
     middleware, and the connection serves the next request."""
-    var prefix = _prefix("h1ok" + _tag(tls))
+    var prefix = _prefix("h1ok" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("a")
-    var srv = _spawn_server(prefix, ServerConfig(), tls)
+    var srv = _spawn_server(prefix, ServerConfig(), tls, loop=loop)
     var got = String("")
     var next_resp = String("")
     try:
@@ -532,14 +706,30 @@ def test_h1_offloaded_response_and_keep_alive_tls() raises:
     _h1_offloaded_response_and_keep_alive(True)
 
 
-def _h1_slow_offload_does_not_stall_other_connections(tls: Bool) raises:
+def test_h1_offloaded_response_and_keep_alive_cancellable() raises:
+    _h1_offloaded_response_and_keep_alive(False, loop="cancel")
+
+
+def test_h1_offloaded_response_and_keep_alive_h1_loop() raises:
+    _h1_offloaded_response_and_keep_alive(False, loop="h1")
+
+
+def test_h1_offloaded_response_and_keep_alive_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_offloaded_response_and_keep_alive(False, loop="bufring")
+
+
+def _h1_slow_offload_does_not_stall_other_connections(
+    tls: Bool, loop: String = "unified"
+) raises:
     """With one worker, a second connection is served while the first
     connection's handler is provably still running (it waits for a file
     the test writes only afterwards)."""
-    var prefix = _prefix("h1stall" + _tag(tls))
+    var prefix = _prefix("h1stall" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("b")
-    var srv = _spawn_server(prefix, ServerConfig(), tls)
+    var srv = _spawn_server(prefix, ServerConfig(), tls, loop=loop)
     var fast = String("")
     var slow = String("")
     var still_running = False
@@ -569,13 +759,33 @@ def test_h1_slow_offload_does_not_stall_other_connections_tls() raises:
     _h1_slow_offload_does_not_stall_other_connections(True)
 
 
-def _h1_pipelined_requests_answer_in_order(tls: Bool) raises:
+def test_h1_slow_offload_does_not_stall_other_connections_cancellable() raises:
+    _h1_slow_offload_does_not_stall_other_connections(False, loop="cancel")
+
+
+def test_h1_slow_offload_does_not_stall_other_connections_h1_loop() raises:
+    _h1_slow_offload_does_not_stall_other_connections(False, loop="h1")
+
+
+def test_h1_slow_offload_does_not_stall_other_connections_stream() raises:
+    _h1_slow_offload_does_not_stall_other_connections(False, loop="stream")
+
+
+def test_h1_slow_offload_does_not_stall_other_connections_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_slow_offload_does_not_stall_other_connections(False, loop="bufring")
+
+
+def _h1_pipelined_requests_answer_in_order(
+    tls: Bool, loop: String = "unified"
+) raises:
     """An inline request, an offloaded one and another inline one sent in
     one write are answered in order."""
-    var prefix = _prefix("h1pipe" + _tag(tls))
+    var prefix = _prefix("h1pipe" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("p")
-    var srv = _spawn_server(prefix, ServerConfig(), tls)
+    var srv = _spawn_server(prefix, ServerConfig(), tls, loop=loop)
     var first = String("")
     var second = String("")
     var third = String("")
@@ -609,11 +819,32 @@ def test_h1_pipelined_requests_answer_in_order_tls() raises:
     _h1_pipelined_requests_answer_in_order(True)
 
 
-def _h1_timeout_answers_503_and_cancels(tls: Bool) raises:
-    var prefix = _prefix("h1timeout" + _tag(tls))
+def test_h1_pipelined_requests_answer_in_order_cancellable() raises:
+    _h1_pipelined_requests_answer_in_order(False, loop="cancel")
+
+
+def test_h1_pipelined_requests_answer_in_order_h1_loop() raises:
+    _h1_pipelined_requests_answer_in_order(False, loop="h1")
+
+
+def test_h1_pipelined_requests_answer_in_order_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_pipelined_requests_answer_in_order(False, loop="bufring")
+
+
+def _h1_timeout_answers_503_and_cancels(
+    tls: Bool, loop: String = "unified"
+) raises:
+    var prefix = _prefix("h1timeout" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("c")
-    var srv = _spawn_server(prefix, ServerConfig(handler_timeout_ms=200), tls)
+    var srv = _spawn_server(
+        prefix,
+        ServerConfig(handler_timeout_ms=200),
+        tls,
+        loop=loop,
+    )
     var got = String("")
     var reason = String("")
     try:
@@ -638,16 +869,39 @@ def test_h1_timeout_answers_503_and_cancels_tls() raises:
     _h1_timeout_answers_503_and_cancels(True)
 
 
-def _h1_full_queue_answers_503_at_once(tls: Bool) raises:
+def test_h1_timeout_answers_503_and_cancels_cancellable() raises:
+    _h1_timeout_answers_503_and_cancels(False, loop="cancel")
+
+
+def test_h1_timeout_answers_503_and_cancels_h1_loop() raises:
+    _h1_timeout_answers_503_and_cancels(False, loop="h1")
+
+
+def test_h1_timeout_answers_503_and_cancels_stream() raises:
+    _h1_timeout_answers_503_and_cancels(False, loop="stream")
+
+
+def test_h1_timeout_answers_503_and_cancels_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_timeout_answers_503_and_cancels(False, loop="bufring")
+
+
+def _h1_full_queue_answers_503_at_once(
+    tls: Bool, loop: String = "unified"
+) raises:
     """One pool thread and room for one queued request: the third
     offloaded request is refused at once, the other two are served."""
-    var prefix = _prefix("h1full" + _tag(tls))
+    var prefix = _prefix("h1full" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("d1")
     names.append("d2")
     names.append("d3")
     var srv = _spawn_server(
-        prefix, ServerConfig(offload_threads=1, offload_queue_depth=1), tls
+        prefix,
+        ServerConfig(offload_threads=1, offload_queue_depth=1),
+        tls,
+        loop=loop,
     )
     var refused = String("")
     var r1 = String("")
@@ -693,11 +947,27 @@ def test_h1_full_queue_answers_503_at_once_tls() raises:
     _h1_full_queue_answers_503_at_once(True)
 
 
-def _h1_client_close_cancels_the_handler(tls: Bool) raises:
-    var prefix = _prefix("h1gone" + _tag(tls))
+def test_h1_full_queue_answers_503_at_once_cancellable() raises:
+    _h1_full_queue_answers_503_at_once(False, loop="cancel")
+
+
+def test_h1_full_queue_answers_503_at_once_h1_loop() raises:
+    _h1_full_queue_answers_503_at_once(False, loop="h1")
+
+
+def test_h1_full_queue_answers_503_at_once_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_full_queue_answers_503_at_once(False, loop="bufring")
+
+
+def _h1_client_close_cancels_the_handler(
+    tls: Bool, loop: String = "unified"
+) raises:
+    var prefix = _prefix("h1gone" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("f")
-    var srv = _spawn_server(prefix, ServerConfig(), tls)
+    var srv = _spawn_server(prefix, ServerConfig(), tls, loop=loop)
     var reason = String("")
     try:
         var s = _Conn(srv[1], tls)
@@ -720,9 +990,27 @@ def test_h1_client_close_cancels_the_handler_tls() raises:
     _h1_client_close_cancels_the_handler(True)
 
 
-def _h1_handler_error_is_500(tls: Bool) raises:
-    var prefix = _prefix("h1raise" + _tag(tls))
-    var srv = _spawn_server(prefix, ServerConfig(), tls)
+def test_h1_client_close_cancels_the_handler_cancellable() raises:
+    _h1_client_close_cancels_the_handler(False, loop="cancel")
+
+
+def test_h1_client_close_cancels_the_handler_h1_loop() raises:
+    _h1_client_close_cancels_the_handler(False, loop="h1")
+
+
+def test_h1_client_close_cancels_the_handler_stream() raises:
+    _h1_client_close_cancels_the_handler(False, loop="stream")
+
+
+def test_h1_client_close_cancels_the_handler_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_client_close_cancels_the_handler(False, loop="bufring")
+
+
+def _h1_handler_error_is_500(tls: Bool, loop: String = "unified") raises:
+    var prefix = _prefix("h1raise" + _tag(tls) + _loop_tag(loop))
+    var srv = _spawn_server(prefix, ServerConfig(), tls, loop=loop)
     var got = String("")
     try:
         var s = _Conn(srv[1], tls)
@@ -742,15 +1030,38 @@ def test_h1_handler_error_is_500_tls() raises:
     _h1_handler_error_is_500(True)
 
 
-def _h1_shutdown_waits_for_the_offloaded_request(tls: Bool) raises:
+def test_h1_handler_error_is_500_cancellable() raises:
+    _h1_handler_error_is_500(False, loop="cancel")
+
+
+def test_h1_handler_error_is_500_h1_loop() raises:
+    _h1_handler_error_is_500(False, loop="h1")
+
+
+def test_h1_handler_error_is_500_stream() raises:
+    _h1_handler_error_is_500(False, loop="stream")
+
+
+def test_h1_handler_error_is_500_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_handler_error_is_500(False, loop="bufring")
+
+
+def _h1_shutdown_waits_for_the_offloaded_request(
+    tls: Bool, loop: String = "unified"
+) raises:
     """A graceful stop with a request on the pool: the worker keeps the
     connection until the handler (which ignores cancellation) returns,
     sends its response, then exits."""
-    var prefix = _prefix("h1drain" + _tag(tls))
+    var prefix = _prefix("h1drain" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("g")
     var srv = _spawn_server(
-        prefix, ServerConfig(shutdown_timeout_ms=10_000), tls
+        prefix,
+        ServerConfig(shutdown_timeout_ms=10_000),
+        tls,
+        loop=loop,
     )
     var got = String("")
     var exited_early = True
@@ -778,32 +1089,60 @@ def test_h1_shutdown_waits_for_the_offloaded_request_tls() raises:
     _h1_shutdown_waits_for_the_offloaded_request(True)
 
 
-def _h1_shutdown_gives_up_after_its_timeout(tls: Bool) raises:
-    """Past ``shutdown_timeout_ms`` the connection is closed unanswered;
-    the worker still waits for the running handler before it exits."""
-    var prefix = _prefix("h1cut" + _tag(tls))
+def test_h1_shutdown_waits_for_the_offloaded_request_cancellable() raises:
+    _h1_shutdown_waits_for_the_offloaded_request(False, loop="cancel")
+
+
+def test_h1_shutdown_waits_for_the_offloaded_request_h1_loop() raises:
+    _h1_shutdown_waits_for_the_offloaded_request(False, loop="h1")
+
+
+def test_h1_shutdown_waits_for_the_offloaded_request_stream() raises:
+    _h1_shutdown_waits_for_the_offloaded_request(False, loop="stream")
+
+
+def test_h1_shutdown_waits_for_the_offloaded_request_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_shutdown_waits_for_the_offloaded_request(False, loop="bufring")
+
+
+def _h1_shutdown_gives_up_after_its_timeout(
+    tls: Bool, loop: String = "unified"
+) raises:
+    """Past ``shutdown_timeout_ms`` the connection is closed unanswered
+    and ``serve`` returns while the handler still runs. The handler then
+    finishes on the pool's copy of it, and the process stays healthy."""
+    var prefix = _prefix("h1cut" + _tag(tls) + _loop_tag(loop))
     var names = List[String]()
     names.append("h")
-    var srv = _spawn_server(prefix, ServerConfig(shutdown_timeout_ms=200), tls)
+    var srv = _spawn_server(
+        prefix,
+        ServerConfig(shutdown_timeout_ms=200),
+        tls,
+        loop=loop,
+    )
     var closed = False
-    var exited_before_release = True
+    var ran_past_serve = False
     try:
         var s = _Conn(srv[1], tls)
         s.get("/stubborn/h")
         _wait_file(prefix + "started-h")
         _touch(prefix + "stop")
         closed = s.closed_by_server()
-        exited_before_release = exists(prefix + "exited")
-        _touch(prefix + "release-h")
         _wait_file(prefix + "exited")
+        ran_past_serve = not exists(prefix + "finished-h")
+        _touch(prefix + "release-h")
+        _wait_file(prefix + "finished-h")
+        # Give the pool thread time to free the job and the port.
+        usleep(50_000)
+        _touch(prefix + "quit")
+        _wait_file(prefix + "bye")
     finally:
         _stop_server(srv[0])
         _cleanup(prefix, names)
     assert_true(closed)
-    assert_false(exited_before_release)
-
-
-# ── HTTP/2 ─────────────────────────────────────────────────────────────────
+    assert_true(ran_past_serve)
 
 
 def test_h1_shutdown_gives_up_after_its_timeout() raises:
@@ -812,6 +1151,160 @@ def test_h1_shutdown_gives_up_after_its_timeout() raises:
 
 def test_h1_shutdown_gives_up_after_its_timeout_tls() raises:
     _h1_shutdown_gives_up_after_its_timeout(True)
+
+
+def test_h1_shutdown_gives_up_after_its_timeout_cancellable() raises:
+    _h1_shutdown_gives_up_after_its_timeout(False, loop="cancel")
+
+
+def test_h1_shutdown_gives_up_after_its_timeout_h1_loop() raises:
+    _h1_shutdown_gives_up_after_its_timeout(False, loop="h1")
+
+
+def test_h1_shutdown_gives_up_after_its_timeout_stream() raises:
+    _h1_shutdown_gives_up_after_its_timeout(False, loop="stream")
+
+
+def test_h1_shutdown_gives_up_after_its_timeout_bufring() raises:
+    if not _have_bufring():
+        return
+    _h1_shutdown_gives_up_after_its_timeout(False, loop="bufring")
+
+
+def test_h1_shutdown_waits_for_a_borrowed_handler() raises:
+    """A handler that is not ``Copyable`` is borrowed by its jobs, so the
+    worker waits for the running one even past ``shutdown_timeout_ms``;
+    the connection is still closed at the deadline."""
+    var prefix = _prefix("h1borrow")
+    var names = List[String]()
+    names.append("b")
+    var srv = _spawn_server(
+        prefix, ServerConfig(shutdown_timeout_ms=200), borrowed=True
+    )
+    var closed = False
+    var exited_before_release = True
+    try:
+        var s = _Conn(srv[1])
+        s.get("/stubborn/b")
+        _wait_file(prefix + "started-b")
+        _touch(prefix + "stop")
+        closed = s.closed_by_server()
+        # Room for serve to return, if it wrongly did not wait.
+        usleep(100_000)
+        exited_before_release = exists(prefix + "exited")
+        _touch(prefix + "release-b")
+        _wait_file(prefix + "exited")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, names)
+    assert_true(closed)
+    assert_false(exited_before_release)
+
+
+def test_cancel_handler_sees_timeout_through_its_cancel_argument() raises:
+    """On ``serve_cancellable``, a ``CancelHandler`` that marks a request
+    ``blocking`` runs it on the pool with ``cancel`` bound to the job, so
+    the handler deadline reaches it there."""
+    var prefix = _prefix("cancelarg")
+    var names = List[String]()
+    names.append("x")
+    var srv = _spawn_server(
+        prefix, ServerConfig(handler_timeout_ms=200), loop="cancel"
+    )
+    var got = String("")
+    var reason = String("")
+    try:
+        var s = _Conn(srv[1])
+        s.get("/cancel/x")
+        got = s.response()
+        _wait_file(prefix + "cancel-x")
+        reason = _read_file(prefix + "cancel-x")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, names)
+    assert_true(got.startswith("HTTP/1.1 503"), got)
+    assert_equal(reason, String(CancelReason.TIMEOUT))
+
+
+def test_stream_full_queue_answers_503_at_once() raises:
+    """On ``serve_streaming``, one pool thread and room for one queued
+    request: the third offloaded request gets 503 at once and never
+    runs."""
+    var prefix = _prefix("streamfull")
+    var names = List[String]()
+    names.append("d1")
+    names.append("d2")
+    names.append("d3")
+    var srv = _spawn_server(
+        prefix,
+        ServerConfig(offload_threads=1, offload_queue_depth=1),
+        loop="stream",
+    )
+    var refused = String("")
+    var r1 = String("")
+    var r2 = String("")
+    var d3_ran = True
+    try:
+        var c1 = _Conn(srv[1])
+        c1.get("/slow/d1")
+        _wait_file(prefix + "started-d1")
+        var c2 = _Conn(srv[1])
+        c2.get("/slow/d2")
+        # Connections are opened in order, so d2 is queued before d3.
+        var c3 = _Conn(srv[1])
+        c3.get("/slow/d3")
+        refused = c3.response()
+        _touch(prefix + "release-d1")
+        _touch(prefix + "release-d2")
+        r1 = c1.response()
+        r2 = c2.response()
+        d3_ran = exists(prefix + "started-d3")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, names)
+    assert_true(refused.startswith("HTTP/1.1 503"), refused)
+    assert_true("Retry-After: 1" in refused, refused)
+    assert_true(r1.endswith("done d1"), r1)
+    assert_true(r2.endswith("done d2"), r2)
+    assert_false(d3_ran, "a refused request must not run")
+
+
+def test_stream_blocking_driver_runs_the_offload_in_place() raises:
+    """``run_stream_connection`` has no pool, so an offloaded request
+    has run and been answered by the time it returns."""
+    var prefix = _prefix("streamhere")
+    var names = List[String]()
+    names.append("h")
+    _touch(prefix + "release-h")
+    var got = String("")
+    var finished = False
+    try:
+        var listener = TcpListener.bind(SocketAddr.localhost(0))
+        var client = TcpStream.connect(listener.local_addr())
+        var request = String("GET /slow/h HTTP/1.1\r\nHost: x\r\n\r\n")
+        _ = client.write(request.as_bytes())
+        var server = listener.accept()
+        var front = _StreamFront(prefix)
+        run_stream_connection(front, server^)
+        finished = exists(prefix + "finished-h")
+        var buf = List[UInt8](capacity=4096)
+        while True:
+            buf.resize(4096, 0)
+            var n = client.read(buf.unsafe_ptr(), 4096)
+            if n == 0:
+                break
+            got += String(unsafe_from_utf8=Span[UInt8, _](buf)[:n])
+        client.close()
+    finally:
+        _cleanup(prefix, names)
+    assert_true(
+        finished, "the handler must have run before the driver returned"
+    )
+    assert_true(got.startswith("HTTP/1.1 200"), got)
+    assert_true(got.endswith("done h"), got)
+
+
+# ── HTTP/2 ─────────────────────────────────────────────────────────────────
 
 
 def _h2_parked_stream_lets_the_connection_go_on(tls: Bool) raises:

@@ -2242,10 +2242,22 @@ from test_offload import (
     test_router_without_offload_never_blocks as test_offload__test_router_without_offload_never_blocks,
 )
 from test_offload import (
+    test_bufring_keeps_serving_a_handler_that_may_block as test_offload__test_bufring_keeps_serving_a_handler_that_may_block,
+)
+from test_offload import (
     test_h1_offloaded_response_and_keep_alive as test_offload__test_h1_offloaded_response_and_keep_alive,
 )
 from test_offload import (
     test_h1_offloaded_response_and_keep_alive_tls as test_offload__test_h1_offloaded_response_and_keep_alive_tls,
+)
+from test_offload import (
+    test_h1_offloaded_response_and_keep_alive_cancellable as test_offload__test_h1_offloaded_response_and_keep_alive_cancellable,
+)
+from test_offload import (
+    test_h1_offloaded_response_and_keep_alive_h1_loop as test_offload__test_h1_offloaded_response_and_keep_alive_h1_loop,
+)
+from test_offload import (
+    test_h1_offloaded_response_and_keep_alive_bufring as test_offload__test_h1_offloaded_response_and_keep_alive_bufring,
 )
 from test_offload import (
     test_h1_slow_offload_does_not_stall_other_connections as test_offload__test_h1_slow_offload_does_not_stall_other_connections,
@@ -2254,10 +2266,31 @@ from test_offload import (
     test_h1_slow_offload_does_not_stall_other_connections_tls as test_offload__test_h1_slow_offload_does_not_stall_other_connections_tls,
 )
 from test_offload import (
+    test_h1_slow_offload_does_not_stall_other_connections_cancellable as test_offload__test_h1_slow_offload_does_not_stall_other_connections_cancellable,
+)
+from test_offload import (
+    test_h1_slow_offload_does_not_stall_other_connections_h1_loop as test_offload__test_h1_slow_offload_does_not_stall_other_connections_h1_loop,
+)
+from test_offload import (
+    test_h1_slow_offload_does_not_stall_other_connections_stream as test_offload__test_h1_slow_offload_does_not_stall_other_connections_stream,
+)
+from test_offload import (
+    test_h1_slow_offload_does_not_stall_other_connections_bufring as test_offload__test_h1_slow_offload_does_not_stall_other_connections_bufring,
+)
+from test_offload import (
     test_h1_pipelined_requests_answer_in_order as test_offload__test_h1_pipelined_requests_answer_in_order,
 )
 from test_offload import (
     test_h1_pipelined_requests_answer_in_order_tls as test_offload__test_h1_pipelined_requests_answer_in_order_tls,
+)
+from test_offload import (
+    test_h1_pipelined_requests_answer_in_order_cancellable as test_offload__test_h1_pipelined_requests_answer_in_order_cancellable,
+)
+from test_offload import (
+    test_h1_pipelined_requests_answer_in_order_h1_loop as test_offload__test_h1_pipelined_requests_answer_in_order_h1_loop,
+)
+from test_offload import (
+    test_h1_pipelined_requests_answer_in_order_bufring as test_offload__test_h1_pipelined_requests_answer_in_order_bufring,
 )
 from test_offload import (
     test_h1_timeout_answers_503_and_cancels as test_offload__test_h1_timeout_answers_503_and_cancels,
@@ -2266,10 +2299,31 @@ from test_offload import (
     test_h1_timeout_answers_503_and_cancels_tls as test_offload__test_h1_timeout_answers_503_and_cancels_tls,
 )
 from test_offload import (
+    test_h1_timeout_answers_503_and_cancels_cancellable as test_offload__test_h1_timeout_answers_503_and_cancels_cancellable,
+)
+from test_offload import (
+    test_h1_timeout_answers_503_and_cancels_h1_loop as test_offload__test_h1_timeout_answers_503_and_cancels_h1_loop,
+)
+from test_offload import (
+    test_h1_timeout_answers_503_and_cancels_stream as test_offload__test_h1_timeout_answers_503_and_cancels_stream,
+)
+from test_offload import (
+    test_h1_timeout_answers_503_and_cancels_bufring as test_offload__test_h1_timeout_answers_503_and_cancels_bufring,
+)
+from test_offload import (
     test_h1_full_queue_answers_503_at_once as test_offload__test_h1_full_queue_answers_503_at_once,
 )
 from test_offload import (
     test_h1_full_queue_answers_503_at_once_tls as test_offload__test_h1_full_queue_answers_503_at_once_tls,
+)
+from test_offload import (
+    test_h1_full_queue_answers_503_at_once_cancellable as test_offload__test_h1_full_queue_answers_503_at_once_cancellable,
+)
+from test_offload import (
+    test_h1_full_queue_answers_503_at_once_h1_loop as test_offload__test_h1_full_queue_answers_503_at_once_h1_loop,
+)
+from test_offload import (
+    test_h1_full_queue_answers_503_at_once_bufring as test_offload__test_h1_full_queue_answers_503_at_once_bufring,
 )
 from test_offload import (
     test_h1_client_close_cancels_the_handler as test_offload__test_h1_client_close_cancels_the_handler,
@@ -2278,10 +2332,34 @@ from test_offload import (
     test_h1_client_close_cancels_the_handler_tls as test_offload__test_h1_client_close_cancels_the_handler_tls,
 )
 from test_offload import (
+    test_h1_client_close_cancels_the_handler_cancellable as test_offload__test_h1_client_close_cancels_the_handler_cancellable,
+)
+from test_offload import (
+    test_h1_client_close_cancels_the_handler_h1_loop as test_offload__test_h1_client_close_cancels_the_handler_h1_loop,
+)
+from test_offload import (
+    test_h1_client_close_cancels_the_handler_stream as test_offload__test_h1_client_close_cancels_the_handler_stream,
+)
+from test_offload import (
+    test_h1_client_close_cancels_the_handler_bufring as test_offload__test_h1_client_close_cancels_the_handler_bufring,
+)
+from test_offload import (
     test_h1_handler_error_is_500 as test_offload__test_h1_handler_error_is_500,
 )
 from test_offload import (
     test_h1_handler_error_is_500_tls as test_offload__test_h1_handler_error_is_500_tls,
+)
+from test_offload import (
+    test_h1_handler_error_is_500_cancellable as test_offload__test_h1_handler_error_is_500_cancellable,
+)
+from test_offload import (
+    test_h1_handler_error_is_500_h1_loop as test_offload__test_h1_handler_error_is_500_h1_loop,
+)
+from test_offload import (
+    test_h1_handler_error_is_500_stream as test_offload__test_h1_handler_error_is_500_stream,
+)
+from test_offload import (
+    test_h1_handler_error_is_500_bufring as test_offload__test_h1_handler_error_is_500_bufring,
 )
 from test_offload import (
     test_h1_shutdown_waits_for_the_offloaded_request as test_offload__test_h1_shutdown_waits_for_the_offloaded_request,
@@ -2290,10 +2368,46 @@ from test_offload import (
     test_h1_shutdown_waits_for_the_offloaded_request_tls as test_offload__test_h1_shutdown_waits_for_the_offloaded_request_tls,
 )
 from test_offload import (
+    test_h1_shutdown_waits_for_the_offloaded_request_cancellable as test_offload__test_h1_shutdown_waits_for_the_offloaded_request_cancellable,
+)
+from test_offload import (
+    test_h1_shutdown_waits_for_the_offloaded_request_h1_loop as test_offload__test_h1_shutdown_waits_for_the_offloaded_request_h1_loop,
+)
+from test_offload import (
+    test_h1_shutdown_waits_for_the_offloaded_request_stream as test_offload__test_h1_shutdown_waits_for_the_offloaded_request_stream,
+)
+from test_offload import (
+    test_h1_shutdown_waits_for_the_offloaded_request_bufring as test_offload__test_h1_shutdown_waits_for_the_offloaded_request_bufring,
+)
+from test_offload import (
     test_h1_shutdown_gives_up_after_its_timeout as test_offload__test_h1_shutdown_gives_up_after_its_timeout,
 )
 from test_offload import (
     test_h1_shutdown_gives_up_after_its_timeout_tls as test_offload__test_h1_shutdown_gives_up_after_its_timeout_tls,
+)
+from test_offload import (
+    test_h1_shutdown_gives_up_after_its_timeout_cancellable as test_offload__test_h1_shutdown_gives_up_after_its_timeout_cancellable,
+)
+from test_offload import (
+    test_h1_shutdown_gives_up_after_its_timeout_h1_loop as test_offload__test_h1_shutdown_gives_up_after_its_timeout_h1_loop,
+)
+from test_offload import (
+    test_h1_shutdown_gives_up_after_its_timeout_stream as test_offload__test_h1_shutdown_gives_up_after_its_timeout_stream,
+)
+from test_offload import (
+    test_h1_shutdown_gives_up_after_its_timeout_bufring as test_offload__test_h1_shutdown_gives_up_after_its_timeout_bufring,
+)
+from test_offload import (
+    test_h1_shutdown_waits_for_a_borrowed_handler as test_offload__test_h1_shutdown_waits_for_a_borrowed_handler,
+)
+from test_offload import (
+    test_cancel_handler_sees_timeout_through_its_cancel_argument as test_offload__test_cancel_handler_sees_timeout_through_its_cancel_argument,
+)
+from test_offload import (
+    test_stream_full_queue_answers_503_at_once as test_offload__test_stream_full_queue_answers_503_at_once,
+)
+from test_offload import (
+    test_stream_blocking_driver_runs_the_offload_in_place as test_offload__test_stream_blocking_driver_runs_the_offload_in_place,
 )
 from test_offload import (
     test_h2_parked_stream_lets_the_connection_go_on as test_offload__test_h2_parked_stream_lets_the_connection_go_on,
@@ -5779,30 +5893,116 @@ def main() raises:
     # tests/http/test_offload.mojo
     suite.test[test_offload__test_router_reports_offloaded_routes]()
     suite.test[test_offload__test_router_without_offload_never_blocks]()
+    suite.test[
+        test_offload__test_bufring_keeps_serving_a_handler_that_may_block
+    ]()
     suite.test[test_offload__test_h1_offloaded_response_and_keep_alive]()
     suite.test[test_offload__test_h1_offloaded_response_and_keep_alive_tls]()
+    suite.test[
+        test_offload__test_h1_offloaded_response_and_keep_alive_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_offloaded_response_and_keep_alive_h1_loop
+    ]()
+    suite.test[
+        test_offload__test_h1_offloaded_response_and_keep_alive_bufring
+    ]()
     suite.test[
         test_offload__test_h1_slow_offload_does_not_stall_other_connections
     ]()
     suite.test[
         test_offload__test_h1_slow_offload_does_not_stall_other_connections_tls
     ]()
+    suite.test[
+        test_offload__test_h1_slow_offload_does_not_stall_other_connections_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_slow_offload_does_not_stall_other_connections_h1_loop
+    ]()
+    suite.test[
+        test_offload__test_h1_slow_offload_does_not_stall_other_connections_stream
+    ]()
+    suite.test[
+        test_offload__test_h1_slow_offload_does_not_stall_other_connections_bufring
+    ]()
     suite.test[test_offload__test_h1_pipelined_requests_answer_in_order]()
     suite.test[test_offload__test_h1_pipelined_requests_answer_in_order_tls]()
+    suite.test[
+        test_offload__test_h1_pipelined_requests_answer_in_order_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_pipelined_requests_answer_in_order_h1_loop
+    ]()
+    suite.test[
+        test_offload__test_h1_pipelined_requests_answer_in_order_bufring
+    ]()
     suite.test[test_offload__test_h1_timeout_answers_503_and_cancels]()
     suite.test[test_offload__test_h1_timeout_answers_503_and_cancels_tls]()
+    suite.test[
+        test_offload__test_h1_timeout_answers_503_and_cancels_cancellable
+    ]()
+    suite.test[test_offload__test_h1_timeout_answers_503_and_cancels_h1_loop]()
+    suite.test[test_offload__test_h1_timeout_answers_503_and_cancels_stream]()
+    suite.test[test_offload__test_h1_timeout_answers_503_and_cancels_bufring]()
     suite.test[test_offload__test_h1_full_queue_answers_503_at_once]()
     suite.test[test_offload__test_h1_full_queue_answers_503_at_once_tls]()
+    suite.test[
+        test_offload__test_h1_full_queue_answers_503_at_once_cancellable
+    ]()
+    suite.test[test_offload__test_h1_full_queue_answers_503_at_once_h1_loop]()
+    suite.test[test_offload__test_h1_full_queue_answers_503_at_once_bufring]()
     suite.test[test_offload__test_h1_client_close_cancels_the_handler]()
     suite.test[test_offload__test_h1_client_close_cancels_the_handler_tls]()
+    suite.test[
+        test_offload__test_h1_client_close_cancels_the_handler_cancellable
+    ]()
+    suite.test[test_offload__test_h1_client_close_cancels_the_handler_h1_loop]()
+    suite.test[test_offload__test_h1_client_close_cancels_the_handler_stream]()
+    suite.test[test_offload__test_h1_client_close_cancels_the_handler_bufring]()
     suite.test[test_offload__test_h1_handler_error_is_500]()
     suite.test[test_offload__test_h1_handler_error_is_500_tls]()
+    suite.test[test_offload__test_h1_handler_error_is_500_cancellable]()
+    suite.test[test_offload__test_h1_handler_error_is_500_h1_loop]()
+    suite.test[test_offload__test_h1_handler_error_is_500_stream]()
+    suite.test[test_offload__test_h1_handler_error_is_500_bufring]()
     suite.test[test_offload__test_h1_shutdown_waits_for_the_offloaded_request]()
     suite.test[
         test_offload__test_h1_shutdown_waits_for_the_offloaded_request_tls
     ]()
+    suite.test[
+        test_offload__test_h1_shutdown_waits_for_the_offloaded_request_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_shutdown_waits_for_the_offloaded_request_h1_loop
+    ]()
+    suite.test[
+        test_offload__test_h1_shutdown_waits_for_the_offloaded_request_stream
+    ]()
+    suite.test[
+        test_offload__test_h1_shutdown_waits_for_the_offloaded_request_bufring
+    ]()
     suite.test[test_offload__test_h1_shutdown_gives_up_after_its_timeout]()
     suite.test[test_offload__test_h1_shutdown_gives_up_after_its_timeout_tls]()
+    suite.test[
+        test_offload__test_h1_shutdown_gives_up_after_its_timeout_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_shutdown_gives_up_after_its_timeout_h1_loop
+    ]()
+    suite.test[
+        test_offload__test_h1_shutdown_gives_up_after_its_timeout_stream
+    ]()
+    suite.test[
+        test_offload__test_h1_shutdown_gives_up_after_its_timeout_bufring
+    ]()
+    suite.test[test_offload__test_h1_shutdown_waits_for_a_borrowed_handler]()
+    suite.test[
+        test_offload__test_cancel_handler_sees_timeout_through_its_cancel_argument
+    ]()
+    suite.test[test_offload__test_stream_full_queue_answers_503_at_once]()
+    suite.test[
+        test_offload__test_stream_blocking_driver_runs_the_offload_in_place
+    ]()
     suite.test[test_offload__test_h2_parked_stream_lets_the_connection_go_on]()
     suite.test[
         test_offload__test_h2_parked_stream_lets_the_connection_go_on_tls
