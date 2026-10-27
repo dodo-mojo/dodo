@@ -63,6 +63,7 @@ The networking layers start as an imported fork (ADR-0003), so their package nam
   - `Offload(handler)` runs a handler on an offload thread pool and wakes the loop through its wake fd (ADR-0004).
   - GPU work is enqueued on the worker's `DeviceContext` stream, and completion is polled from the loop, so the CPU never sits waiting on the GPU.
   - In dev mode `dodo.prof` flags handlers that hold a loop longer than a threshold.
+- Outgoing calls (other APIs, model servers, later databases) run on the same loop: a handler starts several at once and parks until they answer, costing no threads (ADR-0006, proposed).
 - If Mojo gains stable async later, handlers can become `async def` without changing the I/O layer.
 - **Phase 0 spike:** confirm thread creation (`parallelize` vs. pthreads via FFI) and epoll from Mojo 1.2.
 
@@ -87,6 +88,20 @@ The networking layers start as an imported fork (ADR-0003), so their package nam
 | TLS (OpenSSL/BoringSSL via FFI) | Phase 5 | Until then, run behind Caddy, nginx or a cloud load balancer. That's also standard practice in production. |
 | HTTP/2 | Phase 5 | Needed for gRPC and direct browser connections without a proxy. Large attack surface (HPACK, flow control, Rapid Reset). |
 | HTTP/3 / QUIC | Not planned | Proxies and CDNs handle it in front of the app. |
+
+### 3.4 One process or several
+
+One process is dodo's default because it pays off when data is big or shared: images, frames and tensors go from the request to the model without a copy or a network hop, one batching queue groups requests from every worker, tokens stream straight to the client, and there is one thing to deploy. For small JSON calls the hop to another service costs well under a millisecond, so it is rarely the reason to keep things together.
+
+Split when there is a real reason: one GPU shared by many web replicas (each replica would load its own weights), crash isolation, or parts that need to scale or deploy on their own. A monorepo is about code, not processes; it can hold one dodo app or many services.
+
+| Setup | What runs where |
+|---|---|
+| All in one | HTTP, models and kernels in one dodo process |
+| Supervised workers | Models or kernels in child processes that dodo starts, watches, limits and restarts; data passes through shared memory (ADR-0005, proposed) |
+| Distributed | dodo serves HTTP and calls remote model servers, or is one service among many |
+
+Model workers get CPU, RAM and GPU memory limits, each as a ratio or an amount of **the box**: the container's limits when dodo runs in Docker or Kubernetes, otherwise the machine. Kubernetes needs nothing separate; dodo reads a pod's limits the same way and adds `/healthz`, `/readyz` and draining on `SIGTERM`.
 
 ## 4. Developer API (sketch)
 
