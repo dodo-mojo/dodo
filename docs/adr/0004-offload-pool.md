@@ -21,11 +21,16 @@ Mojo constraints: capturing closures can't be passed to another thread today, an
    - The worker drains completions on wake-up and writes each response as usual.
 3. **Timeouts.** If `handler_timeout_ms` passes first, the client gets `503 Service Unavailable` and the request's `Cancel` is set to `TIMEOUT`, so a handler that checks it can stop early. The late result is dropped. Inline handlers still can't be interrupted; the docs say so.
 4. **Client gone.** If the client closes while the job runs, `Cancel` is set to `PEER_CLOSED` and the result is dropped.
-5. **Scope of v1.** HTTP/1.1 on the unified loop. HTTP/2 streams run offloaded handlers inline until v2, which parks the stream instead of the connection.
+5. **Scope of v1.** HTTP/1.1 and HTTP/2, cleartext and TLS, on the unified loop (the default for `serve`).
+   - HTTP/1.1 parks the whole connection, since its responses must go out in order.
+   - HTTP/2 parks only the stream. The connection keeps reading, so other streams and control frames (PING, SETTINGS, WINDOW_UPDATE) keep flowing while a job runs. Each connection keeps a list of pending stream deadlines and arms its timer for the earliest one.
+   - `RST_STREAM` from the client sets that stream's `Cancel` to `PEER_CLOSED` and drops its result. Closing the connection does the same for all of its pending streams.
+   - Graceful shutdown and a sent `GOAWAY` wait for pending streams, up to `shutdown_timeout_ms`.
 
 ## Consequences
 
 - One slow route no longer slows the whole worker, and `handler_timeout_ms` works for offloaded routes.
+- On HTTP/2, one slow stream no longer slows the other streams on its connection.
 - A pool thread costs memory and a context switch per offloaded request, so fast handlers should stay inline. `dodo.prof` will flag inline handlers that hold the loop too long.
 - Handlers run on two kinds of threads, so a handler's state must be safe to read from several threads at once.
 
