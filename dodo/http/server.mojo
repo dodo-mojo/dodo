@@ -22,6 +22,7 @@ from std.collections import Optional
 from std.sys import stderr
 
 from .handler import Handler, CancelHandler
+from ._shared_handler import SharedCancelHandler, SharedHandler
 from .cancel import Cancel
 from .streaming_server import StreamHandler
 from .intern import intern_method_bytes
@@ -503,6 +504,10 @@ struct HttpServer(Movable):
         Copyable](handler, num_workers, pin_cores)`` overload
         below for that.
 
+        A handler that is not ``Copyable`` is moved into a
+        :class:`SharedHandler`, so the offload pool can keep it alive for
+        a job still running after this returns.
+
         Args:
             handler: The request handler (ownership transferred).
 
@@ -510,7 +515,11 @@ struct HttpServer(Movable):
             NetworkError: On fatal listener errors; per-connection
                 errors close the offending connection silently.
         """
-        self._serve_one(handler)
+        comptime if conforms_to(H, Copyable):
+            self._serve_one(handler)
+        else:
+            var shared = SharedHandler(handler^)
+            self._serve_one(shared)
 
     def _resolve_max_connections(mut self, workers: Int):
         """Turn ``max_connections == 0`` (automatic) into a per-worker cap
@@ -917,9 +926,16 @@ struct HttpServer(Movable):
 
         self._stopping = False
         self._resolve_max_connections(1)
-        run_reactor_loop_cancel(
-            self._listener, self.config, handler, self._stopping
-        )
+        comptime if conforms_to(CH, Copyable):
+            run_reactor_loop_cancel(
+                self._listener, self.config, handler, self._stopping
+            )
+        else:
+            # Shared, so the offload pool can keep it for a running job.
+            var shared = SharedCancelHandler(handler^)
+            run_reactor_loop_cancel(
+                self._listener, self.config, shared, self._stopping
+            )
 
     def local_addr(self) -> SocketAddr:
         """Return the local address the server is bound to."""

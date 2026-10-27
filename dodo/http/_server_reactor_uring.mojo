@@ -19,15 +19,12 @@ from dodo.http._offload_pool import (
     offload_free,
     offload_job,
     offload_outstanding,
-    offload_port_borrows_handler,
-    offload_port_close,
     offload_port_open,
     offload_take_done,
 )
 from dodo.http.server import ServerConfig
 from dodo.net import SocketAddr
 from dodo.net._libc import _close
-from dodo.utils import usleep
 from dodo.tcp import TcpStream, TcpListener
 from dodo.runtime import Pool
 from dodo.runtime.scheduler import (
@@ -52,6 +49,7 @@ from ._reactor import (
     STATE_WRITING,
     _monotonic_ms,
 )
+from ._reactor.offload_loop import close_offload_port
 from ._server_uring_setup import _probe_bufring_setup_flags
 
 # Shared connection-lifecycle helpers live in ``_server_reactor_epoll``
@@ -702,22 +700,6 @@ def _br_settled(conns: Dict[UInt64, Int]) -> Bool:
     return True
 
 
-def _br_close_offload_port(port: Int):
-    """Cancel every job still out and close the port. A borrowed
-    (non-``Copyable``) handler is still in use by a running job, so then
-    the worker waits for its jobs first."""
-    if port == 0:
-        return
-    offload_cancel_all(port, CancelReason.SHUTDOWN)
-    if offload_port_borrows_handler(port):
-        while offload_outstanding(port) > 0:
-            usleep(1000)
-            var jobs = offload_take_done(port)
-            for i in range(len(jobs)):
-                offload_free(jobs[i])
-    offload_port_close(port)
-
-
 def run_uring_bufring_reactor_loop[
     H: Handler,
 ](
@@ -1013,7 +995,7 @@ def run_uring_bufring_reactor_loop_shared[
         _cleanup_conn_uring_br(leftover[i], conns, ureactor)
     for i in range(len(parked.held)):
         offload_free(parked.held[i])
-    _br_close_offload_port(offload_port)
+    close_offload_port(offload_port)
     try:
         ureactor.unregister_pbuf_ring(
             _URING_BR_BGID, ring_addr, _URING_BR_NBUFS

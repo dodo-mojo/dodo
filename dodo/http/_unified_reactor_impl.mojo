@@ -1553,7 +1553,7 @@ def _run_unified_loop_for_fd[
     var still_live = _drain_remaining_conns_unified(
         conns, timers, reactor, wheel
     )
-    close_offload_port(offload_port, reactor)
+    close_offload_port(offload_port)
     store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, still_live)
 
 

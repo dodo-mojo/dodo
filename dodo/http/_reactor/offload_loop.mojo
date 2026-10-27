@@ -15,12 +15,10 @@ from dodo.http._offload_pool import (
     offload_cancel_all,
     offload_free,
     offload_job,
-    offload_outstanding,
-    offload_port_borrows_handler,
     offload_port_close,
     offload_take_done,
 )
-from dodo.runtime import Event, Reactor, TimerWheel
+from dodo.runtime import Reactor, TimerWheel
 
 from .keepalive_scan import STATE_PARKED, STATE_WRITING
 from .lifecycle import _apply_step, _cleanup_conn, _conn_ptr_from_int
@@ -127,26 +125,14 @@ def offload_settled_h1(conns: Dict[Int, Int]) raises -> Bool:
     return True
 
 
-def close_offload_port(port: Int, mut reactor: Reactor):
+def close_offload_port(port: Int):
     """Cancel every job this worker still has out and close its port.
 
     Queued jobs are skipped once cancelled. A running one finishes on
     the port's own copy of the handler and is freed by the pool, so the
-    worker returns at once. Only a handler that is not ``Copyable`` is
-    borrowed by its jobs, and then the worker waits for them.
+    worker returns at once.
     """
     if port == 0:
         return
     offload_cancel_all(port, CancelReason.SHUTDOWN)
-    if offload_port_borrows_handler(port):
-        var events = List[Event]()
-        while offload_outstanding(port) > 0:
-            events.clear()
-            try:
-                _ = reactor.poll(10, events)
-            except:
-                pass
-            var jobs = offload_take_done(port)
-            for i in range(len(jobs)):
-                offload_free(jobs[i])
     offload_port_close(port)

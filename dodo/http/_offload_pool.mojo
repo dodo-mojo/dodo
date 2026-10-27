@@ -436,14 +436,10 @@ struct OffloadPort(Movable):
     var wake_fd: Int
     var pool: Int
     var handler_addr: Int
-    """The handler jobs run: the port's own copy, or the worker's
-    handler when its type is not ``Copyable``."""
+    """The port's own copy of the handler jobs run."""
     var serve: def(Int, Request) raises thin -> Response
     var drop_handler: def(Int) thin -> None
     """Frees the handler at ``handler_addr`` with the port."""
-    var owns_handler: Bool
-    """False when jobs borrow the worker's handler, so the worker must
-    wait for every job before it returns."""
     var live: List[Int]
     """Jobs submitted and not yet taken back (worker only)."""
 
@@ -453,7 +449,6 @@ struct OffloadPort(Movable):
         handler_addr: Int,
         serve: def(Int, Request) raises thin -> Response,
         drop_handler: def(Int) thin -> None,
-        owns_handler: Bool,
         wake_fd: Int,
     ):
         var p = Pool[_OffloadPool].get_ptr(pool)
@@ -466,7 +461,6 @@ struct OffloadPort(Movable):
         self.handler_addr = handler_addr
         self.serve = serve
         self.drop_handler = drop_handler
-        self.owns_handler = owns_handler
         self.live = List[Int]()
 
 
@@ -540,7 +534,6 @@ def _open_port(
     handler_addr: Int,
     serve: def(Int, Request) raises thin -> Response,
     drop_handler: def(Int) thin -> None,
-    owns_handler: Bool,
     wake_fd: Int,
     threads: Int,
     depth: Int,
@@ -548,7 +541,7 @@ def _open_port(
     var pool = _pool_start(threads, depth)
     return Pool[OffloadPort].alloc_move(
         OffloadPort(
-            pool, handler_addr, serve, drop_handler, owns_handler, wake_fd
+            pool, handler_addr, serve, drop_handler, wake_fd
         )
     )
 
@@ -559,32 +552,23 @@ def offload_port_open[
     """Open a port for a worker serving ``handler``, starting the pool if
     this is its first user. Returns the port's address.
 
-    A ``Copyable`` handler is copied into the port, so a job still
-    running when the worker stops keeps a live handler after the worker
-    returns. Any other handler is borrowed, and the worker waits for its
-    jobs before it returns."""
-    comptime if conforms_to(H, Copyable):
-        comptime C = downcast[H, Copyable & Handler]
-        var copy = rebind[C](handler).copy()
-        return _open_port(
-            Pool[C].alloc_move(copy^),
-            _offload_serve_thunk[C],
-            _drop_handler_copy[C],
-            True,
-            wake_fd,
-            threads,
-            depth,
-        )
-    else:
-        return _open_port(
-            Int(Pointer[H, _](to=handler)),
-            _offload_serve_thunk[H],
-            _keep_handler,
-            False,
-            wake_fd,
-            threads,
-            depth,
-        )
+    The handler is copied into the port, so a job still running when the
+    worker stops keeps a live handler after the worker returns. The
+    server wraps a handler that is not ``Copyable`` in a
+    ``SharedHandler`` before any worker sees it."""
+    comptime assert conforms_to(
+        H, Copyable
+    ), "offload: wrap a handler that is not Copyable in SharedHandler"
+    comptime C = downcast[H, Copyable & Handler]
+    var copy = rebind[C](handler).copy()
+    return _open_port(
+        Pool[C].alloc_move(copy^),
+        _offload_serve_thunk[C],
+        _drop_handler_copy[C],
+        wake_fd,
+        threads,
+        depth,
+    )
 
 
 def _no_serve(addr: Int, req: Request) raises -> Response:
@@ -596,9 +580,7 @@ def offload_port_open_bare(
 ) raises -> Int:
     """Open a port whose jobs each bring their own handler copy
     (:func:`offload_submit_call`), for the streaming loop."""
-    return _open_port(
-        0, _no_serve, _keep_handler, True, wake_fd, threads, depth
-    )
+    return _open_port(0, _no_serve, _keep_handler, wake_fd, threads, depth)
 
 
 def offload_port_open_cancel[
@@ -606,29 +588,21 @@ def offload_port_open_cancel[
 ](ref handler: CH, wake_fd: Int, threads: Int, depth: Int) raises -> Int:
     """:func:`offload_port_open` for a ``CancelHandler``. Jobs call
     ``serve(req, req.cancel)``, so the handler sees the job's cancel
-    cell."""
-    comptime if conforms_to(CH, Copyable):
-        comptime C = downcast[CH, Copyable & CancelHandler]
-        var copy = rebind[C](handler).copy()
-        return _open_port(
-            Pool[C].alloc_move(copy^),
-            _offload_cancel_serve_thunk[C],
-            _drop_cancel_handler_copy[C],
-            True,
-            wake_fd,
-            threads,
-            depth,
-        )
-    else:
-        return _open_port(
-            Int(Pointer[CH, _](to=handler)),
-            _offload_cancel_serve_thunk[CH],
-            _keep_handler,
-            False,
-            wake_fd,
-            threads,
-            depth,
-        )
+    cell. A handler that is not ``Copyable`` arrives wrapped in a
+    ``SharedCancelHandler``."""
+    comptime assert conforms_to(
+        CH, Copyable
+    ), "offload: wrap a handler that is not Copyable in SharedCancelHandler"
+    comptime C = downcast[CH, Copyable & CancelHandler]
+    var copy = rebind[C](handler).copy()
+    return _open_port(
+        Pool[C].alloc_move(copy^),
+        _offload_cancel_serve_thunk[C],
+        _drop_cancel_handler_copy[C],
+        wake_fd,
+        threads,
+        depth,
+    )
 
 
 def offload_submit(
@@ -780,14 +754,6 @@ def offload_cancel_all(port_addr: Int, reason: Int):
     var port = Pool[OffloadPort].get_ptr(port_addr)
     for i in range(len(port[].live)):
         offload_cancel(port[].live[i], reason)
-
-
-def offload_port_borrows_handler(port_addr: Int) -> Bool:
-    """Whether jobs on this port run the worker's own handler, so the
-    worker has to wait for them before it returns."""
-    if port_addr == 0:
-        return False
-    return not Pool[OffloadPort].get_ptr(port_addr)[].owns_handler
 
 
 def offload_port_close(port_addr: Int):

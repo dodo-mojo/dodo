@@ -342,7 +342,7 @@ def _run_handler_loop_impl[
         leftover.append(kv.key)
     for i in range(len(leftover)):
         _cleanup_conn(leftover[i], conns, timers, reactor, wheel)
-    close_offload_port(offload_port, reactor)
+    close_offload_port(offload_port)
 
 
 def run_reactor_loop_shared[
@@ -629,4 +629,4 @@ def run_reactor_loop_cancel[
         ch_ptr[].cancel_cell.flip(CancelReason.SHUTDOWN)
         ch_ptr[].offload_abandon(CancelReason.SHUTDOWN)
         _cleanup_conn(leftover[i], conns, timers, reactor, wheel)
-    close_offload_port(offload_port, reactor)
+    close_offload_port(offload_port)

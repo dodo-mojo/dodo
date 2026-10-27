@@ -51,7 +51,7 @@ from dodo.tcp import TcpListener, TcpStream, accept_fd
 
 from .cancel import CancelReason
 from .response import Response
-from .streaming_server import StreamConn, StreamHandler
+from .streaming_server import StreamConn, StreamHandler, _OffloadSlot
 from ._offload_pool import (
     offload_cancel,
     offload_cancel_all,
@@ -107,7 +107,7 @@ struct _StreamOffload(Movable):
     """The loop's link to the offload pool. The port opens on the first
     ``StreamConn.offload``, so a front that never offloads starts no
     pool. This loop has no timer wheel, so handler deadlines are kept
-    here, per client fd."""
+    here, per job."""
 
     var port: Int
     var wake_fd: Int
@@ -115,6 +115,7 @@ struct _StreamOffload(Movable):
     var depth: Int
     var timeout_ms: Int
     var deadlines: Dict[Int, Int]
+    """Job address to its handler deadline, until the job comes back."""
 
     def __init__(out self, wake_fd: Int, config: ServerConfig):
         self.port = 0
@@ -130,21 +131,31 @@ struct _StreamOffload(Movable):
     def submit[
         H: StreamHandler
     ](mut self, mut handler: H, mut conn: StreamConn, fd: Int) raises:
-        """Queue what the last callback passed to ``conn.offload``. A
-        full queue is answered with 503 at once."""
-        while conn._offload_call:
-            var call = conn._offload_call.take()
+        """Queue what the last callback passed to ``conn.offload``, then
+        hand the front every answer that is ready, oldest first. A full
+        queue answers 503 in that request's turn."""
+        while True:
+            self._queue(conn, fd)
+            if not conn._offload_next_ready():
+                return
+            handler.on_offload_done(conn, conn._offload_take_next())
+
+    def _queue(mut self, mut conn: StreamConn, fd: Int) raises:
+        while len(conn._offload_calls) > 0:
+            var call = conn._offload_calls.pop(0)
             if self.port == 0:
                 self.port = offload_port_open_bare(
                     self.wake_fd, self.threads, self.depth
                 )
             var job = offload_submit_call(self.port, call^, fd)
             if job == 0:
-                handler.on_offload_done(conn, unavailable_response())
+                conn._offload_slots.append(
+                    _OffloadSlot(unavailable_response())
+                )
                 continue
-            conn._offload_job = job
+            conn._offload_slots.append(_OffloadSlot(job))
             if self.timeout_ms > 0:
-                self.deadlines[fd] = _monotonic_ms() + self.timeout_ms
+                self.deadlines[job] = _monotonic_ms() + self.timeout_ms
 
     def poll_timeout_ms(self, cap_ms: Int) -> Int:
         """How long to block: until the earliest handler deadline, at
@@ -158,7 +169,7 @@ struct _StreamOffload(Movable):
         return max(wait, 0)
 
     def expired(mut self) -> List[Int]:
-        """Client fds whose handler deadline ran out; forgotten here."""
+        """Jobs whose handler deadline ran out; forgotten here."""
         var now = _monotonic_ms()
         var out = List[Int]()
         for kv in self.deadlines.items():
@@ -174,17 +185,30 @@ def _give_offload_response[
 ](
     mut conns: Dict[Int, StreamConn],
     fd: Int,
+    job: Int,
     var resp: Response,
     mut handler: H,
     mut off: _StreamOffload,
 ) raises -> Bool:
-    """Hand ``resp`` to the front and send what it queued. True when the
-    connection is done and can be dropped."""
+    """Record ``resp`` as the answer to ``job``, hand the front what is
+    ready and send what it queued. True when the connection is done and
+    can be dropped."""
     ref c = conns[fd]
-    handler.on_offload_done(c, resp^)
-    _ = c.drain_nonblocking()
+    c._offload_answer(job, resp^)
     off.submit(handler, c, fd)
+    _ = c.drain_nonblocking()
     return c.is_closing() and not c.has_pending_out()
+
+
+def _waits_on(conns: Dict[Int, StreamConn], fd: Int, job: Int) -> Bool:
+    """Whether the connection on ``fd`` still waits for ``job``. False
+    when the connection is gone or the fd now belongs to another one."""
+    if fd not in conns:
+        return False
+    try:
+        return conns[fd]._offload_waits_on(job)
+    except:
+        return False
 
 
 def _answer_offload[
@@ -195,6 +219,7 @@ def _answer_offload[
     mut interests: Dict[Int, Int],
     mut up_to_client: Dict[Int, Int],
     fd: Int,
+    job: Int,
     var resp: Response,
     mut handler: H,
     mut off: _StreamOffload,
@@ -203,7 +228,7 @@ def _answer_offload[
     what it queued and close the connection if it is done."""
     var drop_it = False
     try:
-        drop_it = _give_offload_response(conns, fd, resp^, handler, off)
+        drop_it = _give_offload_response(conns, fd, job, resp^, handler, off)
     except:
         drop_it = True
     if drop_it:
@@ -231,23 +256,15 @@ def _deliver_offloads[
     for i in range(len(jobs)):
         var job = jobs[i]
         var fd = offload_job(job)[].fd
-        var waiting = False
-        try:
-            waiting = fd in conns and conns[fd]._offload_job == job
-        except:
-            pass
-        if waiting:
-            try:
-                conns[fd]._offload_job = 0
-            except:
-                pass
-            _ = off.deadlines.pop(fd, 0)
+        _ = off.deadlines.pop(job, 0)
+        if _waits_on(conns, fd, job):
             _answer_offload(
                 reactor,
                 conns,
                 interests,
                 up_to_client,
                 fd,
+                job,
                 offload_job_response(job),
                 handler,
                 off,
@@ -267,17 +284,13 @@ def _expire_offloads[
 ):
     """``handler_timeout_ms`` ran out: cancel the job with ``TIMEOUT``
     and answer 503."""
-    var fds = off.expired()
-    for i in range(len(fds)):
-        var fd = fds[i]
-        var job = 0
-        try:
-            if fd in conns:
-                job = conns[fd]._offload_job
-                conns[fd]._offload_job = 0
-        except:
-            pass
-        if job == 0:
+    var jobs = off.expired()
+    for i in range(len(jobs)):
+        var job = jobs[i]
+        # The job stays alive until the pool hands it back, so its fd
+        # can still be read.
+        var fd = offload_job(job)[].fd
+        if not _waits_on(conns, fd, job):
             continue
         offload_cancel(job, CancelReason.TIMEOUT)
         _answer_offload(
@@ -286,6 +299,7 @@ def _expire_offloads[
             interests,
             up_to_client,
             fd,
+            job,
             unavailable_response(),
             handler,
             off,
@@ -351,10 +365,8 @@ def _close_conn[
         # producing before we drop it. No-op for a front managing its
         # own raw-fd upstream.
         conn._maybe_cancel_upstream()
-        # A request still on the offload pool has no one to answer.
-        if conn._offload_job != 0:
-            offload_cancel(conn._offload_job, CancelReason.PEER_CLOSED)
-            conn._offload_job = 0
+        # Requests still on the offload pool have no one to answer.
+        conn._offload_cancel_all(CancelReason.PEER_CLOSED)
         try:
             handler.on_close(conn)
         except:
@@ -617,8 +629,8 @@ def _run_stream_loop_impl[
                     var open_ok = True
                     try:
                         handler.on_open(conn)
-                        _ = conn.drain_nonblocking()
                         off.submit(handler, conn, cfd)
+                        _ = conn.drain_nonblocking()
                     except:
                         open_ok = False
                     if not open_ok or (
@@ -660,8 +672,8 @@ def _run_stream_loop_impl[
                 ref uc = conns[client_fd]
                 try:
                     handler.on_upstream(uc)
-                    _ = uc.drain_nonblocking()
                     off.submit(handler, uc, client_fd)
+                    _ = uc.drain_nonblocking()
                 except:
                     up_drop = True
                 if not up_drop:
@@ -765,4 +777,4 @@ def _run_stream_loop_impl[
     # by ``_close_conn`` as each owning connection is torn down.
     for fd_key in _client_fds(interests):
         _close_conn(reactor, conns, interests, up_to_client, fd_key, handler)
-    close_offload_port(off.port, reactor)
+    close_offload_port(off.port)
