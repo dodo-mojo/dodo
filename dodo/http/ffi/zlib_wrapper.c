@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "scratch_cache.h"
+#include "../../utils/ffi/pin_self.h"
 
 #include <libdeflate.h>
 

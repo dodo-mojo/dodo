@@ -6,7 +6,8 @@
 # skips the build when the library is newer than its sources.
 #
 # Linked with `-z nodelete` on Linux so the library is never unmapped once
-# loaded, even if a call site drops its handle early.
+# loaded, even if a call site drops its handle early. macOS has no such flag;
+# the library pins itself instead (dodo/utils/ffi/pin_self.h).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../../../build"
@@ -14,6 +15,7 @@ TARGET="$BUILD_DIR/libdodo_tls.so"
 INSTALLED="$CONDA_PREFIX/lib/libdodo_tls.so"
 SOURCE="$SCRIPT_DIR/openssl_wrapper.cpp"
 HEADER="$SCRIPT_DIR/openssl_wrapper.h"
+PIN_HEADER="$SCRIPT_DIR/../../utils/ffi/pin_self.h"
 
 if [ -z "$CONDA_PREFIX" ]; then
     echo "dodo: CONDA_PREFIX not set, skipping the TLS wrapper build" >&2
@@ -25,6 +27,7 @@ _tls_needs_rebuild() {
     [ ! -f "$INSTALLED" ] && return 0
     [ "$SOURCE" -nt "$TARGET" ] && return 0
     [ "$HEADER" -nt "$TARGET" ] && return 0
+    [ "$PIN_HEADER" -nt "$TARGET" ] && return 0
     [ "$CONDA_PREFIX/lib/libssl.so" -nt "$TARGET" ] 2>/dev/null && return 0
     [ "$TARGET" -nt "$INSTALLED" ] 2>/dev/null && return 0
     return 1
@@ -43,7 +46,7 @@ mkdir -p "$BUILD_DIR"
 
 if [[ "$(uname)" == "Darwin" ]]; then
     CXX="clang++"
-    NODELETE=""
+    NODELETE=""  # see pin_self.h
 else
     CXX="g++"
     NODELETE="-Wl,-z,nodelete"
@@ -57,6 +60,9 @@ if $CXX -O2 -std=c++17 -fPIC -DNDEBUG -shared \
     -lssl -lcrypto \
     $NODELETE \
     -Wl,-rpath,"$CONDA_PREFIX/lib"; then
+    # Replace the file instead of overwriting it: macOS kills any process
+    # that loads a signed library whose file was rewritten in place.
+    rm -f "$INSTALLED"
     cp "$TARGET" "$INSTALLED"
     echo "dodo: built $INSTALLED"
 else

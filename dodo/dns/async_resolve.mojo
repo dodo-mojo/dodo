@@ -1,7 +1,7 @@
 """DNS resolution on a separate thread + happy-eyeballs ordering.
 
 ``getaddrinfo(3)`` is a blocking syscall with no async variant on the
-platforms dodo targets. :func:`resolve_async` runs it on a fresh pool
+platforms dodo targets. :func:`resolve_async` runs it on a fresh OS
 thread (the pthread mechanism :func:`block_in_pool` uses) **and waits
 for that thread**: the caller is blocked for the whole lookup, exactly
 as with :func:`dodo.dns.resolve`. What it adds is a separate stack and
@@ -121,7 +121,9 @@ def resolve_async(host: String, cancel: Cancel) raises -> List[IpAddr]:
     )
 
     try:
-        var handle = ThreadHandle.spawn[_resolve_start](ctx_opaque)
+        # Not a pool task: a pool join can run the lookup on the
+        # caller's own thread (see dodo.runtime.blocking).
+        var handle = ThreadHandle.spawn_os[_resolve_start](ctx_opaque)
         handle.join()
     except e:
         Pool[String].free(host_addr)

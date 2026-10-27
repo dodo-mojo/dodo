@@ -24,11 +24,11 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels and agent harnesse
 
 ## Toolchain
 
-- Mojo has no Windows support. Build and run everything in **WSL Ubuntu-24.04**: `wsl -d Ubuntu-24.04 -- bash -l`.
-- Mojo 1.2.0 and MAX/modular 26.7.0 via pixi (`~/.pixi/bin`). The repo is used from WSL as `/mnt/e/dodo`; `.pixi/config.toml` keeps the env off the Windows drive.
+- Two dev machines. **macOS (Apple Silicon):** native, repo at `~/anubhav/dodo`, kqueue backend, FFI wrappers built with clang++. **Windows:** Mojo has no Windows support, so build in **WSL Ubuntu-24.04** (`wsl -d Ubuntu-24.04 -- bash -l`), repo at `/mnt/e/dodo`. Linux-only code (epoll, io_uring, accept balancing) is only tested on WSL. macOS has no `-z nodelete`, so each wrapper library pins itself (`dodo/utils/ffi/pin_self.h`); never overwrite an installed `.so` in place (macOS SIGKILLs the next process that loads it).
+- Mojo 1.2.0 and MAX/modular 26.7.0 via pixi (`~/.pixi/bin`). `.pixi/config.toml` keeps the env out of the repo (detached environments).
 - `pixi run tests` runs everything (about 2,450 tests). After adding a test file: `pixi run tests-gen`. One file: `pixi run mojo -I . tests/http/test_x.mojo`. Use `AGG_JOBS=2` on 16 GB machines.
 - Mojo 1.x: `def` only (`fn` is removed), and `raises` must be explicit. GPU code is under `max.gpu`.
-- The GPU is an RTX 5070, verified working.
+- GPU work runs on the Windows machine's RTX 5070 (verified working). The Mac has no NVIDIA GPU.
 - Reference clones live in WSL under `~/src/`.
 - WSL2's wall clock jumps 2–3 s when it resyncs. Time benchmarks with a monotonic clock, or rerun any `wrk` run with a p99 around 1–2 s.
 - **Stale builds after Windows-side edits:** WSL can keep old memory-mapped pages of a file edited from Windows, and Mojo compiles that old code. Before building, run `wsl -d Ubuntu-24.04 -u root -- sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"`. Never trust a binary from a build whose exit status you didn't check.
@@ -37,9 +37,10 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels and agent harnesse
 
 - Commits: `type: one line`, with no em dashes, no body, and **no Claude co-author trailer**. Only commit when asked.
 - Ask the human one decision at a time, with a recommendation.
+- Offloaded blocking work (`block_in_pool`, `resolve_async`) uses `ThreadHandle.spawn_os`, never a pool task: joining a pool task from a reactor worker can run the task on that worker.
 - Simple, readable code over clever code. No dense one-liners.
 - Goal: the fastest Mojo framework. Profile before optimizing; show before/after numbers on hot-path PRs; delete code nothing on the roadmap uses.
 - Major decision → write an ADR. Anything smaller → `TODO.md`.
 - Test every UI input and button against its edge cases in the built-in browser.
-- In imported code, delete changelog-style or personal comments ("v0.11:", "C7:", "Step 2") whenever you touch a file. Never follow the original project's conventions.
+- In imported code, fix slow code and workarounds for old Mojo bugs as you find them (measure the claim first; Mojo 1.2.0 fixed many). Delete changelog-style or personal comments ("v0.11:", "C7:", "Step 2") whenever you touch a file. Never follow the original project's conventions.
 - Update this file when layout, commands or decisions change. Keep it under about 60 lines; link, don't copy.

@@ -30,6 +30,7 @@
 #include <stdint.h>
 
 #include "scratch_cache.h"
+#include "../../utils/ffi/pin_self.h"
 
 /* ── Inline brotli ABI declarations (minimal subset) ─────────────────────── */
 

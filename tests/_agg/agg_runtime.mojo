@@ -369,6 +369,9 @@ from test_libc_time import (
 from test_libc_time import (
     test_hundred_one_ms_sleeps_within_2000ms as test_libc_time__test_hundred_one_ms_sleeps_within_2000ms,
 )
+from test_libc_time import (
+    test_one_ms_sleeps_stay_accurate_with_many_threads as test_libc_time__test_one_ms_sleeps_stay_accurate_with_many_threads,
+)
 from test_pool import (
     test_alloc_returns_nonzero_address as test_pool__test_alloc_returns_nonzero_address,
 )
@@ -1062,6 +1065,9 @@ def main() raises:
     suite.test[test_libc_time__test_monotonic_is_non_decreasing]()
     suite.test[test_libc_time__test_monotonic_tracks_a_sleep]()
     suite.test[test_libc_time__test_hundred_one_ms_sleeps_within_2000ms]()
+    suite.test[
+        test_libc_time__test_one_ms_sleeps_stay_accurate_with_many_threads
+    ]()
     # tests/runtime/test_pool.mojo
     suite.test[test_pool__test_alloc_returns_nonzero_address]()
     suite.test[test_pool__test_alloc_then_get_ptr_reads_value]()

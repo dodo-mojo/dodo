@@ -17,9 +17,13 @@ Covers:
   inbox refuses further pushes.
 - After ``close`` no push is accepted and what was queued can still be
   drained.
+
+The group only exists on Linux, so the tests that need one return early
+elsewhere.
 """
 
 from std.memory import Pointer, Layout, alloc
+from std.sys.info import CompilationTarget
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
 from dodo.runtime._balance import (
@@ -71,6 +75,8 @@ def test_open_without_group_is_disabled() raises:
 
 
 def test_pick_keeps_connection_when_even() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(3)
     var c0 = _stats_cell(g, 0)
     var c1 = _stats_cell(g, 1)
@@ -91,6 +97,8 @@ def test_pick_keeps_connection_when_even() raises:
 
 
 def test_pick_keeps_connection_below_floor() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(2)
     var c0 = _stats_cell(g, 0)
     var c1 = _stats_cell(g, 1)
@@ -105,6 +113,8 @@ def test_pick_keeps_connection_below_floor() raises:
 
 
 def test_pick_names_least_loaded_peer() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(4)
     var cells = List[Int]()
     var bs = List[Balancer]()
@@ -130,6 +140,8 @@ def test_pick_names_least_loaded_peer() raises:
 
 
 def test_pick_counts_pending_as_load() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(2)
     var c0 = _stats_cell(g, 0)
     var c1 = _stats_cell(g, 1)
@@ -152,6 +164,8 @@ def test_pick_counts_pending_as_load() raises:
 
 
 def test_pick_skips_peer_that_is_not_live() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(3)
     var c0 = _stats_cell(g, 0)
     var c1 = _stats_cell(g, 1)
@@ -174,6 +188,8 @@ def test_pick_skips_peer_that_is_not_live() raises:
 
 
 def test_push_pop_is_fifo() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(2)
     var c0 = _stats_cell(g, 0)
     var c1 = _stats_cell(g, 1)
@@ -198,6 +214,8 @@ def test_push_pop_is_fifo() raises:
 
 
 def test_push_rejects_bad_target() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(2)
     var c0 = _stats_cell(g, 0)
     var b0 = Balancer.open(c0, 0)
@@ -209,6 +227,8 @@ def test_push_rejects_bad_target() raises:
 
 
 def test_full_inbox_refuses_and_wraps() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(2)
     var c0 = _stats_cell(g, 0)
     var c1 = _stats_cell(g, 1)
@@ -235,6 +255,8 @@ def test_full_inbox_refuses_and_wraps() raises:
 
 
 def test_close_refuses_pushes_and_leaves_queue_drainable() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # the balancing group only exists on Linux
     var g = balance_group_alloc(2)
     var c0 = _stats_cell(g, 0)
     var c1 = _stats_cell(g, 1)

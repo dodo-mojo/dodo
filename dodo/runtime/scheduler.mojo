@@ -75,7 +75,6 @@ Known limitations:
 """
 
 from std.atomic import Atomic, Ordering
-from std.ffi import c_int, external_call
 from std.memory import Layout, Pointer, alloc
 
 from std.os import getenv
@@ -107,7 +106,7 @@ from .scheduler_stats import (
     WORKER_STATUS_CRASHED,
 )
 from ._worker import _WorkerCtx, _worker_entry
-from ._libc_time import monotonic_now_ms
+from ._libc_time import libc_nanosleep_ms, monotonic_now_ms
 
 
 # ── ShutdownReport (per-worker drain accounting) ─────────────────────────────
@@ -838,9 +837,9 @@ struct Scheduler[F: Frontend](Movable):
         # return (WORKER_STAT_DONE), then join the ones that did and
         # detach the rest. This used to go straight to pthread_join, so
         # a worker stuck in a handler held drain(timeout_ms) for as long
-        # as the handler took, forever included. A yield loop, not a
-        # sleep: libc_nanosleep_ms after pthread_create trips the
-        # usleep-multiplier anomaly noted in shutdown().
+        # as the handler took, forever included. Checks every
+        # millisecond rather than spinning, so a long drain leaves the
+        # CPU to the workers it is waiting for.
         var n = self._workers_len
         var done = List[Bool](length=n, fill=True)
         if deadline_ms > 0:
@@ -856,7 +855,7 @@ struct Scheduler[F: Frontend](Movable):
                         all_done = False
                 if all_done or monotonic_now_ms() >= until:
                     break
-                _ = external_call["sched_yield", c_int]()
+                _ = libc_nanosleep_ms(1)
         var stuck = List[Int]()
         for i in range(n):
             try:

@@ -14,25 +14,23 @@ another thread:
 The handler stays in straight-line code; ``cancel`` short-
 circuits if the request is cancelled mid-blocking-call.
 
-Implementation: one AsyncRT task per call.
+Implementation: one dedicated OS thread per call.
 
-Each ``block_in_pool[T]`` call runs ``work()`` as a task on the
-AsyncRT pool (``ThreadHandle.spawn``), surfaces the result back
-through a heap-allocated task struct, and joins the task. A
-reactor worker is itself a pool task, so its join donates: while
-it waits it runs queued pool tasks, its own ``work()`` included
-if no other worker has taken it. In a forked child, which has no
-pool, the task is a fresh OS thread instead.
+Each ``block_in_pool[T]`` call runs ``work()`` on a fresh pthread
+(``ThreadHandle.spawn_os``), surfaces the result back through a
+heap-allocated task struct, and joins the thread.
 
 Notes on the design:
 
-1. The pool is shared with the stdlib, so there is no dodo-side
-   pool to size or keep alive, and a task costs an enqueue rather
-   than a ``pthread_create`` (~30-50 µs on Linux x86_64).
-2. A ``work()`` that blocks holds its pool worker for as long as
-   it blocks. A reactor that donates while joining can also pick
-   up someone else's queued ``work()`` before it returns to its
-   own connections.
+1. Not an AsyncRT task. A reactor worker is itself a pool task, and
+   a pool join donates the waiting thread: it runs queued tasks,
+   its own ``work()`` included, so ``work()`` would block the very
+   reactor it was meant to spare. ``pthread_join`` only waits. The
+   price is a ``pthread_create`` per call (~30-50 µs on Linux
+   x86_64), small next to work worth offloading. ADR-0004's pool
+   replaces this.
+2. A blocking ``work()`` holds its own thread, never a pool worker,
+   so it cannot starve the reactors or the stdlib's tasks.
 3. The MAX_POOL_SIZE cap (32) is enforced process-wide via a
    kernel-backed POSIX named semaphore shared by ``block_in_pool``
    and ``resolve_async``: a call that would exceed the cap raises
@@ -45,9 +43,9 @@ Notes on the design:
 
 What the split actually buys:
 
-- Blocking syscalls inside ``work()`` run on another pool worker
-  when one is free, so the kernel can schedule other reactor
-  workers onto the freed CPU while the syscall is waiting.
+- Blocking syscalls inside ``work()`` run on their own thread, so
+  the kernel can schedule other reactor workers onto the freed CPU
+  while the syscall is waiting.
 - Multi-worker parallelism: N concurrent connections on N
   reactor workers each calling ``block_in_pool`` get up to N
   parallel ``work()`` executions, instead of being serialised
@@ -81,17 +79,11 @@ Cancel contract (unchanged from the in-thread fallback):
 
 Why join rather than poll-on-done-flag:
 
-A previous iteration of this implementation polled a heap
-``done_flag`` byte with a 1 ms ``libc_usleep`` between checks
-to surface mid-flight cancel without waiting for ``work()``
-to complete. ``libc_usleep`` hits the documented 1000-1500x
-multiplier when the calling thread
-participates in multi-threaded contexts (and a ``block_in_pool``
-caller is, by construction, multi-threaded). That made the 1 ms
-poll behave like a 1 second poll and dragged the per-call
-latency from ~50 µs to ~1.1 s. Joining sidesteps the libc-time
-path entirely, so per-call latency is the spawn + work + join
-cost.
+Polling a done flag would let a mid-flight cancel raise before
+``work()`` returns, but every poll interval adds latency to every
+call, and the caller is blocked either way. Joining wakes the
+caller the moment ``work()`` returns, so per-call latency is the
+spawn + work + join cost.
 
 The trade-off is that mid-flight cancel no longer raises
 *before* ``work()`` returns; it raises *after*. Handlers that
@@ -387,12 +379,11 @@ def _raise_cancel(prefix: String, reason: Int) raises:
 def block_in_pool[
     T: Deinitable & Movable
 ](work: def() raises thin -> T, cancel: Cancel) raises -> T:
-    """Run ``work()`` as an AsyncRT task; wait for its result on the
+    """Run ``work()`` on another thread; wait for its result on the
     calling thread.
 
-    The task holds a pool worker for as long as ``work()`` blocks
-    (see ``dodo.runtime._asyncrt``). In a forked child it runs on a
-    fresh OS thread.
+    ``work()`` runs on a fresh OS thread, never on the caller's (see
+    the module docstring for why it is not a pool task).
 
     Pre-flight: if ``cancel`` is already flipped at entry, raise
     without spawning anything.
@@ -467,16 +458,13 @@ def block_in_pool[
     # ── Spawn worker task + block on join ───────────────────────────────────
     # Joining is the right primitive here: the user-visible API
     # is synchronous, so the submitter needs to wait until the worker
-    # has finished writing the result/error buffers anyway. Polling
-    # would mean either burning CPU (busy-wait) or going through
-    # libc_usleep, which hits the documented 1000-1500x multiplier
-    # in multi-threaded contexts and inflates
-    # per-call latency from ~50 us to ~1 s.
+    # has finished writing the result/error buffers anyway, and a
+    # join wakes it as soon as they are written.
     var task_opaque = Pointer[UInt8, MutUntrackedOrigin](
         unsafe_from_address=Int(task_ptr)
     )
     try:
-        var handle = ThreadHandle.spawn[_block_thunk[T]](task_opaque)
+        var handle = ThreadHandle.spawn_os[_block_thunk[T]](task_opaque)
         handle.join()
     except e:
         _pool_release()

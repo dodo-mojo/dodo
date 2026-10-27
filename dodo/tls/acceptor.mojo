@@ -207,8 +207,9 @@ struct TlsServerConfig(Copyable):
     10_000 (10 s). A slow or stalled client that never completes the
     handshake is aborted at the deadline so it cannot hold the
     worker indefinitely (slow-loris-on-handshake DoS bound). Measured
-    against a monotonic clock, not an iteration count, so it stays
-    honest under the libc-sleep multiplier. ``0`` disables the cap."""
+    against a monotonic clock, not an iteration count, so the time
+    spent in each ``SSL_accept`` call counts too. ``0`` disables the
+    cap."""
 
     def __init__(
         out self,
@@ -459,9 +460,9 @@ struct TlsAcceptor(Movable):
         #
         # Deadline is measured against a monotonic clock (not an
         # iteration count) so a slow/stalled client cannot hold the
-        # worker past ``handshake_timeout_ms`` even if the 1ms sleeps
-        # dilate under the libc-sleep multiplier. The reactor follow-up
-        # replaces this with poll-driven WANT_*-aware state transitions.
+        # worker past ``handshake_timeout_ms``, however long each
+        # SSL_accept call blocks. The reactor follow-up replaces this
+        # with poll-driven WANT_*-aware state transitions.
         var timeout_ms = self.config.handshake_timeout_ms
         # Bound a blocking SSL_accept read/write so a stalled client
         # cannot pin the worker inside the syscall past the deadline.

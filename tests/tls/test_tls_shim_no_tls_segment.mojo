@@ -4,8 +4,12 @@
 in it bumps glibc's TLS generation, and every other library's dynamic TLS
 access, the allocator's on every malloc and free included, then stays on
 ``__tls_get_addr``'s slow path.
+
+glibc and ELF are Linux-only, so the test returns early elsewhere (macOS
+libraries are Mach-O).
 """
 
+from std.sys.info import CompilationTarget
 from std.testing import TestSuite, assert_equal, assert_true
 
 from dodo.utils import find_dodo_lib
@@ -45,6 +49,8 @@ def _program_header_types(path: String) raises -> List[Int]:
 
 
 def test_openssl_shim_has_no_tls_segment() raises:
+    comptime if not CompilationTarget.is_linux():
+        return
     var types = _program_header_types(find_dodo_lib("tls"))
     assert_true(len(types) > 0)
     var tls = 0

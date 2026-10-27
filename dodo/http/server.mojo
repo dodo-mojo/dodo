@@ -839,13 +839,6 @@ struct HttpServer(Movable):
         # Block until the caller flips _stopping via close() or until
         # all workers exit (an external close() on each listener via
         # the scheduler's own shutdown path is the normal exit).
-        #
-        # Routes through ``libc_nanosleep_ms`` (50ms) rather than
-        # the inferred-signature ``usleep`` because Mojo mis-passes
-        # the c_uint argument and ends up sleeping ~50 seconds
-        # instead of 50 ms — the rolled-own FFI in
-        # ``dodo.runtime._libc_time`` has explicit Int32 /
-        # pointer-to-Int64 signatures.
         while not self._stopping and scheduler.is_running():
             # Coarse wait: the HttpServer loop on the main thread
             # doesn't need to be responsive the way the worker reactor
@@ -1095,9 +1088,7 @@ struct HttpServer(Movable):
         )
 
         # Block until self._stopping flips. Same 50 ms sleep loop the
-        # generic _serve_multicore uses (see the long comment there
-        # for why libc_nanosleep_ms beats the inferred-signature
-        # usleep).
+        # generic _serve_multicore uses.
         while not self._stopping and scheduler.is_running():
             _ = libc_nanosleep_ms(50)
 

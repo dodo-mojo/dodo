@@ -9,6 +9,7 @@
  */
 
 #include "openssl_wrapper.h"
+#include "../../utils/ffi/pin_self.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>

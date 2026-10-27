@@ -20,6 +20,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "../../utils/ffi/pin_self.h"
+
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif

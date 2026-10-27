@@ -1,20 +1,12 @@
 """libc time FFI.
 
-Mojo has an empirically-observed anomaly when calling ``usleep``
-via the inferred-signature overload of ``external_call``:
-``usleep(c_uint(1000))`` (1 ms
-expected) sleeps for ~1.5 seconds, and ``usleep(c_uint(50_000))``
-(50 ms expected) sleeps for ~56 seconds. The exact root cause
-hasn't been pinned down but the symptoms are consistent with a
-register-width / type-coercion mismatch somewhere in the
-``external_call`` path.
-
-The fix is to bind libc time primitives ourselves with explicit
-``Int32`` / pointer-to-``Int64`` signatures and stop relying on
-``std.ffi.c_uint``. Both functions in this module are tested
-empirically against monotonic-clock differences in
-``tests/test_libc_time.mojo`` so any future regression is caught
-in-tree rather than slowly through drain-test wall-time growth.
+An older Mojo passed the argument of an inferred-signature
+``external_call["usleep"]`` wrongly: a 1 ms sleep took ~1.5 s and a
+50 ms one ~56 s. These bindings use explicit signatures from that
+time. Mojo 1.2.0 sleeps accurately either way, on its own or with
+thousands of threads in the process, and
+``tests/runtime/test_libc_time.mojo`` checks the wall-clock semantics
+(a many-threads case included) so a regression shows up there first.
 
 POSIX semantics:
 

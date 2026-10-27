@@ -138,6 +138,10 @@ def _unlock(cell: Int):
 
 def _wake(fd: Int):
     """Make a sleeping ``Reactor.poll`` on the eventfd ``fd`` return."""
+    comptime if not CompilationTarget.is_linux():
+        # No group exists off Linux, so nothing calls this there; the guard
+        # keeps the Linux-only symbol out of the macOS link.
+        return
     if fd <= 0:
         return
     _ = external_call["eventfd_write", c_int](c_int(fd), UInt64(1))

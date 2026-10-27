@@ -14,7 +14,8 @@ which worker holds each connection. Scenarios:
 1. **Spread**: 64 keep-alive connections end up within a few connections
    of each other across the 4 workers, every connection stays served by
    the worker that owns it, and every response is intact (this covers a
-   handed-off stream being adopted and driven like any other).
+   handed-off stream being adopted and driven like any other). Linux
+   only: the balancing group does not exist elsewhere.
 2. **Churn on top of a loaded server**: with 40 connections held open
    (above the balancing floor), 100 short ``Connection: close`` requests
    all complete, so a hand-off never loses or double-serves a stream.
@@ -23,6 +24,7 @@ which worker holds each connection. Scenarios:
 from std.collections import Dict
 from std.ffi import c_int, c_size_t, c_uint, external_call
 from std.memory import stack_allocation
+from std.sys.info import CompilationTarget
 from std.testing import assert_equal, assert_true, TestSuite
 
 from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
@@ -50,12 +52,21 @@ comptime _TID_WIDTH = 8
 # ── Handler: reply with the id of the thread that served the request ───────
 
 
+def _thread_id() -> Int:
+    """A small id for the calling thread (fits in ``_TID_WIDTH`` digits)."""
+    comptime if CompilationTarget.is_linux():
+        return Int(external_call["gettid", c_int]())
+    else:
+        var me = external_call["pthread_self", UInt64]()
+        return Int(external_call["pthread_mach_thread_np", c_uint](me))
+
+
 @fieldwise_init
 struct _TidHandler(Copyable, Handler):
     var unused: Int
 
     def serve(self, req: Request) raises -> Response:
-        var tid = Int(external_call["gettid", c_int]())
+        var tid = _thread_id()
         var s = String(tid)
         var padded = String("")
         for _ in range(_TID_WIDTH - s.byte_length()):
@@ -142,6 +153,8 @@ comptime _CLOSE = (
 
 
 def test_connections_spread_evenly_across_workers() raises:
+    comptime if not CompilationTarget.is_linux():
+        return  # balancing only exists on Linux
     var started = _start_server()
     var pid = started[0]
     var port = started[1]

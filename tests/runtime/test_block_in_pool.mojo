@@ -206,19 +206,21 @@ def _capture_pthread_self() raises -> UInt64:
 
 
 def test_runs_on_different_thread() raises:
-    """``work()`` runs on a fresh kernel thread, not the caller's.
+    """``work()`` never runs on the caller's thread.
 
-    Pins the public contract that distinguishes the pthread
-    implementation from the in-thread fallback: kernel-level
-    parallelism. Without this, ``block_in_pool`` would be a
-    no-op wrapper around ``work()``.
+    One call can land on another thread by luck, so this makes many.
+    Without this, ``block_in_pool`` would be a no-op wrapper around
+    ``work()`` that stalls the caller's reactor.
     """
     var caller_tid = external_call["pthread_self", UInt64]()
-    var work_tid = block_in_pool[UInt64](_capture_pthread_self, Cancel.never())
-    assert_true(
-        caller_tid != work_tid,
-        "block_in_pool ran work on the caller's thread, not a fresh one",
-    )
+    for _ in range(200):
+        var work_tid = block_in_pool[UInt64](
+            _capture_pthread_self, Cancel.never()
+        )
+        assert_true(
+            caller_tid != work_tid,
+            "block_in_pool ran work on the caller's thread",
+        )
 
 
 # ── Process-wide thread-count cap (D2) ──────────────────────────────────────

@@ -11,6 +11,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../../../build"
+PIN_HEADER="$SCRIPT_DIR/../../utils/ffi/pin_self.h"
 
 if [ -z "$CONDA_PREFIX" ]; then
     echo "dodo: CONDA_PREFIX not set, skipping the HTTP wrapper builds" >&2
@@ -19,7 +20,7 @@ fi
 
 if [[ "$(uname)" == "Darwin" ]]; then
     CC="clang"
-    NODELETE=""
+    NODELETE=""  # no such flag on macOS; pin_self.h does the same
 else
     CC="gcc"
     NODELETE="-Wl,-z,nodelete"
@@ -40,7 +41,7 @@ _build_lib() {
     local stale=0
     if [ ! -f "$target" ] || [ ! -f "$installed" ]; then
         stale=1
-    elif [ "$source" -nt "$target" ] || [ "$SCRIPT_DIR/scratch_cache.h" -nt "$target" ]; then
+    elif [ "$source" -nt "$target" ] || [ "$SCRIPT_DIR/scratch_cache.h" -nt "$target" ] || [ "$PIN_HEADER" -nt "$target" ]; then
         stale=1
     elif [ "$target" -nt "$installed" ]; then
         stale=1
@@ -52,6 +53,9 @@ _build_lib() {
     if $CC -O2 -fPIC -shared -o "$target" "$source" \
         -I"$CONDA_PREFIX/include" -L"$CONDA_PREFIX/lib" \
         "$@" $NODELETE -Wl,-rpath,"$CONDA_PREFIX/lib"; then
+        # Replace the file instead of overwriting it: macOS kills any process
+        # that loads a signed library whose file was rewritten in place.
+        rm -f "$installed"
         cp "$target" "$installed"
         echo "dodo: built $installed"
     else

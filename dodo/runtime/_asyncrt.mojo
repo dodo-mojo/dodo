@@ -383,7 +383,7 @@ def asyncrt_worker_capacity() -> Int:
     across the whole process.
 
     One below the pool size, so at least one worker stays free for
-    short tasks (``block_in_pool``, DNS, the H3/H2 race) and for
+    short tasks (the H3/H2 race) and for
     whatever else in the process uses AsyncRT. Never below 1.
     """
     var n = parallelism_level() - 1
