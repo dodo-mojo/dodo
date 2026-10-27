@@ -54,6 +54,11 @@ and dropped until the peer closes or the linger time runs out, so a
 client still sending its request reads the response instead of a reset
 (RFC 9112 sec 9.6)."""
 
+comptime STATE_PARKED: Int = 4
+"""The request is running on the offload pool (ADR-0004). Nothing is
+parsed until its response comes back, since HTTP/1.1 responses go out in
+order; the socket is still read, to notice the client leaving."""
+
 comptime LINGER_READ_TIMEOUT_MS: Int = 2_000
 """Close a lingering connection that sends nothing for this long."""
 

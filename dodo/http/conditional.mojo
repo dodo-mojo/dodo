@@ -463,6 +463,12 @@ struct Conditional[Inner: Handler & Copyable](Copyable, Handler):
             return _make_412(resp^)
         return resp^
 
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
 
 def _make_304(var resp: Response) -> Response:
     """Rewrite ``resp`` into a 304 Not Modified per RFC 9110 §15.4.5.

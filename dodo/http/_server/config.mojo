@@ -144,13 +144,19 @@ struct ServerConfig(Copyable):
             last body byte (default 30_000). 0 disables. Guards the
             slow-body-upload variant of the slow-client DoS surface.
             Mirrors nginx's ``client_body_timeout``.
-        handler_timeout_ms: Intended cap on ``Handler.serve`` (or
-            ``CancelHandler.serve``) wall time (default 30_000). **Not
-            enforced yet**: handlers run synchronously on the worker
-            thread and nothing flips ``Cancel.TIMEOUT`` while one is
-            running. Kept so configs that set it stay valid, and still
-            checked against ``request_timeout_ms`` by
+        handler_timeout_ms: Max ms an ``Offload`` handler may run
+            (default 30_000). When it runs out the client gets 503,
+            ``req.cancel`` flips to ``TIMEOUT`` and the late result is
+            dropped. 0 disables. Inline handlers run on the worker
+            thread and can't be interrupted, so it does not bound them.
+            Checked against ``request_timeout_ms`` by
             ``ServerConfig.check``.
+        offload_threads: Threads in the process-wide offload pool that
+            runs ``Offload`` handlers (default 0: one per CPU core). The
+            first server to start the pool sizes it.
+        offload_queue_depth: Offloaded requests that may wait for a pool
+            thread (default 1024). When the queue is full the client gets
+            503 with ``Retry-After: 1`` at once.
         request_timeout_ms: Max ms to read one whole request, head and
             body, from its first byte (default 60_000); the reactor
             answers 408 and closes when it runs out. 0 disables. It
@@ -199,6 +205,8 @@ struct ServerConfig(Copyable):
     var expose_error_messages: Bool
     var read_body_timeout_ms: Int
     var handler_timeout_ms: Int
+    var offload_threads: Int
+    var offload_queue_depth: Int
     var request_timeout_ms: Int
     var header_timeout_ms: Int
     var min_body_rate: Int
@@ -234,7 +242,9 @@ struct ServerConfig(Copyable):
     a mid-flight env-var flip cannot reroute live connections.
     Linux-only, HTTP/1.1-only, single-listener-only -- the
     field is silently ignored on macOS / for HTTP/2 / for
-    a multi-address ``HttpServer.bind(List[SocketAddr])``."""
+    a multi-address ``HttpServer.bind(List[SocketAddr])``.
+    That loop has no offload pool, so a handler whose
+    ``may_block()`` is True is served by the reactor loop."""
     var h1_leniency: H1LeniencyConfig
     """HTTP/1.1 parser leniency configuration. Strict by default
     (every flag off); each named flag relaxes a specific RFC 9112
@@ -272,6 +282,8 @@ struct ServerConfig(Copyable):
         expose_error_messages: Bool = False,
         read_body_timeout_ms: Int = 30_000,
         handler_timeout_ms: Int = 30_000,
+        offload_threads: Int = 0,
+        offload_queue_depth: Int = 1024,
         request_timeout_ms: Int = 60_000,
         header_timeout_ms: Int = 10_000,
         min_body_rate: Int = 240,
@@ -294,6 +306,8 @@ struct ServerConfig(Copyable):
         self.expose_error_messages = expose_error_messages
         self.read_body_timeout_ms = read_body_timeout_ms
         self.handler_timeout_ms = handler_timeout_ms
+        self.offload_threads = offload_threads
+        self.offload_queue_depth = offload_queue_depth
         self.request_timeout_ms = request_timeout_ms
         self.header_timeout_ms = header_timeout_ms
         self.min_body_rate = min_body_rate
@@ -354,6 +368,12 @@ struct ServerConfig(Copyable):
         comptime assert (
             cfg.handler_timeout_ms >= 0
         ), "ServerConfig.handler_timeout_ms must be >= 0 (0 disables)"
+        comptime assert (
+            cfg.offload_threads >= 0
+        ), "ServerConfig.offload_threads must be >= 0 (0 = one per CPU core)"
+        comptime assert (
+            cfg.offload_queue_depth >= 1
+        ), "ServerConfig.offload_queue_depth must be >= 1"
         comptime assert (
             cfg.request_timeout_ms >= 0
         ), "ServerConfig.request_timeout_ms must be >= 0 (0 disables)"

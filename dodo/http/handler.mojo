@@ -154,6 +154,28 @@ trait Handler(Deinitable, Movable):
         """
         ...
 
+    def may_block(self) -> Bool:
+        """Whether any request to this handler may run on the offload pool.
+
+        Read once when a worker starts. ``False`` (the default) means the
+        worker never asks :meth:`blocking`, so a server without
+        :class:`dodo.http.Offload` pays nothing for it. ``Offload``
+        returns ``True``; a wrapper returns its inner handler's answer
+        and a ``Router`` returns whether any route does.
+        """
+        return False
+
+    def blocking(self, req: Request) raises -> Bool:
+        """Whether serving ``req`` may block, so the worker runs
+        ``serve(req)`` on the offload pool instead of inline (ADR-0004).
+
+        ``False`` by default. ``Offload`` returns ``True``; a wrapper
+        returns its inner handler's answer, and a ``Router`` asks the
+        route ``req`` matches. A wrapper that does not forward this keeps
+        an ``Offload`` inside it inline. A raise counts as ``False``.
+        """
+        return False
+
 
 # ── HandlerExtractor: convenience trait composition ──────────────────────────
 

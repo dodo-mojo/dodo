@@ -42,6 +42,12 @@ from std.memory.alloc import unsafe_alloc
 
 from dodo.errors import map_handler_error, log_handler_error
 from dodo.http.cancel import Cancel, CancelCell, CancelReason
+from dodo.http._offload_pool import (
+    offload_cancel,
+    offload_job,
+    offload_submit,
+    unavailable_response,
+)
 from dodo.http.handler import CancelHandler, Handler
 from dodo.http.headers import HeaderMap
 from dodo.http.request import Request
@@ -65,6 +71,7 @@ from ._reactor.tls_transport import TlsTransport
 
 from ._server_reactor_impl import (
     StepResult,
+    _monotonic_ms,
     STATE_READING,
     STATE_WRITING,
     STATE_CLOSING,
@@ -243,6 +250,25 @@ struct Http2ConnHandle(Movable):
     readability (renegotiation / KeyUpdate). The step arms both
     interests; the reactor re-enters the other drive path."""
 
+    # ── Offloaded streams (ADR-0004) ───────────────────────────────────────
+    var offload_port: Int
+    """The worker's ``OffloadPort`` address, or 0 when its handler never
+    offloads. Set by the unified loop."""
+
+    var offloads: Dict[Int, Int]
+    """Streams parked on the offload pool: stream id -> job address.
+    Only the stream waits; the connection keeps reading and serving."""
+
+    var offload_deadlines: Dict[Int, Int]
+    """Monotonic ms by which each parked stream must be answered
+    (``handler_timeout_ms``); absent when it is 0. The connection's timer
+    is armed for the earliest."""
+
+    var close_deadline_ms: Int
+    """Set when the connection is to close (GOAWAY sent or received,
+    shutdown) while streams are still parked: it waits for them until
+    this monotonic ms (``shutdown_timeout_ms``). 0 when not waiting."""
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def __init__(
@@ -279,6 +305,10 @@ struct Http2ConnHandle(Movable):
         self._ws_tunnels = Dict[Int, WsOverH2ServerStream]()
         self.tls = Optional[TlsTransport]()
         self.tls_cross_interest = False
+        self.offload_port = 0
+        self.offloads = Dict[Int, Int]()
+        self.offload_deadlines = Dict[Int, Int]()
+        self.close_deadline_ms = 0
 
     def __init__(
         out self,
@@ -348,6 +378,10 @@ struct Http2ConnHandle(Movable):
         self._ws_tunnels = Dict[Int, WsOverH2ServerStream]()
         self.tls = Optional[TlsTransport]()
         self.tls_cross_interest = False
+        self.offload_port = 0
+        self.offloads = Dict[Int, Int]()
+        self.offload_deadlines = Dict[Int, Int]()
+        self.close_deadline_ms = 0
 
     def attach_tls(mut self, var transport: TlsTransport):
         """Adopt the ``SSL*`` of a connection whose ALPN selected ``h2``."""
@@ -526,6 +560,11 @@ struct Http2ConnHandle(Movable):
         # drain below.
         if len(inbound) > 0:
             self.h2.feed(Span[UInt8, _](inbound))
+        # A parked stream the peer reset is answered by nobody: cancel
+        # its job and drop the result when it comes back.
+        var resets = self.h2.take_reset_streams()
+        for i in range(len(resets)):
+            self._abandon_stream(resets[i], CancelReason.PEER_CLOSED)
         # WebSocket-over-h2 sidecar (RFC 8441): accept Extended CONNECT
         # tunnels and pump client frames BEFORE the request dispatch so the
         # 200-OK HEADERS + any server frames ride out on this event.
@@ -545,8 +584,13 @@ struct Http2ConnHandle(Movable):
             # never dispatch a WS stream (even if it END_STREAM's).
             if sid in self._ws_tunnels:
                 continue
+            if sid in self.offloads:
+                continue
             var req = self.h2.take_request(sid)
             req.peer = self.peer
+            if self.offload_port != 0 and _wants_offload(handler, req):
+                self._park_stream(sid, req^, config)
+                continue
             var expose_errors = req.expose_errors
             var request_id = req.headers.get("x-request-id")
             var resp: Response
@@ -583,21 +627,7 @@ struct Http2ConnHandle(Movable):
             # then close. The frame is already in write_buf, so the
             # reactor flushes it before this takes effect.
             self.should_close = True
-        # Decide reactor interest: write if there are bytes to
-        # flush, otherwise stay on read for the next frame.
-        var has_outbound = len(self.write_buf) > self.write_pos
-        if has_outbound:
-            self.state = STATE_WRITING
-            return StepResult(
-                want_read=False,
-                want_write=True,
-                idle_timeout_ms=config.write_timeout_ms,
-            )
-        return StepResult(
-            want_read=True,
-            want_write=False,
-            idle_timeout_ms=config.idle_timeout_ms,
-        )
+        return self._next_step(config)
 
     # ── WebSocket-over-HTTP/2 sidecar dispatch (RFC 8441) ────────────────────
 
@@ -1023,6 +1053,159 @@ struct Http2ConnHandle(Movable):
             idle_timeout_ms=config.idle_timeout_ms,
         )
 
+    # ── Offloaded streams (ADR-0004) ─────────────────────────────────────────
+
+    def _park_stream(
+        mut self, sid: Int, var req: Request, config: ServerConfig
+    ) raises:
+        """Send stream ``sid``'s request to the offload pool. Only the
+        stream waits. A full queue is answered at once with 503."""
+        var job = offload_submit(self.offload_port, req^, Int(self.fd()), sid)
+        if job == 0:
+            self._emit_buffered(sid, unavailable_response())
+            return
+        self.h2.mark_dispatched(sid)
+        self.offloads[sid] = job
+        if config.handler_timeout_ms > 0:
+            self.offload_deadlines[sid] = (
+                _monotonic_ms() + config.handler_timeout_ms
+            )
+
+    def _abandon_stream(mut self, sid: Int, reason: Int) raises:
+        """Cancel parked stream ``sid``'s job with ``reason`` and forget
+        it; its result is dropped when it comes back."""
+        if sid not in self.offloads:
+            return
+        offload_cancel(self.offloads.pop(sid), reason)
+        if sid in self.offload_deadlines:
+            _ = self.offload_deadlines.pop(sid)
+
+    def offload_abandon_all(mut self, reason: Int):
+        """Cancel every parked stream's job (the connection is going
+        away)."""
+        var sids = List[Int]()
+        for entry in self.offloads.items():
+            sids.append(entry.key)
+        for i in range(len(sids)):
+            try:
+                self._abandon_stream(sids[i], reason)
+            except:
+                pass
+
+    def _send_parked(mut self, sid: Int, var resp: Response):
+        """Queue the response of a parked stream, unless the peer has
+        reset it in the meantime."""
+        try:
+            if not self.h2.stream_sendable(sid):
+                return
+            if resp.body_stream:
+                self._begin_stream(sid, resp^)
+            else:
+                self._emit_buffered(sid, resp^)
+        except:
+            self.should_close = True
+
+    def offload_done(
+        mut self, sid: Int, job: Int, config: ServerConfig
+    ) raises -> Optional[StepResult]:
+        """Queue the response of ``job``, back from the pool, on stream
+        ``sid``. ``None`` when the stream no longer waits for it (timed
+        out or reset, or the fd now belongs to another connection): the
+        result is dropped."""
+        if sid not in self.offloads or self.offloads[sid] != job:
+            return Optional[StepResult]()
+        _ = self.offloads.pop(sid)
+        if sid in self.offload_deadlines:
+            _ = self.offload_deadlines.pop(sid)
+        var jp = offload_job(job)
+        if jp[].resp:
+            self._send_parked(sid, jp[].resp.take())
+        elif jp[].err_status != 0:
+            self._send_parked(
+                sid, Response(status=jp[].err_status, reason=jp[].err_reason)
+            )
+        else:
+            self._send_parked(sid, unavailable_response())
+        if len(self._stream_out) > 0:
+            try:
+                self._stream_pump()
+            except:
+                self.should_close = True
+        self._take_outbox()
+        return Optional[StepResult](self._next_step(config))
+
+    def begin_close(mut self, config: ServerConfig) -> StepResult:
+        """Graceful shutdown: send GOAWAY so the peer opens no more
+        streams, and close once the parked ones are answered (or
+        ``shutdown_timeout_ms`` passes)."""
+        self.h2.send_goaway()
+        self.should_close = True
+        self._take_outbox()
+        return self._next_step(config)
+
+    def has_parked_streams(self) -> Bool:
+        return len(self.offloads) > 0
+
+    def offload_timer(mut self, config: ServerConfig) raises -> StepResult:
+        """The connection's timer fired while streams are parked.
+
+        Each stream past its deadline gets 503 and its job is cancelled
+        with ``TIMEOUT``. A connection waiting to close gives up on the
+        rest once ``close_deadline_ms`` has passed.
+        """
+        var now = _monotonic_ms()
+        var overdue = List[Int]()
+        for entry in self.offload_deadlines.items():
+            if entry.value <= now:
+                overdue.append(entry.key)
+        for i in range(len(overdue)):
+            self._abandon_stream(overdue[i], CancelReason.TIMEOUT)
+            self._send_parked(overdue[i], unavailable_response())
+        if self.close_deadline_ms > 0 and self.close_deadline_ms <= now:
+            self.offload_abandon_all(CancelReason.TIMEOUT)
+        self._take_outbox()
+        return self._next_step(config)
+
+    def _timer_ms(self, config: ServerConfig) -> Int:
+        """The timer to arm while reading. With streams parked the
+        connection is not idle: the timer is the earliest stream deadline
+        (or the close deadline), and 0 (no timer) when there is none."""
+        if len(self.offloads) == 0:
+            return config.idle_timeout_ms
+        var earliest = self.close_deadline_ms
+        for entry in self.offload_deadlines.items():
+            if earliest == 0 or entry.value < earliest:
+                earliest = entry.value
+        if earliest == 0:
+            return 0
+        return max(earliest - _monotonic_ms(), 1)
+
+    def _next_step(mut self, config: ServerConfig) -> StepResult:
+        """Reactor interest after queueing output: write while bytes are
+        pending, else read. A connection that should close but still has
+        parked streams keeps reading until they are answered or
+        ``shutdown_timeout_ms`` passes."""
+        if self.should_close and len(self.offloads) > 0:
+            if self.close_deadline_ms == 0:
+                self.close_deadline_ms = (
+                    _monotonic_ms() + config.shutdown_timeout_ms
+                )
+        if len(self.write_buf) > self.write_pos:
+            self.state = STATE_WRITING
+            return StepResult(
+                want_read=False,
+                want_write=True,
+                idle_timeout_ms=config.write_timeout_ms,
+            )
+        if self.should_close and len(self.offloads) == 0:
+            return StepResult(want_read=False, want_write=False, done=True)
+        self.state = STATE_READING
+        return StepResult(
+            want_read=True,
+            want_write=False,
+            idle_timeout_ms=self._timer_ms(config),
+        )
+
     def signal_drain(mut self) raises -> None:
         """Flip every live cell with :data:`CancelReason.SHUTDOWN`.
 
@@ -1122,15 +1305,18 @@ struct Http2ConnHandle(Movable):
                     want_write=True,
                     idle_timeout_ms=config.write_timeout_ms,
                 )
-        if self.should_close:
-            return StepResult(want_read=False, want_write=False, done=True)
-        # h2 stays open across many requests; back to reading.
-        self.state = STATE_READING
-        return StepResult(
-            want_read=True,
-            want_write=False,
-            idle_timeout_ms=config.idle_timeout_ms,
-        )
+        # h2 stays open across many requests; back to reading (or done,
+        # once a closing connection has no parked streams left).
+        return self._next_step(config)
+
+
+def _wants_offload[H: Handler](ref handler: H, req: Request) -> Bool:
+    """Whether ``handler`` sends ``req`` to the offload pool. A
+    ``blocking`` that raises keeps the request inline."""
+    try:
+        return handler.blocking(req)
+    except:
+        return False
 
 
 # ── Pool helpers (mirror _server_reactor_impl.mojo's ConnHandle pool) ────

@@ -525,10 +525,12 @@ struct HttpServer(Movable):
         var per_worker = (files - SPARE_FILES) // max(workers, 1)
         self.config.max_connections = max(per_worker, 16)
 
-    def _resolve_bufring(mut self):
+    def _resolve_bufring(mut self, may_block: Bool):
         """Decide once, at startup, whether the io_uring buffer-ring loop
         serves: when opted into (``DODO_BUFRING_HANDLER=1`` or
-        ``use_bufring``) and the config needs nothing that loop lacks."""
+        ``use_bufring``) and the config and handler need nothing that
+        loop lacks. ``may_block`` is the handler's ``may_block()``: that
+        loop has no offload pool."""
         if not self.config.use_bufring:
             self.config.use_bufring = _resolve_bufring_handler_env()
         if not self.config.use_bufring:
@@ -536,6 +538,8 @@ struct HttpServer(Movable):
         var gap = bufring_gap(self.config)
         if not gap and self._ws_h2_hooks:
             gap = "WebSocket upgrades"
+        if not gap and may_block:
+            gap = "Offload"
         if gap:
             print(
                 "dodo: the io_uring buffer ring does not enforce",
@@ -555,7 +559,7 @@ struct HttpServer(Movable):
 
         self._stopping = False
         self._resolve_max_connections(1)
-        self._resolve_bufring()
+        self._resolve_bufring(handler.may_block())
         comptime if CompilationTarget.is_linux():
             if (
                 use_uring_backend()
@@ -824,7 +828,7 @@ struct HttpServer(Movable):
 
         # Before the config is handed to the worker threads.
         self._resolve_max_connections(num_workers)
-        self._resolve_bufring()
+        self._resolve_bufring(handler.may_block())
 
         var frontend = HttpFrontend[H](
             handler^,

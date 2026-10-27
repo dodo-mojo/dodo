@@ -536,6 +536,12 @@ struct Metrics[Inner: Handler & Copyable](Copyable, Handler):
         reg[].exit()
         return resp^
 
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
     def render(self) -> String:
         """Convenience accessor that snapshots the underlying
         registry as Prometheus text exposition. Equivalent to

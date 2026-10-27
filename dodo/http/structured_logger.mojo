@@ -215,6 +215,12 @@ struct StructuredLogger[Inner: Handler & Copyable](Copyable, Handler):
         print(line)
         return resp^
 
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
     def _build_success_line(
         self,
         req: Request,

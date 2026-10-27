@@ -251,6 +251,13 @@ def _struct_serve_thunk[
     return ptr[].serve(req).lower()
 
 
+def _struct_blocking_thunk[
+    H: Handler & Copyable
+](addr: Int, req: Request) raises -> Bool:
+    """Thunk that asks the boxed ``H`` whether ``req`` blocks."""
+    return Pool[H].get_ptr(addr)[].blocking(req)
+
+
 def _struct_destroy_thunk[H: Handler & Copyable](addr: Int) -> None:
     """Thunk that destroys + frees the heap-allocated ``H`` at
     ``addr``. Called once per route from ``Router.__deinit__`` via
@@ -314,11 +321,15 @@ struct _StructHandlerRegistry(Movable):
     var destroy_thunks: List[def(Int) thin -> None]
     """Monomorphised destroy thunks; ``destroy_thunks[i]`` is the
     thunk for ``addrs[i]``."""
+    var blocking_thunks: List[def(Int, Request) raises thin -> Bool]
+    """Monomorphised ``blocking`` thunks; ``blocking_thunks[i]`` is
+    the thunk for ``addrs[i]``."""
 
     def __init__(out self):
         self.addrs = List[Int]()
         self.serve_thunks = List[def(Int, Request) raises thin -> Response]()
         self.destroy_thunks = List[def(Int) thin -> None]()
+        self.blocking_thunks = List[def(Int, Request) raises thin -> Bool]()
 
     def __deinit__(deinit self):
         """Run every destroy thunk and free the boxed handlers.
@@ -382,6 +393,9 @@ struct Router(Copyable, Defaultable, Handler):
     """Optional custom fallback invoked when no route matched and no
     mount claimed the path. When unset, ``serve`` returns the default
     404 (or 405 when the path exists under other methods)."""
+    var _may_block: Bool
+    """Some route or mount may run on the offload pool (an ``Offload``
+    is registered somewhere below this router)."""
 
     def __init__(out self):
         """Create an empty router (no routes)."""
@@ -392,6 +406,7 @@ struct Router(Copyable, Defaultable, Handler):
             _StructHandlerRegistry()
         )
         self._fallback = Optional[FnHandler]()
+        self._may_block = False
 
     # ── Registration per method (def-function overloads) ────────────────────
 
@@ -595,11 +610,14 @@ struct Router(Copyable, Defaultable, Handler):
         1-byte phantom pad now that ``size_of`` is public.
         """
         var segs = _compile_segments(path)
+        if handler.may_block():
+            self._may_block = True
         var addr = Pool[H].alloc_move(handler^)
         ref reg = self._struct_registry[]
         reg.addrs.append(addr)
         reg.serve_thunks.append(_struct_serve_thunk[H])
         reg.destroy_thunks.append(_struct_destroy_thunk[H])
+        reg.blocking_thunks.append(_struct_blocking_thunk[H])
         self._routes.append(
             _Route(
                 method,
@@ -640,11 +658,14 @@ struct Router(Copyable, Defaultable, Handler):
         if len(psegs) == 0:
             raise Error("mount prefix must have at least one segment")
         var wrapper = _MountedRouter(sub^, len(psegs))
+        if wrapper.may_block():
+            self._may_block = True
         var addr = Pool[_MountedRouter].alloc_move(wrapper^)
         ref reg = self._struct_registry[]
         reg.addrs.append(addr)
         reg.serve_thunks.append(_struct_serve_thunk[_MountedRouter])
         reg.destroy_thunks.append(_struct_destroy_thunk[_MountedRouter])
+        reg.blocking_thunks.append(_struct_blocking_thunk[_MountedRouter])
         self._mounts.append(_Mount(psegs^, len(reg.addrs) - 1))
 
     # ── Route introspection (OpenAPI derivation) ───────────────────────────────
@@ -737,6 +758,37 @@ struct Router(Copyable, Defaultable, Handler):
             return self._fallback.value().serve(child)
         return not_found(req.url)
 
+    def may_block(self) -> Bool:
+        """Whether some route or mount below this router is offloaded."""
+        return self._may_block
+
+    def blocking(self, req: Request) raises -> Bool:
+        """Whether the route ``req`` matches is offloaded.
+
+        Follows the same matching order as :meth:`serve`: direct routes,
+        then the first matching mount. 404, 405 and the fallback always
+        run inline.
+        """
+        if not self._may_block:
+            return False
+        var segs_in = _split_path(_path_only(req.url))
+        for i in range(len(self._routes)):
+            if self._routes[i].method != req.method:
+                continue
+            if not _match(segs_in, self._routes[i].segs).matched:
+                continue
+            if self._routes[i].handler_kind == _ROUTE_KIND_FN:
+                return False
+            var sh_idx = self._routes[i].handler_idx
+            ref reg = self._struct_registry[]
+            return reg.blocking_thunks[sh_idx](reg.addrs[sh_idx], req)
+        for i in range(len(self._mounts)):
+            if _prefix_match(segs_in, self._mounts[i].segs):
+                var sh_idx = self._mounts[i].handler_idx
+                ref reg = self._struct_registry[]
+                return reg.blocking_thunks[sh_idx](reg.addrs[sh_idx], req)
+        return False
+
 
 # ── Mounted sub-router wrapper ───────────────────────────────────────────────
 
@@ -759,7 +811,8 @@ struct _MountedRouter(Copyable, Handler):
         self.sub = sub^
         self.prefix_segs = prefix_segs
 
-    def serve(self, req: Request) raises -> Response:
+    def _child(self, req: Request) raises -> Request:
+        """``req`` with the mount prefix stripped from its path."""
         var segs = _split_path(_path_only(req.url))
         var rebuilt = String("/")
         for i in range(self.prefix_segs, len(segs)):
@@ -770,8 +823,18 @@ struct _MountedRouter(Copyable, Handler):
         if q.byte_length() > 0:
             rebuilt += "?"
             rebuilt += q
-        var child = _child_request(req, rebuilt)
-        return self.sub.serve(child)
+        return _child_request(req, rebuilt)
+
+    def serve(self, req: Request) raises -> Response:
+        return self.sub.serve(self._child(req))
+
+    def may_block(self) -> Bool:
+        return self.sub.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        if not self.sub.may_block():
+            return False
+        return self.sub.blocking(self._child(req))
 
 
 # ── Internals ────────────────────────────────────────────────────────────────

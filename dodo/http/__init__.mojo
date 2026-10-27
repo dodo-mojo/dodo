@@ -148,6 +148,7 @@ from .handler import (
     FnHandler,
     FnHandlerCT,
 )
+from .offload import Offload
 from .router import Router
 from .routes import ComptimeRoute, ComptimeRouter
 from .extract import (

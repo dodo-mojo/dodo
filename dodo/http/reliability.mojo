@@ -279,6 +279,12 @@ struct Retry[Inner: Handler & Copyable](Copyable, Handler):
         # response is via the raise branch above.
         return self.inner.serve(req).lower()
 
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
+
 
 struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
     """Post-hoc wall-clock deadline check.
@@ -330,6 +336,12 @@ struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
         if elapsed_ms > self.budget_ms:
             return Response(status=504, reason=String("Gateway Timeout"))
         return resp^
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
 
 
 struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
@@ -411,6 +423,12 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
         if not allow:
             return Response(status=429, reason=String("Too Many Requests"))
         return self.inner.serve(req).lower()
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
 
 
 # CircuitBreaker states.
@@ -502,3 +520,9 @@ struct CircuitBreaker[Inner: Handler & Copyable](Copyable, Handler):
         except e:
             self._record_failure(Int64(perf_counter_ns()))
             raise e^
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)

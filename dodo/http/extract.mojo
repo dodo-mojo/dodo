@@ -883,6 +883,12 @@ struct Extracted[H: Copyable & Defaultable & Handler](Copyable, Handler):
                 )
         return h.serve(req).lower()
 
+    def may_block(self) -> Bool:
+        return self.prototype.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.prototype.blocking(req)
+
 
 @always_inline
 def _bad_request_from_error(

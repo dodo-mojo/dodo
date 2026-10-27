@@ -497,3 +497,9 @@ struct Cache[
                             return self._build_hit_response(entry)
         var fresh = self.inner.serve(req).lower()
         return self._store_response(req, fresh^)
+
+    def may_block(self) -> Bool:
+        return self.inner.may_block()
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.inner.blocking(req)
