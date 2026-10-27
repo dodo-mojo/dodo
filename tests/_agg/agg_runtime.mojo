@@ -575,6 +575,18 @@ from test_scheduler import (
     test_start_raises_when_a_worker_listener_cannot_bind as test_scheduler__test_start_raises_when_a_worker_listener_cannot_bind,
 )
 from test_scheduler import (
+    test_worker_0_serves_the_handed_over_listener as test_scheduler__test_worker_0_serves_the_handed_over_listener,
+)
+from test_scheduler import (
+    test_handed_over_listener_becomes_the_shared_listener as test_scheduler__test_handed_over_listener_becomes_the_shared_listener,
+)
+from test_scheduler import (
+    test_handed_over_listener_is_closed_when_start_raises as test_scheduler__test_handed_over_listener_is_closed_when_start_raises,
+)
+from test_scheduler import (
+    test_listener_fds_must_cover_every_address as test_scheduler__test_listener_fds_must_cover_every_address,
+)
+from test_scheduler import (
     test_drain_keeps_the_stop_flag_allocated_for_a_detached_worker as test_scheduler__test_drain_keeps_the_stop_flag_allocated_for_a_detached_worker,
 )
 from test_scheduler import (
@@ -1177,6 +1189,14 @@ def main() raises:
     suite.test[
         test_scheduler__test_start_raises_when_a_worker_listener_cannot_bind
     ]()
+    suite.test[test_scheduler__test_worker_0_serves_the_handed_over_listener]()
+    suite.test[
+        test_scheduler__test_handed_over_listener_becomes_the_shared_listener
+    ]()
+    suite.test[
+        test_scheduler__test_handed_over_listener_is_closed_when_start_raises
+    ]()
+    suite.test[test_scheduler__test_listener_fds_must_cover_every_address]()
     suite.test[
         test_scheduler__test_drain_keeps_the_stop_flag_allocated_for_a_detached_worker
     ]()
