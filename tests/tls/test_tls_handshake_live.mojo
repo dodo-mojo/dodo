@@ -38,10 +38,8 @@ Coverage:
   configured client cert succeeds; a configured server + missing
   client cert fails the handshake.
 
-The full reactor-driven wire test (a dodo ``HttpsServer`` with
-``run_reactor_loop_view`` + STATE_TLS_HANDSHAKE) lands in the
-C7-bis follow-up — the contracts here use the blocking-poll
-``handshake_fd`` instead.
+These contracts use the blocking-poll ``handshake_fd``; the
+reactor-driven TLS path is covered by ``test_https_reactor.mojo``.
 """
 
 from std.testing import (

@@ -7,7 +7,7 @@ re-exports every name here (including the ``_ascii_lower`` alias the
 reactor imports from ``dodo.http.server``).
 """
 
-from std.memory import unsafe_memcpy, stack_allocation
+from std.memory import unsafe_memcpy
 
 from ..response import Response
 from ..headers import _eq_icase
@@ -100,40 +100,6 @@ def _append_str(mut buf: List[UInt8], s: String):
         src=s.unsafe_ptr(),
         count=n,
     )
-
-
-@always_inline
-def _append_int(mut buf: List[UInt8], var n: Int):
-    """Append the ASCII decimal form of ``n`` to ``buf``.
-
-    Hot path on every serialised response (status line + Content-Length).
-    Stack-buffer ``itoa`` keeps it allocation-free; the previous
-    ``String(int)`` path forced a per-call heap allocation just to throw
-    the bytes back into the wire buffer.
-    """
-    if n == 0:
-        buf.append(UInt8(48))  # '0'
-        return
-    var negative = n < 0
-    if negative:
-        n = -n
-    # 20 digits is enough for Int64 (-9223372036854775808 → 19 digits + sign).
-    var tmp = stack_allocation[20, UInt8]()
-    var i = 0
-    while n > 0:
-        tmp[unsafe_offset=i] = UInt8(48 + (n % 10))
-        n = n // 10
-        i += 1
-    var old_len = len(buf)
-    var sign = 1 if negative else 0
-    buf.resize(old_len + sign + i, UInt8(0))
-    var p = buf.unsafe_ptr().unsafe_offset(old_len)
-    if negative:
-        p[unsafe_offset=0] = UInt8(45)  # '-'
-        p = p.unsafe_offset(1)
-    # ``tmp`` holds the digits in reverse order; flip them on the way out.
-    for k in range(i):
-        p[unsafe_offset=k] = tmp[unsafe_offset=i - 1 - k]
 
 
 def _status_reason(code: Int) -> String:

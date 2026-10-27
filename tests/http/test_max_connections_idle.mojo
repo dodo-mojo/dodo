@@ -19,7 +19,6 @@ server, the parent runs the clients, reads the child's CPU time from
 
 from std.ffi import c_int, c_size_t, c_uint, external_call
 from std.memory import stack_allocation
-from std.os import setenv
 from std.sys.info import CompilationTarget
 from std.testing import assert_equal, assert_true, TestSuite
 
@@ -27,7 +26,6 @@ from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 
 from dodo.http import HttpServer, Handler, Request, Response, ok
 from dodo.http.server import ServerConfig
-from dodo.http.static_response import precompute_response
 from dodo.net import SocketAddr
 from dodo.net._libc import (
     AF_INET,
@@ -141,7 +139,7 @@ def _cpu_seconds(pid: Int) raises -> Float64:
 # ── Server under test ──────────────────────────────────────────────────────
 
 
-def _start_server(static: Bool) raises -> Tuple[Int, UInt16]:
+def _start_server() raises -> Tuple[Int, UInt16]:
     var cfg = ServerConfig(idle_timeout_ms=30_000, max_connections=_CAP)
     var srv = HttpServer.bind(SocketAddr.localhost(0), config=cfg^)
     var port = UInt16(srv.local_addr().port)
@@ -149,18 +147,7 @@ def _start_server(static: Bool) raises -> Tuple[Int, UInt16]:
     var pid = fork()
     if pid == 0:
         try:
-            if static:
-                # The io_uring static loop has no connection cap; pin the
-                # epoll loop, which is the one under test.
-                _ = setenv("DODO_DISABLE_IO_URING", "1")
-                var resp = precompute_response(
-                    status=200,
-                    content_type="text/plain; charset=utf-8",
-                    body="OK",
-                )
-                srv.serve_static(resp)
-            else:
-                srv.serve(_OkHandler(0))
+            srv.serve(_OkHandler(0))
         except:
             pass
         exit()
@@ -168,8 +155,8 @@ def _start_server(static: Bool) raises -> Tuple[Int, UInt16]:
     return (pid, port)
 
 
-def _scenario(static: Bool) raises:
-    var started = _start_server(static)
+def _scenario() raises:
+    var started = _start_server()
     var pid = started[0]
     var port = started[1]
     var held = List[c_int]()
@@ -213,11 +200,7 @@ def _scenario(static: Bool) raises:
 
 
 def test_handler_server_idles_at_the_cap_and_resumes() raises:
-    _scenario(False)
-
-
-def test_static_server_idles_at_the_cap_and_resumes() raises:
-    _scenario(True)
+    _scenario()
 
 
 def main() raises:

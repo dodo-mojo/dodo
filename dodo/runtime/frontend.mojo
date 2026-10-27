@@ -5,24 +5,12 @@ The trait defines the *only* coupling point between
 join, listener bind, shared-stop flag, drain accounting) and the
 HTTP / HTTP/2 / future-protocol layers above it. Every protocol
 that wants to ride the multicore scheduler implements
-:trait:`Frontend` once (HTTP/1.1, the unified HTTP/1.1+HTTP/2
-preface-peek path, the io_uring buffer-ring path, the static-
-response fast path); the scheduler stays oblivious to which one
-runs.
+:trait:`Frontend` once (the unified HTTP/1.1+HTTP/2 path, the
+io_uring buffer-ring path, the streaming path); the scheduler stays
+oblivious to which one runs.
 
-Before this inversion :mod:`dodo.runtime.scheduler` imported
-directly from :mod:`dodo.http._server_reactor_impl`,
-:mod:`dodo.http._unified_reactor_impl`,
-:mod:`dodo.http.handler`, :mod:`dodo.http.server`,
-:mod:`dodo.http.static_response`, and
-:mod:`dodo.http2.server`. That's a layering violation -- the
-runtime package should *not* depend on protocol packages -- and
-the cycle blocked any work where the H1/H2/H3 surfaces wanted to
-call back into runtime primitives without circling. Pushing the
-dispatch into a protocol-side :class:`Frontend` impl breaks the
-cycle: the runtime depends on the trait only, the trait lives in
-:mod:`dodo.runtime`, and concrete impls live where the protocol
-itself does.
+The runtime depends on this trait only, never on protocol packages.
+Concrete impls live where their protocol does.
 
 ## Contract
 

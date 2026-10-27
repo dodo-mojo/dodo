@@ -1,7 +1,7 @@
 """A client accepted on fd 0 must still be served (MACH-01).
 
-The reactor loops used to register the listener under reactor token 0 and
-each client under token = its fd. ``accept`` returns the lowest free fd, so
+A reactor loop that registers the listener under token 0 and each client
+under token = its fd breaks here. ``accept`` returns the lowest free fd, so
 once something in the process closed fd 0 (stdin) the next client got fd 0,
 hence token 0, hence every one of its events went to the accept drainer and
 its request was never read.
@@ -13,12 +13,10 @@ case per reactor loop that carried the pattern:
 
 * ``serve``             -> ``dodo/http/_unified_reactor_impl.mojo``
 * ``serve_cancellable`` -> ``run_reactor_loop_cancel``
-* ``serve_view``        -> ``run_reactor_loop_view``
 * ``serve`` with a ``num_workers=2`` pool shares the unified loop's code.
 
-The static and shared-handler loops in ``_server_reactor_epoll.mojo`` use the
-same constant; their request path cannot close fd 0 from inside the handler,
-so they are covered by ``test_listener_token_is_not_a_possible_fd``.
+The shared-handler loop in ``_server_reactor_epoll.mojo`` uses the same
+constant and is covered by ``test_listener_token_is_not_a_possible_fd``.
 
 No fixed ports: every server binds port 0.
 """
@@ -34,7 +32,6 @@ from dodo.http import (
     WithCancel,
     ok,
 )
-from dodo.http.handler import WithViewCancel
 from dodo.net import SocketAddr
 from dodo.runtime import LISTENER_TOKEN, WAKEUP_TOKEN
 from dodo.tcp import TcpStream
@@ -96,8 +93,7 @@ def _get(port: UInt16, path: String) -> String:
 
 comptime _VARIANT_SERVE = 0
 comptime _VARIANT_CANCELLABLE = 1
-comptime _VARIANT_VIEW = 2
-comptime _VARIANT_SERVE_POOL = 3
+comptime _VARIANT_SERVE_POOL = 2
 
 
 def _run_variant(variant: Int, mut srv: HttpServer) raises:
@@ -105,8 +101,6 @@ def _run_variant(variant: Int, mut srv: HttpServer) raises:
         srv.serve(_closer_fn)
     elif variant == _VARIANT_CANCELLABLE:
         srv.serve_cancellable(WithCancel[_Closer](_Closer()))
-    elif variant == _VARIANT_VIEW:
-        srv.serve_view(WithViewCancel[_Closer](_Closer()))
     elif variant == _VARIANT_SERVE_POOL:
         srv.serve(_Closer(), 2, False)
     else:
@@ -144,10 +138,6 @@ def test_client_on_freed_fd0_is_served_unified() raises:
 
 def test_client_on_freed_fd0_is_served_cancellable() raises:
     _assert_client_on_freed_fd0_is_served(_VARIANT_CANCELLABLE)
-
-
-def test_client_on_freed_fd0_is_served_view() raises:
-    _assert_client_on_freed_fd0_is_served(_VARIANT_VIEW)
 
 
 def test_client_on_freed_fd0_is_served_pool() raises:

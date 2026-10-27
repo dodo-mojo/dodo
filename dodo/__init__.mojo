@@ -71,9 +71,7 @@ from .http.cancel import Cancel
 from .http.handler import (
     Handler,
     CancelHandler,
-    ViewHandler,
     WithCancel,
-    WithViewCancel,
     HandlerInfallible,
     WithRaises,
 )
@@ -81,7 +79,6 @@ from .http.router import Router
 from .http.routes import ComptimeRoute, ComptimeRouter
 from .http.auth import Auth, BasicAuth, BearerAuth
 from .http.error import HttpError, TooManyRedirects
-from .http.static_response import precompute_response, StaticResponse
 from .http.cookie import Cookie, CookieJar, parse_set_cookie_header
 
 # Streaming server and reactor-integrated body sources

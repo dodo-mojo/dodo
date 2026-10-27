@@ -1089,11 +1089,9 @@ def _drain_remaining_conns_unified(
     (when applicable) are not in ``conns`` and are closed by the caller;
     the loop only borrows them.
 
-    The flip is what the legacy epoll loop always did and the unified
-    loop never did: cancel-aware handlers (``CancelHandler`` /
-    ``ViewHandler``) and streaming bodies poll the cell and can stop
-    producing, instead of having the socket yanked mid-chunk. Plain
-    ``Handler``s ignore Cancel and run to completion, unchanged.
+    Streaming bodies poll the cell and can stop producing, instead of
+    having the socket yanked mid-chunk. Plain ``Handler``s ignore Cancel
+    and run to completion.
 
     Returns the number of connections that were still live, which the
     caller reports as ``in_flight_at_deadline``.

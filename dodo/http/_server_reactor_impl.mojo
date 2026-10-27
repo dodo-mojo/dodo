@@ -1,14 +1,9 @@
-"""Reactor-backed HTTP server: per-connection state machine + loops.
+"""Reactor-backed HTTP server: re-export surface for the loops.
 
-This module is a thin re-export surface. The per-connection state machine (``ConnHandle`` + byte-fast-path /
-keep-alive helpers) lives in ``dodo.http._reactor``; the epoll/kqueue
-server loops + connection-lifecycle glue live in
-``dodo.http._server_reactor_epoll``; the io_uring static + buffer-ring
-loops live in ``dodo.http._server_reactor_uring``. Every public symbol
-is re-exported here so existing
-``from dodo.http._server_reactor_impl import ...`` call sites across
-``dodo.http``, ``dodo.http2``, ``dodo.runtime``, ``tests/`` and
-``fuzz/`` keep resolving unchanged.
+The per-connection state machine (``ConnHandle`` and the keep-alive
+helpers) lives in ``dodo.http._reactor``; the epoll/kqueue loops in
+``dodo.http._server_reactor_epoll``; the io_uring buffer-ring loop in
+``dodo.http._server_reactor_uring``.
 """
 
 from ._reactor import (
@@ -41,14 +36,10 @@ from ._server_reactor_epoll import (
     _accept_loop,
     _accept_loop_fd,
     run_reactor_loop_shared,
-    run_reactor_loop_static,
-    run_reactor_loop_static_shared,
     run_reactor_loop_cancel,
-    run_reactor_loop_view,
 )
 
 from ._server_reactor_uring import (
-    run_uring_reactor_loop_static,
     run_uring_bufring_reactor_loop,
     run_uring_bufring_reactor_loop_shared,
 )

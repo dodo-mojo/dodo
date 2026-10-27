@@ -14,11 +14,8 @@ re-exported here so existing import sites in ``dodo.http``,
 ``dodo.http2``, ``dodo.runtime``, the tests, and the fuzz corpus
 keep working unchanged.
 
-The five reader entry points (default, bufring, cancel-aware,
-view-based, static) dispatch through a shared set of helpers
-parameterised on a comptime :class:`DispatchConfig` so the H1 hot
-path stays straight-line and the byte-source-step duplication that
-the previous shape carried collapses into a single helper.
+The reader entry points (default, bufring, cancel-aware) share one
+set of parse-and-dispatch helpers.
 
 State transitions::
 
@@ -32,10 +29,6 @@ allocation glue, io_uring buffer-ring glue -- and re-exports
 every public symbol below for back-compat with existing imports
 across ``dodo/http/``, ``dodo/http2/``, ``dodo/runtime/``, tests,
 and the fuzz corpus.
-
-The parse-and-dispatch step of each ``on_readable_*`` reader (minimal,
-view, cancel-aware, static) could move to its own module if this file
-grows further.
 """
 
 from std.collections import List, Optional
@@ -45,7 +38,7 @@ from std.memory import unsafe_memcpy, stack_allocation
 from dodo.crypto.hmac import base64url_decode
 from dodo.errors import map_handler_error, log_handler_error
 from dodo.http.cancel import CancelCell, CancelReason
-from dodo.http.handler import Handler, CancelHandler, ViewHandler
+from dodo.http.handler import Handler, CancelHandler
 from dodo.http.headers import HeaderMap
 from dodo.http.request import Request
 from dodo.http.response import Response
@@ -66,7 +59,6 @@ from dodo.http.server import (
 from dodo.http._server.config import MIN_BODY_RATE_GRACE_MS
 from dodo.http._server.parse import parse_error_status
 from dodo.http._server.write import _status_reason
-from dodo.http.static_response import StaticResponse
 from dodo.net import SocketAddr
 from dodo.net._libc import _recv, _send, _shutdown, MSG_NOSIGNAL, SHUT_WR
 from dodo.tcp import TcpStream
@@ -111,7 +103,6 @@ from .write_path import (
     queue_h2c_upgrade_101,
     serialize_response_into,
     serialize_response_headers_chunked_into,
-    serialize_static_into,
 )
 from dodo.tls._server_ffi import (
     SSL_IO_WANT_READ,
@@ -1306,151 +1297,6 @@ struct ConnHandle(Movable):
             return self._transition_to_writing()
         return self._finalise_response(resp^, final_close)
 
-    def on_readable_view[
-        VH: ViewHandler
-    ](mut self, ref handler: VH, config: ServerConfig) raises -> StepResult:
-        """View-aware variant of ``on_readable_cancel``.
-
-        Same control flow as ``on_readable_cancel`` but dispatches
-        the parsed ``RequestView`` directly into
-        ``VH.serve_view(view, cancel)`` -- the body slice borrows
-        from ``self.read_buf`` and the handler reads it without
-        a copy. The owned ``Request`` materialisation that the
-        ``Handler.serve`` requires is skipped entirely.
-        """
-        if self.state != STATE_READING:
-            return StepResult(
-                want_read=False, want_write=self.state == STATE_WRITING
-            )
-
-        self.cancel_cell.reset()
-
-        var drained = self._drain_recv[flips_cancel_on_close=True](config)
-        if drained:
-            return drained.value()
-        var pending = self._check_request_complete(
-            config, body_timeout_ms=config.read_body_timeout_ms
-        )
-        if pending:
-            return pending.value()
-
-        from dodo.http.request_view import parse_request_view
-        from dodo.http.server import _ascii_lower
-
-        var resp: Response
-        try:
-            # A chunked body is decoded in place: the decoded bytes are
-            # never longer than the framing they came from, so they fit
-            # at ``headers_end`` and the view borrows them from there.
-            var body_override = -1
-            if self.is_chunked:
-                var decoded = List[UInt8]()
-                _ = decode_chunked_body(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    self.headers_end,
-                    decoded,
-                )
-                for i in range(len(decoded)):
-                    self.read_buf[self.headers_end + i] = decoded[i]
-                body_override = len(decoded)
-            var view = parse_request_view(
-                Span[UInt8, _](self.read_buf)[: self.body_total],
-                config.max_header_size,
-                config.max_body_size,
-                config.max_uri_length,
-                self.peer,
-                config.expose_error_messages,
-                body_override,
-            )
-            self.head_request = view.method == "HEAD"
-
-            # Connection-disposition from the borrowed header view --
-            # no allocation, just an offsets-based lookup.
-            var hv = view.headers()
-            var conn_hdr = _ascii_lower(String(hv.get("connection")))
-            var is_http10 = view.version == "HTTP/1.0"
-            var close_after = False
-            if conn_hdr == "close":
-                close_after = True
-            elif is_http10 and conn_hdr != "keep-alive":
-                close_after = True
-
-            var _final_close = self._apply_keepalive_policy(config, close_after)
-
-            try:
-                resp = handler.serve_view(view, self.cancel_cell.handle())
-            except e:
-                log_handler_error(String(hv.get("x-request-id")), String(e))
-                var mapped = map_handler_error(
-                    String(e), config.expose_error_messages
-                )
-                self._queue_error(mapped.status, mapped.reason)
-                return self._transition_to_writing()
-        except e:
-            self._queue_parse_error(String(e))
-            return self._transition_to_writing()
-
-        var keepalive = not self.should_close
-        return self._finalise_response(resp^, not keepalive)
-
-    def on_readable_static(
-        mut self, resp: StaticResponse, config: ServerConfig
-    ) raises -> StepResult:
-        """Static-response variant of ``on_readable``.
-
-        Reads as much as the non-blocking socket makes available per
-        call, scans for the end-of-headers marker, discards the
-        declared body bytes (if any), and queues the pre-encoded
-        ``StaticResponse`` bytes into ``write_buf``. The parser never
-        constructs a ``Request``; no handler is called. Pipelined
-        requests already buffered are answered in the same flush, as on
-        the handler path.
-        """
-        var step = self._serve_static_next(resp, config, True)
-        var served = 1
-        while served < PIPELINE_BATCH_REQUESTS and self._batch_continues():
-            step = self._serve_static_next(resp, config, False)
-            served += 1
-        self._merge_batch()
-        if self.state == STATE_READING and len(self.write_buf) > self.write_pos:
-            return self._transition_to_writing()
-        return step
-
-    def _serve_static_next(
-        mut self, resp: StaticResponse, config: ServerConfig, drain: Bool
-    ) raises -> StepResult:
-        if self.state != STATE_READING:
-            return StepResult(
-                want_read=False, want_write=self.state == STATE_WRITING
-            )
-
-        if drain:
-            var drained = self._drain_recv[flips_cancel_on_close=False](config)
-            if drained:
-                return drained.value()
-        var pending = self._check_request_complete(config)
-        if pending:
-            return pending.value()
-
-        # Inspect Connection header + HTTP/1.0 semantics on the raw
-        # header bytes without building a Request object. Cheap scan
-        # over the header region only.
-        var close_after = _wants_close(self.read_buf, self.headers_end)
-        var final_close = self._apply_keepalive_policy(config, close_after)
-        # A response to HEAD carries no content (RFC 9110 §9.3.2), so
-        # queue only the head of the pre-encoded bytes (APP-04).
-        var is_head = _starts_with_head(self.read_buf)
-
-        if self.body_total > 0 and self.body_total <= len(self.read_buf):
-            _compact_read_buf_drop_prefix(self.read_buf, self.body_total)
-        self.headers_end = -1
-        self.content_length = 0
-        self.body_total = -1
-        self.is_chunked = False
-
-        self._serialize_static(resp, not final_close, is_head)
-        return self._transition_to_writing()
-
     def _flush_write_buf_tls(mut self) raises -> Optional[StepResult]:
         """TLS twin of the ``on_writable`` send loop.
 
@@ -2058,18 +1904,6 @@ struct ConnHandle(Movable):
             want_write=False,
             idle_timeout_ms=LINGER_READ_TIMEOUT_MS,
         )
-
-    def _serialize_static(
-        mut self,
-        resp: StaticResponse,
-        keep_alive: Bool,
-        head_request: Bool = False,
-    ) -> None:
-        """Queue a pre-encoded static response into ``write_buf``."""
-        serialize_static_into(
-            self.write_buf, self.write_pos, resp, keep_alive, head_request
-        )
-        self.write_pos = 0
 
     def _serialize_response(mut self, resp: Response, keep_alive: Bool) -> None:
         """Serialise ``resp`` into ``write_buf`` ready to be sent."""
