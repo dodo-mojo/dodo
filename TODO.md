@@ -28,8 +28,8 @@
 - [ ] Keep-alive idle timeout defaults to 500 ms; `docs/design.md` says 5 s. Settle it in the performance pass (short is cheaper under load, long saves reconnects).
 - [ ] Dedupe the status reason-phrase tables: two copies (`_server/write.mojo`, `streaming_serialize.mojo`).
 - [ ] Decide on `json` and `mozz` (git dependencies from the upstream author): keep, vendor, or replace.
-- [ ] Model workers (ADR-0005, proposed): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`. Accept the ADR first.
-- [ ] Outgoing calls on the event loop (ADR-0006, proposed): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer. Accept the ADR first.
+- [ ] Model workers (ADR-0005): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`.
+- [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer.
 - [ ] Dedupe `_monotonic_ms`: four copies (`client_pool`, `tls_pool`, `keepalive_scan`, `runtime._libc_time`), and the client-pool ones allocate on every call.
 
 ## Developer experience and AI agents (Phase 2 and later)

@@ -63,7 +63,7 @@ The networking layers start as an imported fork (ADR-0003), so their package nam
   - `Offload(handler)` runs a handler on an offload thread pool and wakes the loop through its wake fd (ADR-0004).
   - GPU work is enqueued on the worker's `DeviceContext` stream, and completion is polled from the loop, so the CPU never sits waiting on the GPU.
   - In dev mode `dodo.prof` flags handlers that hold a loop longer than a threshold.
-- Outgoing calls (other APIs, model servers, later databases) run on the same loop: a handler starts several at once and parks until they answer, costing no threads (ADR-0006, proposed).
+- Outgoing calls (other APIs, model servers, later databases) run on the same loop: a handler starts several at once and parks until they answer, costing no threads (ADR-0006).
 - If Mojo gains stable async later, handlers can become `async def` without changing the I/O layer.
 - **Phase 0 spike:** confirm thread creation (`parallelize` vs. pthreads via FFI) and epoll from Mojo 1.2.
 
@@ -98,7 +98,7 @@ Split when there is a real reason: one GPU shared by many web replicas (each rep
 | Setup | What runs where |
 |---|---|
 | All in one | HTTP, models and kernels in one dodo process |
-| Supervised workers | Models or kernels in child processes that dodo starts, watches, limits and restarts; data passes through shared memory (ADR-0005, proposed) |
+| Supervised workers | Models or kernels in child processes that dodo starts, watches, limits and restarts; data passes through shared memory (ADR-0005) |
 | Distributed | dodo serves HTTP and calls remote model servers, or is one service among many |
 
 Model workers get CPU, RAM and GPU memory limits, each as a ratio or an amount of **the box**: the container's limits when dodo runs in Docker or Kubernetes, otherwise the machine. Kubernetes needs nothing separate; dodo reads a pod's limits the same way and adds `/healthz`, `/readyz` and draining on `SIGTERM`.
