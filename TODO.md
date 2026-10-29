@@ -26,7 +26,6 @@
 - [ ] The io_uring buffer-ring loop is never chosen with the default config (it needs every timeout off and `max_connections < 0`). Decide whether it should arm timers or be removed. It also sets `Request.peer` to a loopback placeholder.
 - [ ] `RequestView` (zero-copy request) has no server loop since `serve_view` was removed. The performance pass decides whether the unified loop parses into it or it is deleted.
 - [ ] Keep-alive idle timeout defaults to 500 ms; `docs/design.md` says 5 s. Settle it in the performance pass (short is cheaper under load, long saves reconnects).
-- [ ] Decide on `mozz` (git dependency from the upstream author, fuzzers only): keep, vendor, or replace. `json` is vendored as `dodo/json`.
 - [ ] Model workers (ADR-0005, proposed): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`. Accept the ADR first.
 - [ ] Outgoing calls on the event loop (ADR-0006, proposed): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer. Accept the ADR first.
 

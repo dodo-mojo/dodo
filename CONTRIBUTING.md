@@ -34,7 +34,9 @@ Useful commands:
 | `pixi run tests-gen` | Regenerate `tests/_agg/` after adding or removing a test file |
 | `pixi run mojo -I . tests/http/test_x.mojo` | Run one test file |
 | `pixi run format` | Format the code |
-| `pixi run -e fuzz fuzz` | Run the fuzzers |
+| `pixi run fuzz-build` | Build every fuzzer |
+| `pixi run fuzz url` | Build and run one fuzzer (`fuzz/fuzz_url.mojo`) |
+| `pixi run fuzz-selftest` | Run the fuzzing harness's own tests |
 | `pixi run check-sans-io` | Check the protocol layers do no I/O |
 
 ## Making a change
