@@ -21,10 +21,10 @@ from dodo.http import (
 from dodo.http._reactor.keepalive_scan import (
     LINGER_READ_TIMEOUT_MS,
     LINGER_TOTAL_MS,
-    _monotonic_ms,
 )
 from dodo.http._server_reactor_impl import run_reactor_loop_shared
 from dodo.net import SocketAddr
+from dodo.runtime._libc_time import monotonic_now_ms
 from dodo.tcp import TcpStream
 from dodo.tls import TlsConfig, TlsStream
 from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
@@ -276,19 +276,19 @@ def test_linger_ends_after_the_total_limit_while_the_client_sends() raises:
     var waited = 0
     try:
         var s = _send_431_head(srv[1])
-        var start = _monotonic_ms()
+        var start = monotonic_now_ms()
         # Read the 431 first: a reset later may drop unread input.
         got = _read_once(s)
         var line = _fill_line()
         # Keep sending, under the quiet timeout, past the total limit.
         # Once the server has closed, a write fails.
         try:
-            while _monotonic_ms() - start < LINGER_TOTAL_MS + 4000:
+            while monotonic_now_ms() - start < LINGER_TOTAL_MS + 4000:
                 s.write_all(Span[UInt8, _](line))
                 usleep(300_000)
         except:
             closed = True
-        waited = _monotonic_ms() - start
+        waited = monotonic_now_ms() - start
         s.close()
     except:
         pass
