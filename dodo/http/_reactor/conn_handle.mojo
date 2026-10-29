@@ -1343,6 +1343,8 @@ struct ConnHandle(Movable):
         A request the handler marks ``blocking`` goes to the offload
         pool instead, which binds ``cancel`` to the job.
         """
+        if self.state == STATE_LINGERING:
+            return self._linger_read()
         if self.state == STATE_PARKED:
             return self._parked_read()
         if self.state != STATE_READING:
@@ -1681,9 +1683,7 @@ struct ConnHandle(Movable):
             )
 
         if self.should_close:
-            # Lingering needs a loop that keeps reading and arms timers:
-            # the unified loop does, for cleartext connections.
-            if self.linger_on_close and self.on_unified_loop and not self.tls:
+            if self.linger_on_close:
                 return self._start_lingering()
             return StepResult(want_read=False, want_write=False, done=True)
 
@@ -1993,7 +1993,16 @@ struct ConnHandle(Movable):
         Closing outright while the client is still sending makes the
         kernel answer with a reset, which can destroy the response before
         the client reads it.
+
+        On TLS the ``close_notify`` goes out first, then the same
+        half-close. What the client sends after that is dropped as raw
+        ciphertext: nothing more is decrypted.
         """
+        if self.tls:
+            try:
+                self.tls.value().send_close_notify()
+            except:
+                pass
         _ = _shutdown(self.fd(), SHUT_WR)
         self.state = STATE_LINGERING
         self.read_buf.clear()
