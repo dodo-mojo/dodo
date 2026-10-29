@@ -28,7 +28,7 @@ from .request import Request
 # route did not capture ``name`` (rather than raising as the required ``Path*``
 # do). A parse error on a *present* capture still propagates -> 400. These let
 # a single handler serve overlapping routes (e.g. ``/items`` and
-# ``/items/:id``) without a separate struct per arity.
+# ``/items/{id}``) without a separate struct per arity.
 
 
 @fieldwise_init

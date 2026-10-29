@@ -3211,16 +3211,94 @@ from test_router import (
     test_param_named_value as test_router__test_param_named_value,
 )
 from test_router import (
-    test_wildcard_one_segment as test_router__test_wildcard_one_segment,
+    test_catch_all_one_segment as test_router__test_catch_all_one_segment,
 )
 from test_router import (
-    test_wildcard_many_segments as test_router__test_wildcard_many_segments,
+    test_catch_all_many_segments as test_router__test_catch_all_many_segments,
 )
 from test_router import (
-    test_wildcard_zero_segments_does_not_match as test_router__test_wildcard_zero_segments_does_not_match,
+    test_catch_all_zero_segments_does_not_match as test_router__test_catch_all_zero_segments_does_not_match,
 )
 from test_router import (
-    test_wildcard_not_last_rejected as test_router__test_wildcard_not_last_rejected,
+    test_catch_all_uses_its_own_name as test_router__test_catch_all_uses_its_own_name,
+)
+from test_router import (
+    test_catch_all_after_param as test_router__test_catch_all_after_param,
+)
+from test_router import (
+    test_catch_all_has_no_star_key as test_router__test_catch_all_has_no_star_key,
+)
+from test_router import (
+    test_path_must_start_with_slash as test_router__test_path_must_start_with_slash,
+)
+from test_router import (
+    test_empty_path_rejected as test_router__test_empty_path_rejected,
+)
+from test_router import (
+    test_unclosed_brace_rejected as test_router__test_unclosed_brace_rejected,
+)
+from test_router import (
+    test_closing_brace_without_opening_rejected as test_router__test_closing_brace_without_opening_rejected,
+)
+from test_router import (
+    test_reversed_braces_rejected as test_router__test_reversed_braces_rejected,
+)
+from test_router import (
+    test_empty_param_name_rejected as test_router__test_empty_param_name_rejected,
+)
+from test_router import (
+    test_nameless_catch_all_rejected as test_router__test_nameless_catch_all_rejected,
+)
+from test_router import (
+    test_name_starting_with_digit_rejected as test_router__test_name_starting_with_digit_rejected,
+)
+from test_router import (
+    test_name_with_dash_rejected as test_router__test_name_with_dash_rejected,
+)
+from test_router import (
+    test_underscore_and_digit_names_accepted as test_router__test_underscore_and_digit_names_accepted,
+)
+from test_router import (
+    test_duplicate_param_name_rejected as test_router__test_duplicate_param_name_rejected,
+)
+from test_router import (
+    test_duplicate_name_across_param_and_catch_all_rejected as test_router__test_duplicate_name_across_param_and_catch_all_rejected,
+)
+from test_router import (
+    test_catch_all_not_last_rejected as test_router__test_catch_all_not_last_rejected,
+)
+from test_router import (
+    test_param_with_literal_prefix_rejected as test_router__test_param_with_literal_prefix_rejected,
+)
+from test_router import (
+    test_param_with_literal_suffix_rejected as test_router__test_param_with_literal_suffix_rejected,
+)
+from test_router import (
+    test_two_params_in_one_segment_rejected as test_router__test_two_params_in_one_segment_rejected,
+)
+from test_router import (
+    test_old_param_syntax_rejected as test_router__test_old_param_syntax_rejected,
+)
+from test_router import (
+    test_old_wildcard_syntax_rejected as test_router__test_old_wildcard_syntax_rejected,
+)
+from test_router import (
+    test_post_registration_validates_too as test_router__test_post_registration_validates_too,
+)
+from test_router import (
+    test_struct_handler_registration_validates_too as test_router__test_struct_handler_registration_validates_too,
+)
+from test_router import (
+    test_openapi_template_keeps_params as test_router__test_openapi_template_keeps_params,
+)
+from test_router import (
+    test_openapi_template_names_catch_all as test_router__test_openapi_template_names_catch_all,
+)
+from test_router import (
+    test_openapi_template_root as test_router__test_openapi_template_root,
+)
+from test_router import (
+    test_route_path_params_lists_param_and_catch_all as test_router__test_route_path_params_lists_param_and_catch_all,
 )
 from test_router import (
     test_method_get_and_post_on_same_path as test_router__test_method_get_and_post_on_same_path,
@@ -3352,6 +3430,12 @@ from test_router_mount import (
 from test_router_mount import (
     test_mount_rejects_param_prefix as test_router_mount__test_mount_rejects_param_prefix,
 )
+from test_router_mount import (
+    test_mount_rejects_catch_all_prefix as test_router_mount__test_mount_rejects_catch_all_prefix,
+)
+from test_router_mount import (
+    test_mount_rejects_old_param_syntax as test_router_mount__test_mount_rejects_old_param_syntax,
+)
 from test_routes_comptime import (
     test_handler_sees_the_whole_request as test_routes_comptime__test_handler_sees_the_whole_request,
 )
@@ -3404,10 +3488,22 @@ from test_routes_comptime import (
     test_comptime_matches_runtime_route_shape as test_routes_comptime__test_comptime_matches_runtime_route_shape,
 )
 from test_routes_comptime import (
-    test_non_final_wildcard_matches_nothing as test_routes_comptime__test_non_final_wildcard_matches_nothing,
+    test_comptime_parse_reports_catch_all_not_last as test_routes_comptime__test_comptime_parse_reports_catch_all_not_last,
 )
 from test_routes_comptime import (
-    test_final_wildcard_still_captures_rest as test_routes_comptime__test_final_wildcard_still_captures_rest,
+    test_comptime_parse_reports_old_param_syntax as test_routes_comptime__test_comptime_parse_reports_old_param_syntax,
+)
+from test_routes_comptime import (
+    test_comptime_parse_reports_old_wildcard_syntax as test_routes_comptime__test_comptime_parse_reports_old_wildcard_syntax,
+)
+from test_routes_comptime import (
+    test_comptime_parse_reports_partial_param as test_routes_comptime__test_comptime_parse_reports_partial_param,
+)
+from test_routes_comptime import (
+    test_comptime_parse_accepts_valid_path as test_routes_comptime__test_comptime_parse_accepts_valid_path,
+)
+from test_routes_comptime import (
+    test_catch_all_capture_uses_its_name as test_routes_comptime__test_catch_all_capture_uses_its_name,
 )
 from test_server import (
     test_find_crlfcrlf_simple as test_server__test_find_crlfcrlf_simple,
@@ -6414,10 +6510,38 @@ def main() raises:
     suite.test[test_router__test_param_does_not_match_too_short]()
     suite.test[test_router__test_param_does_not_match_too_long]()
     suite.test[test_router__test_param_named_value]()
-    suite.test[test_router__test_wildcard_one_segment]()
-    suite.test[test_router__test_wildcard_many_segments]()
-    suite.test[test_router__test_wildcard_zero_segments_does_not_match]()
-    suite.test[test_router__test_wildcard_not_last_rejected]()
+    suite.test[test_router__test_catch_all_one_segment]()
+    suite.test[test_router__test_catch_all_many_segments]()
+    suite.test[test_router__test_catch_all_zero_segments_does_not_match]()
+    suite.test[test_router__test_catch_all_uses_its_own_name]()
+    suite.test[test_router__test_catch_all_after_param]()
+    suite.test[test_router__test_catch_all_has_no_star_key]()
+    suite.test[test_router__test_path_must_start_with_slash]()
+    suite.test[test_router__test_empty_path_rejected]()
+    suite.test[test_router__test_unclosed_brace_rejected]()
+    suite.test[test_router__test_closing_brace_without_opening_rejected]()
+    suite.test[test_router__test_reversed_braces_rejected]()
+    suite.test[test_router__test_empty_param_name_rejected]()
+    suite.test[test_router__test_nameless_catch_all_rejected]()
+    suite.test[test_router__test_name_starting_with_digit_rejected]()
+    suite.test[test_router__test_name_with_dash_rejected]()
+    suite.test[test_router__test_underscore_and_digit_names_accepted]()
+    suite.test[test_router__test_duplicate_param_name_rejected]()
+    suite.test[
+        test_router__test_duplicate_name_across_param_and_catch_all_rejected
+    ]()
+    suite.test[test_router__test_catch_all_not_last_rejected]()
+    suite.test[test_router__test_param_with_literal_prefix_rejected]()
+    suite.test[test_router__test_param_with_literal_suffix_rejected]()
+    suite.test[test_router__test_two_params_in_one_segment_rejected]()
+    suite.test[test_router__test_old_param_syntax_rejected]()
+    suite.test[test_router__test_old_wildcard_syntax_rejected]()
+    suite.test[test_router__test_post_registration_validates_too]()
+    suite.test[test_router__test_struct_handler_registration_validates_too]()
+    suite.test[test_router__test_openapi_template_keeps_params]()
+    suite.test[test_router__test_openapi_template_names_catch_all]()
+    suite.test[test_router__test_openapi_template_root]()
+    suite.test[test_router__test_route_path_params_lists_param_and_catch_all]()
     suite.test[test_router__test_method_get_and_post_on_same_path]()
     suite.test[test_router__test_method_wrong_on_known_path_returns_405]()
     suite.test[test_router__test_method_not_allowed_includes_allow_header]()
@@ -6477,6 +6601,8 @@ def main() raises:
     suite.test[test_router_mount__test_unmounted_prefix_is_404]()
     suite.test[test_router_mount__test_mount_survives_router_copy]()
     suite.test[test_router_mount__test_mount_rejects_param_prefix]()
+    suite.test[test_router_mount__test_mount_rejects_catch_all_prefix]()
+    suite.test[test_router_mount__test_mount_rejects_old_param_syntax]()
     # tests/http/test_routes_comptime.mojo
     suite.test[test_routes_comptime__test_handler_sees_the_whole_request]()
     suite.test[test_routes_comptime__test_literal_root]()
@@ -6497,8 +6623,20 @@ def main() raises:
     suite.test[
         test_routes_comptime__test_comptime_matches_runtime_route_shape
     ]()
-    suite.test[test_routes_comptime__test_non_final_wildcard_matches_nothing]()
-    suite.test[test_routes_comptime__test_final_wildcard_still_captures_rest]()
+    suite.test[
+        test_routes_comptime__test_comptime_parse_reports_catch_all_not_last
+    ]()
+    suite.test[
+        test_routes_comptime__test_comptime_parse_reports_old_param_syntax
+    ]()
+    suite.test[
+        test_routes_comptime__test_comptime_parse_reports_old_wildcard_syntax
+    ]()
+    suite.test[
+        test_routes_comptime__test_comptime_parse_reports_partial_param
+    ]()
+    suite.test[test_routes_comptime__test_comptime_parse_accepts_valid_path]()
+    suite.test[test_routes_comptime__test_catch_all_capture_uses_its_name]()
     # tests/http/test_server.mojo
     suite.test[test_server__test_find_crlfcrlf_simple]()
     suite.test[test_server__test_find_crlfcrlf_with_headers]()

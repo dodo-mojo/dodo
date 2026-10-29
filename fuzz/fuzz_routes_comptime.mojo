@@ -42,15 +42,15 @@ def _ok_user(req: Request) raises -> Response:
 
 
 def _ok_files(req: Request) raises -> Response:
-    return ok("files:" + req.param("*"))
+    return ok("files:" + req.param("rest"))
 
 
 comptime _ROUTES: List[ComptimeRoute] = [
     ComptimeRoute(Method.GET, "/", _ok_home),
     ComptimeRoute(Method.GET, "/users", _ok_list),
     ComptimeRoute(Method.POST, "/users", _ok_create),
-    ComptimeRoute(Method.GET, "/users/:id", _ok_user),
-    ComptimeRoute(Method.GET, "/files/*", _ok_files),
+    ComptimeRoute(Method.GET, "/users/{id}", _ok_user),
+    ComptimeRoute(Method.GET, "/files/{*rest}", _ok_files),
 ]
 
 
@@ -63,8 +63,8 @@ def _build_runtime_router() raises -> Router:
     r.get("/", _ok_home)
     r.get("/users", _ok_list)
     r.post("/users", _ok_create)
-    r.get("/users/:id", _ok_user)
-    r.get("/files/*", _ok_files)
+    r.get("/users/{id}", _ok_user)
+    r.get("/files/{*rest}", _ok_files)
     return r^
 
 
@@ -154,7 +154,7 @@ def main() raises:
     seeds.append(_b("users/"))
     seeds.append(_b("//users"))
     seeds.append(_b("users//42"))
-    seeds.append(_b("users/:id"))
+    seeds.append(_b("users/{id}"))
     seeds.append(_b("*"))
     seeds.append(_b("files/*"))
     seeds.append(_b("?x=1"))

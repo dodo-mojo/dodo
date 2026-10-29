@@ -198,7 +198,7 @@ def test_router_passes_the_peer_through_a_param_route_and_a_mount() raises:
     from dodo.http import Router
 
     var r = Router()
-    r.get("/u/:id", _peer_echo)
+    r.get("/u/{id}", _peer_echo)
     assert_equal(
         r.serve(_client_req("/u/7")).text(), "203.0.113.9:4242 expose=True"
     )
@@ -213,7 +213,7 @@ def test_router_passes_the_peer_through_a_param_route_and_a_mount() raises:
 
 
 comptime _PEER_ROUTES: List[ComptimeRoute] = [
-    ComptimeRoute(Method.GET, "/p/:id", _peer_echo),
+    ComptimeRoute(Method.GET, "/p/{id}", _peer_echo),
 ]
 
 

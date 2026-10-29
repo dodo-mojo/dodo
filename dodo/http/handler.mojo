@@ -225,7 +225,7 @@ trait HandlerExtractor(Copyable, Defaultable, Handler):
                 ...
 
         var r = Router()
-        r.get(\"/users/:id\", Extracted[GetUser]())
+        r.get(\"/users/{id}\", Extracted[GetUser]())
 
     Re-exported from :mod:`dodo.http.handler` only (the demoted
     internal-adapter import path).

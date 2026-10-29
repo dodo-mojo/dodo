@@ -31,7 +31,7 @@ def h_user(req: Request) raises -> Response:
 def _router_with_routes() raises -> Router:
     var r = Router()
     r.get("/", h_home)
-    r.get("/users/:id", h_user)
+    r.get("/users/{id}", h_user)
     return r^
 
 

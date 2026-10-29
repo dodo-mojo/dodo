@@ -182,11 +182,11 @@ def _fast(req: Request) raises -> Response:
 def _router(prefix: String) raises -> Router:
     var r = Router()
     r.get("/fast", _fast)
-    r.get("/slow/:name", Offload(_Gate(prefix)))
-    r.get("/stubborn/:name", Offload(_Gate(prefix, stubborn=True)))
+    r.get("/slow/{name}", Offload(_Gate(prefix)))
+    r.get("/stubborn/{name}", Offload(_Gate(prefix, stubborn=True)))
     r.get("/raise", Offload(_Raiser()))
     var api = Router()
-    api.get("/slow/:name", Logger(Offload(_Gate(prefix))))
+    api.get("/slow/{name}", Logger(Offload(_Gate(prefix))))
     r.mount("/api", api^)
     return r^
 
