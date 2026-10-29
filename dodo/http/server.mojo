@@ -13,7 +13,7 @@
 from std.memory import unsafe_memcpy, stack_allocation
 from std.ffi import c_int, c_uint, external_call
 
-from json import dumps, Value as JsonValue
+from ..json import dumps, Value as JsonValue
 
 from ..runtime._libc_time import libc_nanosleep_ms, monotonic_now_ms
 from ..runtime.reuseport import bind_reuseport_if_free

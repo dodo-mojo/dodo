@@ -25,7 +25,7 @@ dodo must accept and reject.
 
 from std.pathlib import Path
 from std.testing import assert_equal, assert_false, assert_true
-from json import loads, Value, Null
+from dodo.json import loads, Value, Null
 
 from dodo.ws.frame import WsFrame
 

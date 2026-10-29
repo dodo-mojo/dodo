@@ -11,7 +11,7 @@ resolving.
 
 from std.collections import Optional
 
-from json import loads, Value
+from ..json import loads, Value
 
 from ._extract_core import (
     Extractor,
@@ -139,7 +139,7 @@ trait FromJson(Copyable, Defaultable, Deinitable):
 
     Example:
         ```mojo
-        from json import Value
+        from ..json import Value
         from dodo.http import FromJson
 
         @fieldwise_init
@@ -192,7 +192,7 @@ struct JsonAs[T: FromJson](Copyable, Defaultable, Extractor):
     def apply(mut self, req: Request) raises:
         if len(req.body) == 0:
             raise Error("missing JSON body")
-        self.value.parse_json(loads[target="cpu-simdjson"](req.text()))
+        self.value.parse_json(loads(req.text()))
 
     @staticmethod
     def extract(req: Request) raises -> Self:

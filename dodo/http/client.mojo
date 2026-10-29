@@ -52,7 +52,7 @@ from ..tcp import TcpStream
 from ..tcp.stream import _connect_with_fallback
 from ..tls import TlsStream, TlsConfig
 from ..net import NetworkError
-from json import dumps, Value as JsonValue
+from ..json import dumps, Value as JsonValue
 from ..net import SocketAddr
 from ..dns import resolve
 

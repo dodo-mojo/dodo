@@ -9,9 +9,12 @@ re-exports every name here, so the public ``dodo.http`` /
 
 from std.memory import unsafe_memcpy
 
-from json import JsonWriter, Value as JsonValue
-from json.reflection import serialize_json_into
-from json.value.value import write_value
+from ...json import (
+    JsonWriter,
+    Value as JsonValue,
+    serialize_json_into,
+    write_value,
+)
 
 from ..response import Response, Status
 

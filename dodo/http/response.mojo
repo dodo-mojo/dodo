@@ -2,7 +2,7 @@
 
 from std.collections import Optional
 
-from json import loads, Value
+from ..json import loads, Value
 from .body import Body, ChunkSource, InlineBody
 from .cancel import Cancel
 from .headers import HeaderMap
@@ -198,7 +198,7 @@ struct ResponseImpl[B: Body = InlineBody](Movable):
             print(data["slideshow"]["title"].string_value())
             ```
         """
-        return loads[target="cpu-simdjson"](self.text())
+        return loads(self.text())
 
     def raise_for_status(self) raises:
         """Raise ``HttpError`` if the status code is not 2xx.

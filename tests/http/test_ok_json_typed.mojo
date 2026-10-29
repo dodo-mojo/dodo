@@ -9,7 +9,7 @@ extractor.
 
 from std.testing import assert_equal, assert_true
 
-from json import loads, Value as JsonValue
+from dodo.json import loads, Value as JsonValue
 
 from dodo.http import ok_json, ok_json_of, ok_json_value
 
