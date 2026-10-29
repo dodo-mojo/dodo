@@ -79,9 +79,6 @@ def _open_fds() -> Int:
 
 @fieldwise_init
 struct _Idle(Copyable, Frontend):
-    def requires_per_worker_listener(self) -> Bool:
-        return False
-
     def run_worker(
         mut self,
         listener_fd: Int,

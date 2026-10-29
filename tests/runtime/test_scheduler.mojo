@@ -58,9 +58,6 @@ struct _NopFrontend(Copyable, Frontend):
 
     var tag: Int
 
-    def requires_per_worker_listener(self) -> Bool:
-        return False
-
     def run_worker(
         mut self,
         listener_fd: Int,
@@ -239,9 +236,6 @@ struct _StubbornFrontend(Copyable, Frontend):
     handler, then exits."""
 
     var hold_ms: Int
-
-    def requires_per_worker_listener(self) -> Bool:
-        return False
 
     def run_worker(
         mut self,
@@ -431,9 +425,6 @@ struct _GateFrontend(Copyable, Frontend):
 
     var cells: Int  # [0] gate, [1] stop-flag addr seen, [2] outcome
 
-    def requires_per_worker_listener(self) -> Bool:
-        return False
-
     def run_worker(
         mut self,
         listener_fd: Int,
@@ -529,9 +520,6 @@ struct _OneStuckFrontend(Copyable, Frontend):
     stuck worker publishes its listener fds."""
 
     var cells: Int  # [0] ticket, [1] gate, [2] primary fd, [3] extra fd
-
-    def requires_per_worker_listener(self) -> Bool:
-        return False
 
     def run_worker(
         mut self,
@@ -640,9 +628,6 @@ struct _GateShared(Copyable, Frontend):
     "in a handler" until the gate opens."""
 
     var cells: Int  # [0] gate, [1] listener fd seen (+1), [2] done
-
-    def requires_per_worker_listener(self) -> Bool:
-        return False
 
     def run_worker(
         mut self,

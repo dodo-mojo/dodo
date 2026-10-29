@@ -20,7 +20,7 @@ dodo bundles four FFI shims under ``$CONDA_PREFIX/lib/``:
 
 * ``libdodo_tls.so`` -- OpenSSL hooks (TLS handshake, AEAD,
   hkdf, hmac, sha1) plus the ``dodo_read`` / ``dodo_write``
-  thin wrappers used by the io_uring reactor's hot path.
+  thin wrappers used by :mod:`dodo.net._libc_fileio`.
 * ``libdodo_zlib.so`` -- zlib + gzip + raw-deflate thin
   wrappers consumed by :mod:`dodo.http.encoding` (HTTP
   ``Content-Encoding``) and :mod:`dodo.ws.permessage_deflate`

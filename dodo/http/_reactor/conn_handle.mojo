@@ -14,7 +14,7 @@ re-exported here so existing import sites in ``dodo.http``,
 ``dodo.http2``, ``dodo.runtime``, the tests, and the fuzz corpus
 keep working unchanged.
 
-The reader entry points (default, bufring, cancel-aware) share one
+The reader entry points (default, cancel-aware) share one
 set of parse-and-dispatch helpers.
 
 State transitions::
@@ -25,7 +25,7 @@ State transitions::
 
 The sister module ``dodo/http/_server_reactor_impl.mojo`` owns the
 I/O-bearing pieces -- reactor entry-point loops, ``Pool[ConnHandle]``
-allocation glue, io_uring buffer-ring glue -- and re-exports
+allocation glue -- and re-exports
 every public symbol below for back-compat with existing imports
 across ``dodo/http/``, ``dodo/http2/``, ``dodo/runtime/``, tests,
 and the fuzz corpus.
@@ -115,15 +115,6 @@ from dodo.tls._server_ffi import (
     SSL_IO_WANT_READ,
     SSL_IO_WANT_WRITE,
 )
-
-
-# ── Dispatch-config comptime tags ─────────────────────────────────────────────
-
-comptime BYTE_SOURCE_RECV: Int = 0
-"""Drain the non-blocking socket via ``_recv`` until EAGAIN."""
-comptime BYTE_SOURCE_BUFRING: Int = 1
-"""Use kernel-provided bytes (io_uring buffer-ring path); skip
-``_recv``."""
 
 
 # ── Streaming coalescing budget ───────────────────────────────────────────────
@@ -639,29 +630,6 @@ struct ConnHandle(Movable):
             )
         return Optional[StepResult]()
 
-    @always_inline
-    def _append_pre_recv_bytes(
-        mut self, bytes: Span[UInt8, _], config: ServerConfig
-    ) raises -> Optional[StepResult]:
-        """Append kernel-pre-delivered ``bytes`` (io_uring buffer-ring
-        path) into ``self.read_buf``. Mirror of :meth:`_drain_recv`
-        for the BUFRING byte source; identical body-size cap check.
-        """
-        if len(bytes) > 0:
-            var old_len = len(self.read_buf)
-            var add = len(bytes)
-            self.read_buf.resize(old_len + add, UInt8(0))
-            var dst = self.read_buf.unsafe_ptr().unsafe_offset(old_len)
-            unsafe_memcpy(dest=dst, src=bytes.unsafe_ptr(), count=add)
-            if (
-                len(self.read_buf) - config.max_header_size
-                > config.max_body_size
-            ):
-                self._note_head_from_buf()
-                self._queue_error(413, "Content Too Large")
-                return Optional[StepResult](self._transition_to_writing())
-        return Optional[StepResult]()
-
     def _maybe_send_continue(mut self):
         """Write ``HTTP/1.1 100 Continue`` once for a request that asked
         for it and whose head is in but whose body is not.
@@ -1029,17 +997,6 @@ struct ConnHandle(Movable):
             return StepResult(want_read=True, want_write=True)
         return self._parked_step()
 
-    def _parked_bytes(mut self, bytes: Span[UInt8, _]) -> StepResult:
-        """Keep bytes the io_uring loop received while parked, for after
-        the response, up to ``PARKED_READ_LIMIT``. That loop sees the
-        client leave on its own, from the receive completion."""
-        self.read_buf.extend(bytes)
-        if len(self.read_buf) > PARKED_READ_LIMIT:
-            self.read_buf.clear()
-            self.offload_close = True
-            self.should_close = True
-        return self._parked_step()
-
     def offload_abandon(mut self, reason: Int):
         """Give up on the parked job: flip its cancel cell to ``reason``
         and forget it, so its result is dropped when it comes back."""
@@ -1337,111 +1294,6 @@ struct ConnHandle(Movable):
                     want_write=True,
                     idle_timeout_ms=0,
                 )
-
-        var final_close = self._apply_keepalive_policy(config, close_after)
-        if self.offload_port != 0 and _wants_offload(handler, req):
-            return self._offload(req^, final_close, config)
-        var expose_errors = req.expose_errors
-        var request_id = req.headers.get("x-request-id")
-        var resp: Response
-        try:
-            resp = handler.serve(req).lower()
-        except e:
-            log_handler_error(request_id, String(e))
-            var mapped = map_handler_error(String(e), expose_errors)
-            self._queue_error(mapped.status, mapped.reason)
-            return self._transition_to_writing()
-        return self._finalise_response(resp^, final_close)
-
-    def on_readable_from_buf[
-        H: Handler
-    ](
-        mut self,
-        bytes: Span[UInt8, _],
-        ref handler: H,
-        config: ServerConfig,
-    ) raises -> StepResult:
-        """``on_readable[H]`` variant for the io_uring recv-multishot
-        path: takes pre-recv'd bytes from a kernel-delivered buffer
-        instead of looping on ``_recv()`` itself.
-
-        The ``IORING_OP_RECV`` CQE with ``res == 0`` (peer closed)
-        is handled by the caller, not here -- this method only
-        runs when there are real bytes to feed.
-
-        Args:
-            bytes: New bytes to feed into the read pipeline. May be
-                empty (legitimate when the kernel re-issues a
-                multishot completion immediately after re-arm; we
-                skip the parse step in that case).
-            handler: Request -> Response callback.
-            config: Server configuration.
-
-        Returns:
-            A ``StepResult`` describing the new reactor-interest
-            state.
-        """
-        if self.state == STATE_PARKED:
-            return self._parked_bytes(bytes)
-        if self.state != STATE_READING:
-            return StepResult(
-                want_read=False, want_write=self.state == STATE_WRITING
-            )
-
-        var appended = self._append_pre_recv_bytes(bytes, config)
-        if appended:
-            return appended.value()
-        var pending = self._check_request_complete(
-            config, body_timeout_ms=config.read_body_timeout_ms
-        )
-        if pending:
-            return pending.value()
-
-        var req: Request
-        var close_after: Bool
-        try:
-            if config.skip_header_decode_for_short_requests:
-                req = _parse_http_request_bytes_minimal(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    self.headers_end,
-                    self.content_length,
-                    config.max_body_size,
-                    config.max_uri_length,
-                    self.peer,
-                    config.expose_error_messages,
-                )
-                close_after = _wants_close(self.read_buf, self.headers_end)
-            else:
-                req = _parse_http_request_bytes(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    config.max_header_size,
-                    config.max_body_size,
-                    config.max_uri_length,
-                    self.peer,
-                    config.expose_error_messages,
-                    config.h1_leniency,
-                )
-                close_after = _compute_close_after(req.headers, req.version)
-            self.head_request = req.method == "HEAD"
-            if self.is_chunked:
-                # The parsers deliberately do not decode chunked bodies
-                # (they only use TE to resolve the CL/TE ambiguity), so
-                # the framed bytes are decoded here into the body the
-                # handler sees.
-                req.body = List[UInt8]()
-                _ = decode_chunked_body(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    self.headers_end,
-                    req.body,
-                )
-                decode_chunked_trailers(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    self.headers_end,
-                    req.trailers,
-                )
-        except e:
-            self._queue_parse_error(String(e))
-            return self._transition_to_writing()
 
         var final_close = self._apply_keepalive_policy(config, close_after)
         if self.offload_port != 0 and _wants_offload(handler, req):

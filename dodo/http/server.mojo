@@ -30,12 +30,7 @@ from .request import Request, Method
 from .response import Response, Status
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string, ascii_eq_ignore_case
-from ._server.config import (
-    ServerConfig,
-    WsUpgrade,
-    _resolve_bufring_handler_env,
-    bufring_gap,
-)
+from ._server.config import ServerConfig, WsUpgrade
 from .alpn_dispatch import (
     ALPN_HTTP_1_1,
     ALPN_HTTP_2,
@@ -61,8 +56,8 @@ from dodo.runtime.scheduler import ShutdownReport
 struct HttpServer(Movable):
     """A non-blocking reactor HTTP server: HTTP/1.1, HTTP/2, TLS.
 
-    One ``serve`` call runs an event loop over ``kqueue`` / ``epoll``
-    (opt-in ``io_uring`` on Linux), so many connections are in flight at
+    One ``serve`` call runs an event loop over ``kqueue`` / ``epoll``,
+    so many connections are in flight at
     once rather than one per calling thread. Each accepted cleartext
     connection is dispatched by peeking its first 24 bytes: the RFC 9113
     §3.4 client preface selects the HTTP/2 handle, anything else the
@@ -534,49 +529,14 @@ struct HttpServer(Movable):
         var per_worker = (files - SPARE_FILES) // max(workers, 1)
         self.config.max_connections = max(per_worker, 16)
 
-    def _resolve_bufring(mut self):
-        """Decide once, at startup, whether the io_uring buffer-ring loop
-        serves: when opted into (``DODO_BUFRING_HANDLER=1`` or
-        ``use_bufring``) and the config needs nothing that loop lacks."""
-        if not self.config.use_bufring:
-            self.config.use_bufring = _resolve_bufring_handler_env()
-        if not self.config.use_bufring:
-            return
-        var gap = bufring_gap(self.config)
-        if not gap and self._ws_h2_hooks:
-            gap = "WebSocket upgrades"
-        if gap:
-            print(
-                "dodo: the io_uring buffer ring does not enforce",
-                gap + "; serving with the reactor loop",
-                file=stderr,
-            )
-            self.config.use_bufring = False
-
     def _serve_one[H: Handler](mut self, ref handler: H) raises:
-        """The single-worker reactor: io_uring buffer ring when opted in,
-        else the unified h1/h2 loop over every bound listener, with the
-        WebSocket-over-h2 sidecar when one is attached."""
-        from ._server_reactor_impl import run_uring_bufring_reactor_loop
+        """The single-worker reactor: the unified h1/h2 loop over every
+        bound listener, with the WebSocket-over-h2 sidecar when one is
+        attached."""
         from ._unified_reactor_impl import run_unified_reactor_loop
-        from dodo.runtime.uring_reactor import use_uring_backend
-        from std.sys.info import CompilationTarget
 
         self._stopping = False
         self._resolve_max_connections(1)
-        self._resolve_bufring()
-        comptime if CompilationTarget.is_linux():
-            if (
-                use_uring_backend()
-                and self.config.use_bufring
-                and len(self._extra_listener_fds) == 0
-                and not self._tls_ctx
-                and not self._ws_h2_hooks
-            ):
-                run_uring_bufring_reactor_loop[H](
-                    self._listener, self.config, handler, self._stopping
-                )
-                return
         var hooks = Optional[WsH2Hooks](None)
         if self._ws_h2_hooks:
             hooks = Optional[WsH2Hooks](self._ws_h2_hooks.value().copy())
@@ -841,7 +801,6 @@ struct HttpServer(Movable):
 
         # Before the config is handed to the worker threads.
         self._resolve_max_connections(num_workers)
-        self._resolve_bufring()
 
         var frontend = HttpFrontend[H](
             handler^,

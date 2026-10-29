@@ -725,27 +725,6 @@ def test_unlimited_body_cap_serves_request() raises:
     client.close()
 
 
-def test_unlimited_body_cap_bufring_path() raises:
-    """APP-06: the io_uring buffer-ring ingest path has the same cap."""
-    var listener = TcpListener.bind(SocketAddr.localhost(0))
-    var port = listener.local_addr().port
-    var client = TcpStream.connect(SocketAddr.localhost(port))
-    var server = listener.accept()
-    server._socket.set_nonblocking(True)
-    listener.close()
-    var ch = ConnHandle(server^)
-    var cfg = _default_config()
-    cfg.max_body_size = Int.MAX
-    var h = FnHandler(_echo_handler)
-    var req = _bytes_of("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-    _ = ch.on_readable_from_buf(Span[UInt8](req), h, cfg)
-    assert_equal(ch.state, STATE_WRITING)
-    assert_false(ch.should_close)
-    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
-    assert_true(" 200 " in wire)
-    client.close()
-
-
 def test_body_cap_still_rejects_oversized_input() raises:
     """APP-06: the subtraction form keeps rejecting a buffer larger than
     ``max_header_size + max_body_size`` (here 64 + 64 = 128 bytes)."""

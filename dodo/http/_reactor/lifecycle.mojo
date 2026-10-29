@@ -1,4 +1,4 @@
-"""Connection-lifecycle glue shared by the epoll/kqueue and io_uring loops.
+"""Connection-lifecycle glue shared by the epoll/kqueue loops.
 
 ``ConnHandle`` alloc/free/lookup, the ``StepResult`` -> reactor/timer
 translation (``_apply_step``), teardown (``_cleanup_conn``), the poll
