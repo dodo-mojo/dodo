@@ -9,13 +9,16 @@ re-exports every name here, so the public ``dodo.http`` /
 
 from std.memory import unsafe_memcpy
 
-from json import JsonWriter, Value as JsonValue
-from json.reflection import serialize_json_into
-from json.value.value import write_value
+from ...json import (
+    JsonWriter,
+    Value as JsonValue,
+    serialize_json_into,
+    write_value,
+)
 
 from ..response import Response, Status
 
-from .write import _status_reason
+from ..status_reason import status_reason
 
 
 @always_inline
@@ -232,7 +235,7 @@ def redirect(url: String, status: Int = 302) -> Response:
     Returns:
         A ``Response`` with the ``Location`` header set.
     """
-    var resp = Response(status=status, reason=_status_reason(status))
+    var resp = Response(status=status, reason=status_reason(status))
     try:
         resp.headers.set("Location", url)
     except:

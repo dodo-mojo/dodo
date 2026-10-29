@@ -36,8 +36,7 @@ top-level handler that is not ``Copyable`` can't be copied: then
 
 Every server loop runs it on the pool: the unified HTTP/1.1 and HTTP/2
 loop, cleartext and TLS; ``serve_cancellable`` (wrap the stack in
-``WithCancel``); the HTTP/1.1-only multi-worker loop; and the opt-in
-io_uring buffer ring.
+``WithCancel``); and the HTTP/1.1-only multi-worker loop.
 """
 
 from .handler import Handler

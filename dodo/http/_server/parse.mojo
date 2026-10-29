@@ -33,7 +33,7 @@ from .parse_util import (
     _is_token_char,
     _parse_int_str,
     _read_line_buf,
-    _read_line_buf_lenient,
+    _read_line_crlf,
     _scan_content_length,
 )
 
@@ -147,9 +147,7 @@ def _parse_http_request_bytes(
                 break
 
     # 1. Request line: METHOD SP URI SP VERSION CRLF
-    var req_line = _read_line_buf_lenient(
-        data, pos, leniency.allow_lf_only_line_endings
-    )
+    var req_line = _read_line_crlf(data, pos)
     if req_line.byte_length() == 0:
         raise Error("empty request line")
 
@@ -166,7 +164,7 @@ def _parse_http_request_bytes(
     for i in range(sp1):
         if not _is_token_char(req_line.unsafe_ptr()[unsafe_offset=i]):
             raise Error("invalid character in request method")
-    # B3: try the StaticString intern table first — covers the 9
+    # Try the StaticString intern table first — covers the 9
     # RFC 7231 method names (~99 % of real-world traffic is GET /
     # POST). On a hit, the returned String's backing comes from
     # a process-lifetime constant rather than from per-request
@@ -252,9 +250,7 @@ def _parse_http_request_bytes(
     var te_seen = False
 
     while True:
-        var line = _read_line_buf_lenient(
-            data, pos, leniency.allow_lf_only_line_endings
-        )
+        var line = _read_line_crlf(data, pos)
         header_bytes += line.byte_length()
         if (
             not leniency.allow_oversized_header_list

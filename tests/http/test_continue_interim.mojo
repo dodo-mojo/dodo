@@ -1,5 +1,5 @@
 """The interim ``100 Continue`` is completed when the socket takes it only
-in part (APP-49).
+in part.
 
 A cleartext ``send`` can take part of the 25-byte line (Linux does), and a
 TLS ``SSL_write`` can answer WANT_WRITE and keep the record pending. Either
@@ -10,9 +10,7 @@ and after WANT_WRITE a write from another buffer fails with
 
 A kernel send buffer cannot be made to take a short count on every platform,
 so these tests put the connection in the state a short send leaves
-(``continue_pending``) and check the bytes that follow. The end-to-end
-trigger is ``formal/repro/APP-49_continue_partial_send_corrupts_stream.mojo``
-(Linux).
+(``continue_pending``) and check the bytes that follow.
 """
 
 from std.memory import Pointer

@@ -110,7 +110,7 @@ def test_drain_marks_stopping_idempotent() raises:
     assert_true(srv._stopping)
 
 
-# ── drain(timeout_ms) is graceful, not a hard stop (APP-46) ─────────────────
+# ── drain(timeout_ms) is graceful, not a hard stop ─────────────────
 
 comptime _BIG_BODY = 16 * 1024 * 1024
 

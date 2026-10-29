@@ -14,7 +14,7 @@ re-exported here so existing import sites in ``dodo.http``,
 ``dodo.http2``, ``dodo.runtime``, the tests, and the fuzz corpus
 keep working unchanged.
 
-The reader entry points (default, bufring, cancel-aware) share one
+The reader entry points (default, cancel-aware) share one
 set of parse-and-dispatch helpers.
 
 State transitions::
@@ -25,7 +25,7 @@ State transitions::
 
 The sister module ``dodo/http/_server_reactor_impl.mojo`` owns the
 I/O-bearing pieces -- reactor entry-point loops, ``Pool[ConnHandle]``
-allocation glue, io_uring buffer-ring glue -- and re-exports
+allocation glue -- and re-exports
 every public symbol below for back-compat with existing imports
 across ``dodo/http/``, ``dodo/http2/``, ``dodo/runtime/``, tests,
 and the fuzz corpus.
@@ -64,7 +64,7 @@ from dodo.http.server import (
 )
 from dodo.http._server.config import MIN_BODY_RATE_GRACE_MS
 from dodo.http._server.parse import parse_error_status
-from dodo.http._server.write import _status_reason
+from dodo.http.status_reason import status_reason
 from dodo.net import SocketAddr
 from dodo.net._libc import _recv, _send, _shutdown, MSG_NOSIGNAL, SHUT_WR
 from dodo.tcp import TcpStream
@@ -89,7 +89,6 @@ from .keepalive_scan import (
     _is_content_length,
     _is_date,
     _has_header_line,
-    _monotonic_ms,
     _wants_close,
 )
 from dodo.http.proto.chunked import (
@@ -115,15 +114,7 @@ from dodo.tls._server_ffi import (
     SSL_IO_WANT_READ,
     SSL_IO_WANT_WRITE,
 )
-
-
-# ── Dispatch-config comptime tags ─────────────────────────────────────────────
-
-comptime BYTE_SOURCE_RECV: Int = 0
-"""Drain the non-blocking socket via ``_recv`` until EAGAIN."""
-comptime BYTE_SOURCE_BUFRING: Int = 1
-"""Use kernel-provided bytes (io_uring buffer-ring path); skip
-``_recv``."""
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 # ── Streaming coalescing budget ───────────────────────────────────────────────
@@ -345,7 +336,7 @@ struct ConnHandle(Movable):
     on this connection."""
 
     var body_src: Optional[ChunkSourceBox]
-    """Active streaming body source (K1), ``None`` for the buffered
+    """Active streaming body source, ``None`` for the buffered
     path. Set from ``Response.body_stream`` at response completion; the
     ``on_writable`` refill loop pulls a bounded batch of chunks per
     writable edge, frames them as ``Transfer-Encoding: chunked``, and
@@ -541,6 +532,7 @@ struct ConnHandle(Movable):
         if self.tls:
             return self._drain_recv_tls[flips_cancel_on_close](config)
         var chunk = stack_allocation[8192, UInt8]()
+        var head_checked = False
         while True:
             var got = _recv(self.fd(), chunk, c_size_t(8192), c_int(0))
             if got > 0:
@@ -551,7 +543,7 @@ struct ConnHandle(Movable):
                 unsafe_memcpy(dest=dst, src=chunk, count=got_int)
                 # Compare without the sum: ``max_header_size +
                 # max_body_size`` wraps for an "unlimited" body cap such
-                # as ``Int.MAX`` (APP-06). ``len`` and ``max_header_size``
+                # as ``Int.MAX``. ``len`` and ``max_header_size``
                 # are non-negative, so the subtraction cannot overflow.
                 if (
                     len(self.read_buf) - config.max_header_size
@@ -560,6 +552,10 @@ struct ConnHandle(Movable):
                     self._note_head_from_buf()
                     self._queue_error(413, "Content Too Large")
                     return Optional[StepResult](self._transition_to_writing())
+                if not head_checked and self._past_head_budget(config):
+                    head_checked = True
+                    if _find_crlfcrlf(self.read_buf, 0) < 0:
+                        break
                 # A read that did not fill the chunk emptied the socket
                 # (``recv`` returns what is queued, up to the chunk), so
                 # another call would only report EAGAIN. Registration is
@@ -595,6 +591,19 @@ struct ConnHandle(Movable):
                 )
         return Optional[StepResult]()
 
+    def _past_head_budget(self, config: ServerConfig) -> Bool:
+        """True when no head has been framed yet and ``read_buf`` holds
+        more than a head may take.
+
+        The drain loops then check once for a complete head. Without one,
+        they stop reading: the caller answers 431, and reading on would
+        only pull a client's endless head into memory first.
+        """
+        if self.headers_end >= 0:
+            return False
+        var head_budget = config.max_header_size + config.max_uri_length
+        return len(self.read_buf) > head_budget
+
     def _drain_recv_tls[
         flips_cancel_on_close: Bool
     ](mut self, config: ServerConfig) raises -> Optional[StepResult]:
@@ -605,6 +614,7 @@ struct ConnHandle(Movable):
         and is treated exactly like a cleartext peer FIN, so keep-alive
         teardown and cancel semantics are identical on both transports.
         """
+        var head_checked = False
         while True:
             var got = self.tls.value().recv(self.read_buf, 8192)
             if got > 0:
@@ -615,6 +625,10 @@ struct ConnHandle(Movable):
                     self._note_head_from_buf()
                     self._queue_error(413, "Content Too Large")
                     return Optional[StepResult](self._transition_to_writing())
+                if not head_checked and self._past_head_budget(config):
+                    head_checked = True
+                    if _find_crlfcrlf(self.read_buf, 0) < 0:
+                        break
                 continue
             if got == SSL_IO_WANT_READ:
                 break
@@ -637,29 +651,6 @@ struct ConnHandle(Movable):
             return Optional[StepResult](
                 StepResult(want_read=False, want_write=False, done=True)
             )
-        return Optional[StepResult]()
-
-    @always_inline
-    def _append_pre_recv_bytes(
-        mut self, bytes: Span[UInt8, _], config: ServerConfig
-    ) raises -> Optional[StepResult]:
-        """Append kernel-pre-delivered ``bytes`` (io_uring buffer-ring
-        path) into ``self.read_buf``. Mirror of :meth:`_drain_recv`
-        for the BUFRING byte source; identical body-size cap check.
-        """
-        if len(bytes) > 0:
-            var old_len = len(self.read_buf)
-            var add = len(bytes)
-            self.read_buf.resize(old_len + add, UInt8(0))
-            var dst = self.read_buf.unsafe_ptr().unsafe_offset(old_len)
-            unsafe_memcpy(dest=dst, src=bytes.unsafe_ptr(), count=add)
-            if (
-                len(self.read_buf) - config.max_header_size
-                > config.max_body_size
-            ):
-                self._note_head_from_buf()
-                self._queue_error(413, "Content Too Large")
-                return Optional[StepResult](self._transition_to_writing())
         return Optional[StepResult]()
 
     def _maybe_send_continue(mut self):
@@ -747,13 +738,13 @@ struct ConnHandle(Movable):
         # the whole request, head and body, from its first byte.
         # An error queued while the request is still incomplete must know
         # whether it answers a HEAD (no content, RFC 9110 sec 9.3.2); the
-        # parsed ``req.method`` is not available yet (APP-05).
+        # parsed ``req.method`` is not available yet.
         self._note_head_from_buf()
         var timed = (
             config.request_timeout_ms > 0 or config.header_timeout_ms > 0
         )
         if len(self.read_buf) > 0 and timed:
-            var now = _monotonic_ms()
+            var now = monotonic_now_ms()
             if self.request_started_ms == 0:
                 self.request_started_ms = now
             else:
@@ -774,10 +765,7 @@ struct ConnHandle(Movable):
             self.continue_sent = False
             var end = _find_crlfcrlf(self.read_buf, 0)
             if end < 0:
-                if (
-                    not config.h1_leniency.allow_lf_only_line_endings
-                    and _has_bare_lf(self.read_buf)
-                ):
+                if _has_bare_lf(self.read_buf):
                     self._queue_error(400, "Bad Request")
                     return Optional[StepResult](self._transition_to_writing())
                 # The head is the request line (up to max_uri_length)
@@ -796,7 +784,7 @@ struct ConnHandle(Movable):
                 )
             self.headers_end = end
             if config.min_body_rate > 0:
-                self.body_started_ms = _monotonic_ms()
+                self.body_started_ms = monotonic_now_ms()
             var te = request_te_framing(
                 Span[UInt8, _](self.read_buf),
                 self.headers_end,
@@ -908,7 +896,7 @@ struct ConnHandle(Movable):
         into ``STATE_WRITING``.
         """
         self._consume_request()
-        # Streaming path (K1): a handler that returned a streaming
+        # Streaming path: a handler that returned a streaming
         # Response carries a chunk source. Take it onto the connection,
         # emit chunked-framed headers, and let ``on_writable`` pull the
         # body chunk-by-chunk. The buffered path is unchanged.
@@ -1027,17 +1015,6 @@ struct ConnHandle(Movable):
             self.should_close = True
         if self.tls_cross_interest:
             return StepResult(want_read=True, want_write=True)
-        return self._parked_step()
-
-    def _parked_bytes(mut self, bytes: Span[UInt8, _]) -> StepResult:
-        """Keep bytes the io_uring loop received while parked, for after
-        the response, up to ``PARKED_READ_LIMIT``. That loop sees the
-        client leave on its own, from the receive completion."""
-        self.read_buf.extend(bytes)
-        if len(self.read_buf) > PARKED_READ_LIMIT:
-            self.read_buf.clear()
-            self.offload_close = True
-            self.should_close = True
         return self._parked_step()
 
     def offload_abandon(mut self, reason: Int):
@@ -1353,111 +1330,6 @@ struct ConnHandle(Movable):
             return self._transition_to_writing()
         return self._finalise_response(resp^, final_close)
 
-    def on_readable_from_buf[
-        H: Handler
-    ](
-        mut self,
-        bytes: Span[UInt8, _],
-        ref handler: H,
-        config: ServerConfig,
-    ) raises -> StepResult:
-        """``on_readable[H]`` variant for the io_uring recv-multishot
-        path: takes pre-recv'd bytes from a kernel-delivered buffer
-        instead of looping on ``_recv()`` itself.
-
-        The ``IORING_OP_RECV`` CQE with ``res == 0`` (peer closed)
-        is handled by the caller, not here -- this method only
-        runs when there are real bytes to feed.
-
-        Args:
-            bytes: New bytes to feed into the read pipeline. May be
-                empty (legitimate when the kernel re-issues a
-                multishot completion immediately after re-arm; we
-                skip the parse step in that case).
-            handler: Request -> Response callback.
-            config: Server configuration.
-
-        Returns:
-            A ``StepResult`` describing the new reactor-interest
-            state.
-        """
-        if self.state == STATE_PARKED:
-            return self._parked_bytes(bytes)
-        if self.state != STATE_READING:
-            return StepResult(
-                want_read=False, want_write=self.state == STATE_WRITING
-            )
-
-        var appended = self._append_pre_recv_bytes(bytes, config)
-        if appended:
-            return appended.value()
-        var pending = self._check_request_complete(
-            config, body_timeout_ms=config.read_body_timeout_ms
-        )
-        if pending:
-            return pending.value()
-
-        var req: Request
-        var close_after: Bool
-        try:
-            if config.skip_header_decode_for_short_requests:
-                req = _parse_http_request_bytes_minimal(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    self.headers_end,
-                    self.content_length,
-                    config.max_body_size,
-                    config.max_uri_length,
-                    self.peer,
-                    config.expose_error_messages,
-                )
-                close_after = _wants_close(self.read_buf, self.headers_end)
-            else:
-                req = _parse_http_request_bytes(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    config.max_header_size,
-                    config.max_body_size,
-                    config.max_uri_length,
-                    self.peer,
-                    config.expose_error_messages,
-                    config.h1_leniency,
-                )
-                close_after = _compute_close_after(req.headers, req.version)
-            self.head_request = req.method == "HEAD"
-            if self.is_chunked:
-                # The parsers deliberately do not decode chunked bodies
-                # (they only use TE to resolve the CL/TE ambiguity), so
-                # the framed bytes are decoded here into the body the
-                # handler sees.
-                req.body = List[UInt8]()
-                _ = decode_chunked_body(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    self.headers_end,
-                    req.body,
-                )
-                decode_chunked_trailers(
-                    Span[UInt8, _](self.read_buf)[: self.body_total],
-                    self.headers_end,
-                    req.trailers,
-                )
-        except e:
-            self._queue_parse_error(String(e))
-            return self._transition_to_writing()
-
-        var final_close = self._apply_keepalive_policy(config, close_after)
-        if self.offload_port != 0 and _wants_offload(handler, req):
-            return self._offload(req^, final_close, config)
-        var expose_errors = req.expose_errors
-        var request_id = req.headers.get("x-request-id")
-        var resp: Response
-        try:
-            resp = handler.serve(req).lower()
-        except e:
-            log_handler_error(request_id, String(e))
-            var mapped = map_handler_error(String(e), expose_errors)
-            self._queue_error(mapped.status, mapped.reason)
-            return self._transition_to_writing()
-        return self._finalise_response(resp^, final_close)
-
     def on_readable_cancel[
         CH: CancelHandler
     ](mut self, ref handler: CH, config: ServerConfig,) raises -> StepResult:
@@ -1471,6 +1343,8 @@ struct ConnHandle(Movable):
         A request the handler marks ``blocking`` goes to the offload
         pool instead, which binds ``cancel`` to the job.
         """
+        if self.state == STATE_LINGERING:
+            return self._linger_read()
         if self.state == STATE_PARKED:
             return self._parked_read()
         if self.state != STATE_READING:
@@ -1809,9 +1683,7 @@ struct ConnHandle(Movable):
             )
 
         if self.should_close:
-            # Lingering needs a loop that keeps reading and arms timers:
-            # the unified loop does, for cleartext connections.
-            if self.linger_on_close and self.on_unified_loop and not self.tls:
+            if self.linger_on_close:
                 return self._start_lingering()
             return StepResult(want_read=False, want_write=False, done=True)
 
@@ -2080,7 +1952,7 @@ struct ConnHandle(Movable):
         """While the request head has not been fully scanned
         (``headers_end < 0``) the method is read off the buffered request
         line, so an error queued now (431 / 408 / 413 ...) is answered
-        without content when it replies to a HEAD (APP-05). Once the head
+        without content when it replies to a HEAD. Once the head
         is scanned the flag is left alone: after dispatch ``read_buf`` may
         already start with the next pipelined request."""
         if self.headers_end < 0:
@@ -2091,7 +1963,7 @@ struct ConnHandle(Movable):
         period at less than ``config.min_body_rate`` bytes a second."""
         if config.min_body_rate <= 0 or self.body_started_ms == 0:
             return False
-        var elapsed = _monotonic_ms() - self.body_started_ms
+        var elapsed = monotonic_now_ms() - self.body_started_ms
         if elapsed <= MIN_BODY_RATE_GRACE_MS:
             return False
         var received = len(self.read_buf) - self.headers_end
@@ -2101,13 +1973,13 @@ struct ConnHandle(Movable):
         """Answer a request the parser refused, with the status its
         message names (400 unless it is a 413, 414, 417, 431, 501 or 505)."""
         var status = parse_error_status(message)
-        self._queue_error(status, _status_reason(status))
+        self._queue_error(status, status_reason(status))
 
     def _queue_error(mut self, status: Int, reason: String) -> None:
         """Build a minimal error response into ``write_buf`` and mark close.
 
         The response is serialised with ``self.head_request`` so an error
-        answering a HEAD request carries no content (APP-05)."""
+        answering a HEAD request carries no content."""
         self.should_close = True
         # A client that timed out is slow by definition; lingering would
         # only let it hold the connection longer.
@@ -2121,11 +1993,20 @@ struct ConnHandle(Movable):
         Closing outright while the client is still sending makes the
         kernel answer with a reset, which can destroy the response before
         the client reads it.
+
+        On TLS the ``close_notify`` goes out first, then the same
+        half-close. What the client sends after that is dropped as raw
+        ciphertext: nothing more is decrypted.
         """
+        if self.tls:
+            try:
+                self.tls.value().send_close_notify()
+            except:
+                pass
         _ = _shutdown(self.fd(), SHUT_WR)
         self.state = STATE_LINGERING
         self.read_buf.clear()
-        self.linger_started_ms = _monotonic_ms()
+        self.linger_started_ms = monotonic_now_ms()
         return StepResult(
             want_read=True,
             want_write=False,
@@ -2149,7 +2030,7 @@ struct ConnHandle(Movable):
             if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
                 break
             return StepResult(done=True)
-        if _monotonic_ms() - self.linger_started_ms > LINGER_TOTAL_MS:
+        if monotonic_now_ms() - self.linger_started_ms > LINGER_TOTAL_MS:
             return StepResult(done=True)
         return StepResult(
             want_read=True,

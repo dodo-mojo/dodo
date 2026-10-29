@@ -2,7 +2,7 @@
 
 HTTP/1.1 and HTTP/2 server and client, WebSocket (RFC 6455), TLS 1.2/1.3
 (OpenSSL with ALPN), TCP, Unix sockets and DNS, on one reactor per worker
-(epoll, opt-in io_uring on Linux; kqueue on macOS).
+(epoll on Linux, kqueue on macOS).
 
 ```mojo
 from dodo import HttpServer, Router, Request, Response, ok, SocketAddr

@@ -318,7 +318,7 @@ struct Http2ClientConnection(Defaultable, Movable):
         # (RFC 7541 sec 6.3). The decoder's *current* size stays at the
         # 4096 default: the peer's encoder keeps that table until it has
         # received our SETTINGS and sent a size update (sec 4.2), so
-        # shrinking now would drop entries it still indexes (HPACK-03).
+        # shrinking now would drop entries it still indexes.
         out.conn.hpack_decoder.settings_max_size = out.config.header_table_size
         out.conn.hpack_decoder.allow_huffman = out.config.allow_huffman_decode
         out.conn.hpack_encoder.allow_huffman = out.config.allow_huffman_encode
@@ -454,7 +454,7 @@ struct Http2ClientConnection(Defaultable, Movable):
                     # sec 4.2: a frame over the size we advertised is a
                     # connection error FRAME_SIZE_ERROR. Queue the GOAWAY
                     # rather than raising: callers let a raise propagate
-                    # and then close without sending anything (H2-18).
+                    # and then close without sending anything.
                     var gerr = self.conn._conn_error(
                         Http2ErrorCode.FRAME_SIZE_ERROR().value
                     )
@@ -479,7 +479,7 @@ struct Http2ClientConnection(Defaultable, Movable):
             # answers with GOAWAY. It must not be dropped: its header block
             # may insert into the server's HPACK table, and skipping it
             # would leave the decoder out of step for every later response
-            # (RFC 9113 sec 4.3, H2-17).
+            # (RFC 9113 sec 4.3).
             # Special-case: RST_STREAM. ``Connection.handle_frame``
             # already marks the stream CLOSED but does not retain
             # the peer's error code. Stash it here so the
@@ -846,12 +846,9 @@ struct Http2ClientConnection(Defaultable, Movable):
         for i in range(len(extra_headers)):
             hh.append(extra_headers[i].copy())
         var enc = self.conn.hpack_encoder.encode(Span[HpackHeader, _](hh))
-        # HEADERS frame with END_HEADERS always set (the
-        # encoder produces a single contiguous block; we don't
-        # split into CONTINUATION yet -- that's a follow-up for
-        # >max_frame_size header blocks). If the encoded block
-        # exceeds ``max_frame_size`` we fall back to a HEADERS +
-        # CONTINUATION sequence below.
+        # The encoder produces one contiguous block. It goes out as a
+        # single HEADERS frame with END_HEADERS when it fits in
+        # ``max_frame_size``, otherwise as HEADERS + CONTINUATION.
         var max_frame = self.conn.max_frame_size
         var n_enc = len(enc)
         if n_enc <= max_frame:

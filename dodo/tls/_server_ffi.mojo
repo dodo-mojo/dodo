@@ -6,7 +6,7 @@ Exposes the C-side functions added to
 pattern: ``OwnedDLHandle`` to ``libdodo_tls.so``, individually
 typed ``get_function`` calls per FFI export.
 
-Minimum-friction surface for the C7 reactor state machine:
+The surface the TLS reactor state machine uses:
 
 - ``ServerCtx``: holds an ``SSL_CTX*`` (as ``Int``) plus the
   loaded ``OwnedDLHandle``.
@@ -265,6 +265,11 @@ def _do_ssl_get_sni_host(
     if n <= 0:
         return ""
     return String(unsafe_from_utf8=Span[UInt8, _](buf[:n]))
+
+
+def _do_ssl_shutdown(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](lib, "dodo_ssl_shutdown")
+    return Int(f(ssl))
 
 
 def _do_ssl_free(imm lib: OwnedDLHandle, ssl_addr: Int) raises:

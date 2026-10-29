@@ -10,6 +10,7 @@ reactor imports from ``dodo.http.server``).
 from std.memory import unsafe_memcpy
 
 from ..response import Response
+from ..status_reason import status_reason
 from ..headers import _eq_icase
 from ...tcp import TcpStream
 
@@ -35,7 +36,7 @@ def _write_response_buffered(
     """
     var reason = resp.reason
     if reason.byte_length() == 0:
-        reason = _status_reason(resp.status)
+        reason = status_reason(resp.status)
 
     var body_len = len(resp.body)
 
@@ -102,65 +103,6 @@ def _append_str(mut buf: List[UInt8], s: String):
     )
 
 
-def _status_reason(code: Int) -> String:
-    """Return the canonical reason phrase for a known HTTP status code."""
-    if code == 200:
-        return "OK"
-    if code == 201:
-        return "Created"
-    if code == 202:
-        return "Accepted"
-    if code == 204:
-        return "No Content"
-    if code == 301:
-        return "Moved Permanently"
-    if code == 302:
-        return "Found"
-    if code == 304:
-        return "Not Modified"
-    if code == 307:
-        return "Temporary Redirect"
-    if code == 308:
-        return "Permanent Redirect"
-    if code == 400:
-        return "Bad Request"
-    if code == 401:
-        return "Unauthorized"
-    if code == 403:
-        return "Forbidden"
-    if code == 404:
-        return "Not Found"
-    if code == 405:
-        return "Method Not Allowed"
-    if code == 408:
-        return "Request Timeout"
-    if code == 409:
-        return "Conflict"
-    if code == 413:
-        return "Content Too Large"
-    if code == 414:
-        return "URI Too Long"
-    if code == 417:
-        return "Expectation Failed"
-    if code == 422:
-        return "Unprocessable Entity"
-    if code == 431:
-        return "Request Header Fields Too Large"
-    if code == 500:
-        return "Internal Server Error"
-    if code == 501:
-        return "Not Implemented"
-    if code == 502:
-        return "Bad Gateway"
-    if code == 503:
-        return "Service Unavailable"
-    if code == 504:
-        return "Gateway Timeout"
-    if code == 505:
-        return "HTTP Version Not Supported"
-    return "Unknown"
-
-
 def _write_response(mut stream: TcpStream, resp: Response) raises:
     """Legacy response writer. Delegates to buffered version with Connection: close.
     """
@@ -197,7 +139,7 @@ def frame_h1_stream_head_into(
     """
     var reason = resp.reason
     if reason.byte_length() == 0:
-        reason = _status_reason(resp.status)
+        reason = status_reason(resp.status)
     _append_str(out, "HTTP/1.1 ")
     _append_str(out, String(resp.status))
     _append_str(out, " ")

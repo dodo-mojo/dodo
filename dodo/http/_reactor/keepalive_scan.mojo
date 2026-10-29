@@ -21,17 +21,9 @@ References:
 """
 
 from std.collections import List
-from std.ffi import c_int, external_call
-from std.memory import unsafe_memcpy, stack_allocation
-from std.sys.info import CompilationTarget
+from std.memory import unsafe_memcpy
 
 from dodo.http.headers import HeaderMap
-
-# CLOCK_MONOTONIC clock id: 1 on Linux, 6 on Darwin/macOS (id 1 is
-# undefined there, so clock_gettime would fail and the clock read 0).
-comptime _CLOCK_MONOTONIC: c_int = c_int(
-    6
-) if CompilationTarget.is_macos() else c_int(1)
 from dodo.http.proto.h2c_upgrade import (
     detect_h2c_upgrade as _proto_detect_h2c_upgrade,
 )
@@ -151,29 +143,6 @@ struct StepResult(Copyable, ImplicitlyCopyable):
 
 
 # ── Monotonic clock + small ASCII helpers ─────────────────────────────────────
-
-
-def _monotonic_ms() -> Int:
-    """Return the monotonic clock in milliseconds.
-
-    Uses ``clock_gettime(CLOCK_MONOTONIC, ...)`` with the per-OS clock
-    id (1 on Linux, 6 on macOS; see ``_CLOCK_MONOTONIC``).
-    """
-    var buf = stack_allocation[16, UInt8]()
-    for i in range(16):
-        buf.unsafe_offset(i).unsafe_write(UInt8(0))
-    _ = external_call["clock_gettime", c_int](
-        _CLOCK_MONOTONIC, buf.unsafe_bitcast[NoneType]()
-    )
-    var sec: Int64 = 0
-    var nsec: Int64 = 0
-    for i in range(8):
-        sec |= Int64(Int(buf.unsafe_offset(i).unsafe_load())) << Int64(8 * i)
-    for i in range(8):
-        nsec |= Int64(Int(buf.unsafe_offset(8 + i).unsafe_load())) << Int64(
-            8 * i
-        )
-    return Int(sec) * 1000 + Int(nsec) // 1_000_000
 
 
 @always_inline

@@ -83,6 +83,8 @@ from std.collections import Optional
 from std.format import Writable, Writer
 from std.io.file_descriptor import RawFileDescriptor
 
+from dodo.http.status_reason import status_reason
+
 
 comptime HTTP_STATUS_ERROR_PREFIX: String = "HttpStatusError("
 """Shared prefix for the :struct:`HttpStatusError` wire format, used by
@@ -133,54 +135,6 @@ struct ValidationError(Copyable, Writable):
 # ── HttpStatusError ─────────────────────────────────────────────────────────
 
 
-def http_reason_phrase(status: Int) -> String:
-    """Canonical RFC 9110 reason phrase for the common status codes.
-
-    Falls back to a generic class phrase ("Client Error" / "Server
-    Error") for codes without a dedicated entry so the body is never
-    empty.
-    """
-    if status == 400:
-        return "Bad Request"
-    if status == 401:
-        return "Unauthorized"
-    if status == 403:
-        return "Forbidden"
-    if status == 404:
-        return "Not Found"
-    if status == 405:
-        return "Method Not Allowed"
-    if status == 406:
-        return "Not Acceptable"
-    if status == 409:
-        return "Conflict"
-    if status == 410:
-        return "Gone"
-    if status == 412:
-        return "Precondition Failed"
-    if status == 413:
-        return "Payload Too Large"
-    if status == 415:
-        return "Unsupported Media Type"
-    if status == 422:
-        return "Unprocessable Entity"
-    if status == 429:
-        return "Too Many Requests"
-    if status == 500:
-        return "Internal Server Error"
-    if status == 501:
-        return "Not Implemented"
-    if status == 502:
-        return "Bad Gateway"
-    if status == 503:
-        return "Service Unavailable"
-    if status == 504:
-        return "Gateway Timeout"
-    if status >= 500:
-        return "Server Error"
-    return "Client Error"
-
-
 @fieldwise_init
 struct HttpStatusError(Copyable, Writable):
     """An error that names the exact HTTP status a handler wants returned.
@@ -214,7 +168,7 @@ struct HttpStatusError(Copyable, Writable):
     def __init__(out self, status: Int):
         """Construct with the canonical reason phrase for ``status``."""
         self.status = status
-        self.message = http_reason_phrase(status)
+        self.message = status_reason(status)
 
     def write_to[W: Writer](self, mut writer: W):
         """Render the defined status-error wire format
@@ -265,7 +219,7 @@ def parse_status_error(error_str: String) -> Optional[MappedHandlerError]:
         if status < 100 or status > 599:
             return Optional[MappedHandlerError]()
         var marker = error_str.find("): ", lp)
-        var message = http_reason_phrase(status)
+        var message = status_reason(status)
         if marker != -1:
             message = String(error_str[byte = marker + 3 :])
         return Optional[MappedHandlerError](MappedHandlerError(status, message))

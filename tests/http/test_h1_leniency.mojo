@@ -12,7 +12,6 @@ from dodo.http.proto import _ExperimentalH1LeniencyConfig
 
 def test_default_is_strict() raises:
     var c = _ExperimentalH1LeniencyConfig()
-    assert_false(c.allow_lf_only_line_endings)
     assert_false(c.allow_mixed_case_method)
     assert_false(c.allow_ows_around_colon)
     assert_false(c.allow_obs_fold)
@@ -35,11 +34,6 @@ def test_strict_factory() raises:
 def test_individual_flags_toggle() raises:
     # Spot-check that each flag is independently settable and
     # surfaces through ``any_enabled``.
-    var c0 = _ExperimentalH1LeniencyConfig(allow_lf_only_line_endings=True)
-    assert_true(c0.allow_lf_only_line_endings)
-    assert_false(c0.allow_mixed_case_method)
-    assert_true(c0.any_enabled())
-
     var c1 = _ExperimentalH1LeniencyConfig(allow_mixed_case_method=True)
     assert_true(c1.allow_mixed_case_method)
     assert_true(c1.any_enabled())
@@ -93,11 +87,11 @@ def test_individual_flags_toggle() raises:
 
 def test_combined_flags_compose() raises:
     var c = _ExperimentalH1LeniencyConfig(
-        allow_lf_only_line_endings=True,
         allow_mixed_case_method=True,
+        allow_obs_fold=True,
     )
-    assert_true(c.allow_lf_only_line_endings)
     assert_true(c.allow_mixed_case_method)
+    assert_true(c.allow_obs_fold)
     assert_false(c.allow_ows_around_colon)
     assert_true(c.any_enabled())
 

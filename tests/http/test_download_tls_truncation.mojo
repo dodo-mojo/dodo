@@ -1,4 +1,4 @@
-"""Streaming download over TLS: a stream cut without close_notify (H1-11).
+"""Streaming download over TLS: a stream cut without close_notify.
 
 A close-delimited body (no Content-Length, not chunked) is complete only
 if the TLS stream ends with close_notify (RFC 8446 sec 6.1, RFC 9112

@@ -56,7 +56,6 @@ from .acceptor import (
     TlsSniCert,
     TlsInfo,
     TlsServerError,
-    TlsServerNotImplemented,
     TLS_PROTOCOL_TLS12,
     TLS_PROTOCOL_TLS13,
 )

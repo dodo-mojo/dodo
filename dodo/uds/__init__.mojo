@@ -56,10 +56,8 @@ while True:
 
 Out of scope today:
 
-- Abstract namespace addresses (Linux-only ``\0``-prefixed path);
-  follow-up if a downstream sidecar request comes in.
-- ``SCM_RIGHTS`` fd passing; same — interesting for hot
-  binary upgrades, ship when there's a caller.
+- Abstract namespace addresses (Linux-only ``\0``-prefixed path).
+- ``SCM_RIGHTS`` fd passing (useful for hot binary upgrades).
 - macOS Mach-port shim; the macOS UDS path goes through the
   POSIX shim layer, no Mach involvement.
 """

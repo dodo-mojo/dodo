@@ -19,7 +19,7 @@ Cases (7):
   addresses served.
 * ``test_serve_{cancellable,view,static}_rejects_extra_listeners`` --
   the three single-listener loops raise on a multi-address server
-  instead of silently serving only the first address (DOC-05).
+  instead of silently serving only the first address.
 """
 
 from std.ffi import c_int, external_call

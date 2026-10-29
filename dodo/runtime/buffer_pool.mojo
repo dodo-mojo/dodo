@@ -83,7 +83,7 @@ What this module provides
 Storage strategy
 ----------------
 
-Same as ``ResponsePool`` (B6): ``BufferHandle`` is ``Movable``
+Same as ``ResponsePool``: ``BufferHandle`` is ``Movable``
 but not ``Copyable``, so each per-class bucket is a ``List[Int]``
 of heap addresses managed via ``Pool[BufferHandle]``. ``acquire``
 pops an address, takes the pointee, frees the cell.
@@ -92,11 +92,7 @@ pushes the address. Net allocation cost: one ``Pool.alloc/free``
 pair per acquire/release; the actual win is that the **underlying
 ``List[UInt8]`` capacity is preserved** across the move-in / out.
 
-Wiring into the reactor's accept-and-read path is a follow-up;
-this module provides the primitive + tests + re-exports.
-
-
-Not wired. ``ConnHandle.read_buf`` /
+Not wired into the HTTP/1.1 reactor. ``ConnHandle.read_buf`` /
 ``write_buf`` are allocated once per *connection*, not per request, and
 ``Pool[ConnHandle].free`` genuinely destroys the handle, so the
 allocation this would remove happens once per accept. On a keep-alive
@@ -365,7 +361,7 @@ struct BufferPool(Movable):
             return
         # ``bytes`` is public: a caller may have replaced or shrunk it. An
         # undersized buffer must not be recycled into its class, or a later
-        # ``acquire`` would return less than ``min_capacity`` (RT-05).
+        # ``acquire`` would return less than ``min_capacity``.
         # Handles that grew past the class capacity are fine.
         if handle.bytes.capacity() < _capacity_for_class(idx):
             return

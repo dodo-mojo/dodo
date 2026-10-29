@@ -400,7 +400,7 @@ def test_wakeup_after_drain_can_fire_again() raises:
 
 
 def test_poll_reuses_event_buffer_across_calls() raises:
-    """D10: the reactor caches + reuses its event array. Poll many times
+    """The reactor caches + reuses its event array. Poll many times
     (including a grow to a larger max_events and a shrink back) and
     confirm each wakeup is still delivered correctly -- guards the
     reused-buffer path against stale reads / corruption.

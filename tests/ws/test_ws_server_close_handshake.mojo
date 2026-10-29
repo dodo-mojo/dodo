@@ -1,4 +1,4 @@
-"""``WsConnection`` takes part in the closing handshake (WS-06).
+"""``WsConnection`` takes part in the closing handshake.
 
 RFC 6455 sec 5.5.1: an endpoint that receives a CLOSE and has not sent one
 MUST send a CLOSE in response, and after sending a CLOSE it MUST NOT send
@@ -217,7 +217,7 @@ def _recv_raises(mut p: _Pair) -> Bool:
 
 
 def test_unmasked_client_frame_is_refused_with_close_1002() raises:
-    """DOC-02: the refusal of an unmasked frame carries CLOSE 1002."""
+    """The refusal of an unmasked frame carries CLOSE 1002."""
     var p = _Pair()
     var wire = WsFrame(opcode=WsOpcode.TEXT, payload=_bytes("hi")).encode(
         mask=False
@@ -236,7 +236,7 @@ def test_unmasked_client_frame_is_refused_with_close_1002() raises:
 
 
 def test_invalid_utf8_text_frame_is_refused_with_close_1007() raises:
-    """DOC-01: a final TEXT frame that is not UTF-8 fails with CLOSE 1007."""
+    """A final TEXT frame that is not UTF-8 fails with CLOSE 1007."""
     var p = _Pair()
     var good = List[UInt8]()
     good.append(0x68)

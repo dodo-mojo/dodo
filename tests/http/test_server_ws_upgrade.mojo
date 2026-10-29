@@ -501,12 +501,12 @@ def _exchange(port: UInt16, req: String, needle: String) raises -> String:
 
 
 def test_shared_listener_checks_the_whole_handshake() raises:
-    """WS-07: Connection is matched as a token and the key must decode.
+    """Connection is matched as a token and the key must decode.
 
     The reactor tested ``"upgrade" in connection`` and a non-empty key, so
     ``Connection: noupgrade`` and ``Sec-WebSocket-Key: x`` got a 101. A
     request that is not a valid handshake is ordinary HTTP here; the
-    standalone ``WsServer`` applies the same rule (WS-05).
+    standalone ``WsServer`` applies the same rule.
     """
     from dodo.http import ServerConfig, WsUpgrade
 
@@ -633,7 +633,7 @@ def test_shared_listener_upgrade_carries_origin() raises:
     assert_true("origin=[https://app.test]" in got, "got: " + got)
 
 
-# ── WebSocket upgrade on a TLS connection (APP-48) ───────────────────────────
+# ── WebSocket upgrade on a TLS connection ───────────────────────────
 
 
 def _tls_http_handler(req: Request) raises -> Response:

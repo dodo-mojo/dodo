@@ -1,5 +1,5 @@
-"""``TlsAcceptor`` session tickets: rotation on ``reload()`` (DOC-07) and the
-opt-in switch (DOC-08).
+"""``TlsAcceptor`` session tickets: rotation on ``reload()`` and the
+opt-in switch.
 
 ``docs/threat-model.md`` says the ticket key "is part of the TlsAcceptor and
 rotates with ``reload``". A ticket (or cached session) issued before a
@@ -11,7 +11,7 @@ loopback listener (ephemeral port) and serves three blocking handshakes with
 a one-byte echo; the parent drives client connections, each offering the
 session captured on the one before.
 
-DOC-08: ``TlsServerConfig.enable_session_tickets`` defaults to ``False``
+``TlsServerConfig.enable_session_tickets`` defaults to ``False``
 (``docs/features.md`` calls resumption opt-in) and ``False`` really turns tickets
 and the server session cache off, so a client never gets a session to replay.
 """
@@ -182,7 +182,7 @@ def test_ticket_resumes_without_reload() raises:
 
 
 def test_reload_rotates_the_ticket_key() raises:
-    """DOC-07: a ticket issued before ``reload()`` no longer resumes
+    """A ticket issued before ``reload()`` no longer resumes
     after it."""
     var r = _resumption_chain(
         TlsServerConfig(_CRT, _KEY, enable_session_tickets=True), 1
@@ -194,7 +194,7 @@ def test_reload_rotates_the_ticket_key() raises:
 
 
 def test_session_tickets_are_opt_in_by_default() raises:
-    """DOC-08: the config default is off."""
+    """The config default is off."""
     assert_false(TlsServerConfig(_CRT, _KEY).enable_session_tickets)
 
 
@@ -208,7 +208,7 @@ def test_explicit_tickets_issue_a_resumable_session() raises:
 
 
 def test_tickets_off_issues_no_session() raises:
-    """DOC-08: ``enable_session_tickets=False`` issues nothing to replay and
+    """``enable_session_tickets=False`` issues nothing to replay and
     resumes nothing."""
     var r = _session_probe(
         TlsServerConfig(_CRT, _KEY, enable_session_tickets=False)
@@ -218,7 +218,7 @@ def test_tickets_off_issues_no_session() raises:
 
 
 def test_default_config_issues_no_session() raises:
-    """DOC-08: a server built from the default config does not resume."""
+    """A server built from the default config does not resume."""
     var r = _session_probe(TlsServerConfig(_CRT, _KEY))
     assert_false(r[0], "default config must not issue a session")
     assert_false(r[1], "default config must not resume")

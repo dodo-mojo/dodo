@@ -189,7 +189,7 @@ def test_pool_release_with_invalid_class_index_drops_silently() raises:
 
 
 def test_pool_release_drops_handle_with_shrunk_capacity() raises:
-    """RT-05: ``BufferHandle.bytes`` is public, so a caller may replace or
+    """``BufferHandle.bytes`` is public, so a caller may replace or
     shrink it before ``release``. A handle whose capacity is below its
     class must be dropped, not recycled; otherwise ``acquire(60000)``
     returns capacity 0, against its ``capacity >= min_capacity`` contract.
@@ -204,7 +204,7 @@ def test_pool_release_drops_handle_with_shrunk_capacity() raises:
 
 
 def test_pool_release_drops_forged_undersized_handle() raises:
-    """RT-05: a hand-built handle tagged with a class but smaller than it
+    """A hand-built handle tagged with a class but smaller than it
     is dropped; a handle exactly at, or above, its class capacity is kept.
     """
     var p = BufferPool()
@@ -221,7 +221,7 @@ def test_pool_release_drops_forged_undersized_handle() raises:
 
 
 def test_pool_release_keeps_grown_handle() raises:
-    """RT-05: growing ``bytes`` past its class capacity (appends) keeps
+    """Growing ``bytes`` past its class capacity (appends) keeps
     the handle recyclable."""
     var p = BufferPool()
     var h = p.acquire(1024)

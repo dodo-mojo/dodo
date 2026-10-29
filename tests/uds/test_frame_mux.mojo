@@ -130,7 +130,7 @@ def test_demux_oversize_length_raises() raises:
 
 
 def test_demux_error_does_not_redeliver_routed_frames() raises:
-    """NET-04: a protocol error mid-feed used to skip the compaction, so the
+    """A protocol error mid-feed used to skip the compaction, so the
     frames routed before it stayed buffered and the next ``feed`` routed
     them again."""
     var w = ByteWriter()

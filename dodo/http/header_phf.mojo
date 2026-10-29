@@ -23,12 +23,8 @@ regardless of how many other headers the request carries.
 
 The deliverable here is the **dispatch primitive**: given a byte
 slice, return an integer index 0..N-1 if it matches a known
-standard header (case-insensitively), else -1. Wiring into the
-``HeaderMap`` hot path is a follow-up; this module provides
-the table + tests + the public ``StandardHeader.*`` index
-constants for downstream code that wants to talk in indices
-rather than strings (e.g. the upcoming SIMD HPACK decoder needs
-a static-table-resolution side channel).
+standard header (case-insensitively), else -1, plus the public
+``StandardHeader.*`` index constants. ``HeaderMap`` does not use it.
 
 Approach
 --------

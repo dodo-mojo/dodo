@@ -14,7 +14,7 @@ area compiles once.
   with zero tests run.
 
 ``EXCLUDE`` lists tests that mutate process-global state (env vars, named
-semaphores, io_uring registrations), so they run as their own processes.
+semaphores), so they run as their own processes.
 
 Usage
 -----
@@ -32,6 +32,8 @@ import sys
 
 TESTS = "tests"
 OUT_DIR = os.path.join(TESTS, "_agg")
+# The server and scripts the live checks run; no tests in it.
+LIVE_DIR = os.path.join(TESTS, "live")
 
 # Tests that mutate process-global state; they must keep their own process.
 EXCLUDE = {
@@ -40,15 +42,13 @@ EXCLUDE = {
     "tests/runtime/test_handoff.mojo",
     # Fills the whole per-process thread table to make pthread_create fail.
     "tests/runtime/test_scheduler_start_rollback.mojo",
-    "tests/runtime/test_uring_bufring_dispatch.mojo",
     "tests/runtime/test_reuseport.mojo",
-    "tests/http/test_uring_serve_handler.mojo",
-    "tests/http/test_uring_serve_handler_load.mojo",
-    "tests/http/test_uring_bufring_buffers.mojo",
-    "tests/http/test_uring_bufring_partial.mojo",
     # Stress/soak: runtime-bound, not compile-bound, so aggregating it buys
     # nothing and it would dominate the aggregate's wall clock.
     "tests/runtime/stress_scheduler.mojo",
+    # Points DODO_LIB_DIR at an empty directory; the library lookup is
+    # cached per process.
+    "tests/json/test_loads_fallback.mojo",
 }
 
 TEST_DEF = re.compile(r"^def (test_[A-Za-z0-9_]*)\s*\(", re.M)
@@ -90,7 +90,9 @@ def discover() -> dict[str, list[tuple[str, list[str]]]]:
     areas: dict[str, list[tuple[str, list[str]]]] = {}
     missing: list[str] = []
     for path in sorted(glob.glob(f"{TESTS}/**/*.mojo", recursive=True)):
-        if path.startswith(OUT_DIR) or path in EXCLUDE:
+        if path.startswith(OUT_DIR) or path.startswith(LIVE_DIR):
+            continue
+        if path in EXCLUDE:
             continue
         names = TEST_DEF.findall(open(path).read())
         if not names:

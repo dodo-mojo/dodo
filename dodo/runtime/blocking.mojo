@@ -58,8 +58,7 @@ What it does NOT buy (and why):
   ``def block_in_pool[T](work, cancel) raises -> T`` requires
   this — to release the reactor's connection-loop while
   ``work()`` is in flight we'd need either Mojo async or a
-  new "park this connection" reactor state. Both are
-  release-line follow-ups.
+  new "park this connection" reactor state.
 
 Cancel contract (unchanged from the in-thread fallback):
 
@@ -117,7 +116,7 @@ comptime MAX_POOL_SIZE: Int = 32
 # fail-closed: if the semaphore cannot be opened (fd exhaustion,
 # /dev/shm full) the acquire is refused, because a fail-open acquire that
 # did not decrement would let its paired release raise the cap by one for
-# the rest of the process (RT-07).
+# the rest of the process.
 #
 # ponytail: kernel-name-keyed cap. Ceiling: a prior process with the
 # SAME pid that crashed while holding slots can leave the cap reduced
@@ -170,7 +169,7 @@ def _pool_sem_open(name: String) -> Pointer[UInt8, MutUntrackedOrigin]:
     variadic area. On Apple arm64 that area is the stack, while
     ``external_call`` passes every argument in registers (x2, x3), so
     the callee read garbage and failed with ``EINVAL`` every time --
-    which, being fail-open, silently disabled the cap (RT-06). There six
+    which, being fail-open, silently disabled the cap. There six
     dummy register arguments (x2..x7) push ``mode`` and ``value`` into
     the first two 8-byte stack slots, as the callee expects; they are
     passed as 64-bit values so each fills a whole slot (the same ABI
@@ -203,7 +202,7 @@ def _sem_open_failed(sem: Pointer[UInt8, MutUntrackedOrigin]) -> Bool:
     ``SEM_FAILED`` is ``(sem_t *)-1`` on Darwin but ``(sem_t *)0`` on
     glibc / musl. Testing only -1 let a failed open on Linux (for
     example EMFILE once the fd table is full) through, and NULL then
-    reached ``sem_trywait`` / ``sem_post``: SIGSEGV (RT-08). Both values
+    reached ``sem_trywait`` / ``sem_post``: SIGSEGV. Both values
     are rejected; neither is ever a valid ``sem_t *``.
     """
     var addr = Int(sem)
@@ -222,7 +221,7 @@ def _pool_try_acquire() -> Bool:
     returns a slot that was really taken and the count stays within
     ``[0, MAX_POOL_SIZE]``. Returning True without decrementing (the old
     fail-open behaviour) made the matching release raise the cap by one
-    for the rest of the process (RT-07).
+    for the rest of the process.
     """
     var name = _pool_sem_name()
     var sem = _pool_sem_open(name)
@@ -238,7 +237,7 @@ def _pool_release():
     """Return one pool slot claimed by ``_pool_try_acquire``.
 
     If the semaphore cannot be opened the slot is not returned; that can
-    only tighten the cap (never raise it), see RT-07.
+    only tighten the cap (never raise it), see
     """
     var name = _pool_sem_name()
     var sem = _pool_sem_open(name)

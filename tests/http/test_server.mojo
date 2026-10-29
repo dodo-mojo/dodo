@@ -51,10 +51,10 @@ from dodo.http.server import (
     _parse_http_request,
     _write_response,
     _write_response_buffered,
-    _status_reason,
     _is_token_char,
     _is_field_value_char,
 )
+from dodo.http.status_reason import status_reason
 from dodo.tcp import TcpListener, TcpStream
 from dodo.net import SocketAddr, IpAddr
 
@@ -326,14 +326,21 @@ def test_parse_bytes_options_method() raises:
 
 
 def test_status_reason_mappings() raises:
-    """Each status code maps to its RFC reason phrase; an
-    unmapped code falls back to "Unknown"."""
-    assert_equal(_status_reason(200), "OK")
-    assert_equal(_status_reason(404), "Not Found")
-    assert_equal(_status_reason(413), "Content Too Large")
-    assert_equal(_status_reason(414), "URI Too Long")
-    assert_equal(_status_reason(500), "Internal Server Error")
-    assert_equal(_status_reason(999), "Unknown")
+    """Each status code maps to its RFC 9110 reason phrase. A code
+    without one gets its class name, and one outside 100-599 "Unknown"."""
+    assert_equal(status_reason(200), "OK")
+    assert_equal(status_reason(404), "Not Found")
+    assert_equal(status_reason(413), "Content Too Large")
+    assert_equal(status_reason(414), "URI Too Long")
+    assert_equal(status_reason(500), "Internal Server Error")
+    assert_equal(status_reason(422), "Unprocessable Content")
+    assert_equal(status_reason(150), "Informational")
+    assert_equal(status_reason(299), "Successful")
+    assert_equal(status_reason(399), "Redirection")
+    assert_equal(status_reason(499), "Client Error")
+    assert_equal(status_reason(599), "Server Error")
+    assert_equal(status_reason(99), "Unknown")
+    assert_equal(status_reason(999), "Unknown")
 
 
 # ── ServerConfig ──────────────────────────────────────────────────────────────
@@ -918,10 +925,7 @@ def test_parse_bytes_crlf_only() raises:
 
 
 def test_parse_bytes_lf_only() raises:
-    """Request with LF-only line endings is rejected by strict default,
-    accepted with H1LeniencyConfig.allow_lf_only_line_endings."""
-    from dodo.http.proto import H1LeniencyConfig
-
+    """Request with LF-only line endings is rejected (RFC 9112 §2.2)."""
     var raw = "GET / HTTP/1.1\nHost: test\n\n"
     var data = raw.as_bytes()
     var rejected = False
@@ -930,9 +934,6 @@ def test_parse_bytes_lf_only() raises:
     except:
         rejected = True
     assert_true(rejected)
-    var lenient = H1LeniencyConfig(allow_lf_only_line_endings=True)
-    var req = _parse_http_request_bytes(Span[UInt8, _](data), leniency=lenient)
-    assert_equal(req.method, "GET")
 
 
 def test_parse_bytes_long_header_value() raises:

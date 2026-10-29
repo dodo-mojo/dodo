@@ -1,9 +1,8 @@
 """``FileServer`` — serve files from a directory with HEAD + Range support.
 
 Reads files synchronously via libc ``open(2)`` / ``read(2)``;
-suitable for sub-100 MB static directories. For larger trees (or
-concurrent reactor pressure) the reactor's ``Pool[T]`` blocking
-escape hatch is the follow-up.
+suitable for sub-100 MB static directories. For larger trees, or
+under concurrent load, wrap the handler in ``Offload``.
 
 Features:
 

@@ -135,7 +135,7 @@ def _assert_segmentation_independent(
 
 
 def test_chunk_line_cap_is_independent_of_segmentation() raises:
-    """H1-01: the verdict must not depend on where TCP split the bytes.
+    """The verdict must not depend on where TCP split the bytes.
 
     A size line of exactly CHUNK_LINE_MAX bytes is accepted in one read, so
     it must also be accepted when the first read ends right after its CR.
@@ -183,7 +183,7 @@ def test_chunk_line_cap_is_independent_of_segmentation() raises:
 
 
 def test_scan_rejects_bare_lf_in_chunk_lines() raises:
-    """H1-02: LF inside a size line or trailer line is malformed.
+    """LF inside a size line or trailer line is malformed.
 
     An LF-splitting front end ends ``0;\\n`` at the LF and the body at
     offset 5; dodo used to read on to offset 13.

@@ -136,7 +136,7 @@ def test_skip() raises:
 
 
 def test_huge_length_rejected_without_moving_cursor() raises:
-    """ENC-04: ``pos + n`` wrapped for ``n > Int.MAX - pos``, so ``skip`` /
+    """``pos + n`` wrapped for ``n > Int.MAX - pos``, so ``skip`` /
     ``read_bytes`` / ``read_utf8`` accepted it and moved ``pos`` negative."""
     var raw = _bytes(0x01, 0x02, 0x03, 0x04)
     var r = ByteReader(Span[UInt8, _](raw))

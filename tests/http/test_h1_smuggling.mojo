@@ -332,11 +332,12 @@ def test_te_chunked_then_identity_with_cl_is_refused() raises:
 
 # ── The reactor and the parser must read the same header lines ─────────────
 #
-# H1-03 / H1-04: with ``allow_ows_around_colon`` or
-# ``allow_lf_only_line_endings`` the parser accepts ``Name : value`` and
-# bare-LF line ends. The reactor's raw-byte framing has to find the same
+# With ``allow_ows_around_colon`` the parser accepts
+# ``Name : value``. The reactor's raw-byte framing has to find the same
 # Transfer-Encoding / Content-Length lines, or the body is left in the read
-# buffer and served as the next request.
+# buffer and served as the next request. Bare-LF line ends are always
+# rejected by the parser, and the framing still ends lines at a bare LF so
+# it never reads a different header set.
 
 
 def _reactor_te(raw: String) -> Int:
@@ -502,28 +503,22 @@ def test_te_framing_ends_header_lines_at_a_bare_lf() raises:
     )
 
 
-def test_bare_lf_reactor_and_parser_agree() raises:
-    var lenient = H1LeniencyConfig(allow_lf_only_line_endings=True)
-    var te = _parsed_framing(
-        (
+def test_parser_rejects_bare_lf_header_lines() raises:
+    assert_false(
+        _parses(
             "POST / HTTP/1.1\r\nHost: a\nTransfer-Encoding: chunked\r\n\r\n"
             "5\r\nhello\r\n0\r\n\r\n"
-        ),
-        lenient,
+        )
     )
-    assert_equal(te[0], "chunked")
-    var te_first = _parsed_framing(
-        (
+    assert_false(
+        _parses(
             "POST / HTTP/1.1\nTransfer-Encoding: chunked\r\nHost: a\r\n\r\n"
             "5\r\nhello\r\n0\r\n\r\n"
-        ),
-        lenient,
+        )
     )
-    assert_equal(te_first[0], "chunked")
-    var cl = _parsed_framing(
-        "POST / HTTP/1.1\r\nHost: a\nContent-Length: 5\r\n\r\nhello", lenient
+    assert_false(
+        _parses("POST / HTTP/1.1\r\nHost: a\nContent-Length: 5\r\n\r\nhello")
     )
-    assert_equal(cl[1], 5)
 
 
 # ── Header lines the parser used to skip or misread ────────────────────────
@@ -748,7 +743,7 @@ def _obs_text_parse(raw: List[UInt8], fold: Bool) -> String:
 
 
 def test_obs_text_value_that_is_not_utf8_is_rejected() raises:
-    """H1-05: a header value must stay valid UTF-8 inside its ``String``.
+    """A header value must stay valid UTF-8 inside its ``String``.
 
     obs-text is admitted as opaque octets (RFC 9110 sec 5.5), but the value
     is stored as a Mojo ``String``, which holds UTF-8. A byte string that
@@ -816,7 +811,7 @@ def _fold_parse(raw: List[UInt8], obs_text: Bool) -> String:
 
 
 def test_obs_fold_continuation_gets_the_value_byte_check() raises:
-    """H1-10: a continuation line is field content like any other.
+    """A continuation line is field content like any other.
 
     The byte check ran on a field's first line only, so control bytes
     (0x01, DEL, ...) refused there reached the handler through a fold.
@@ -852,7 +847,7 @@ def test_obs_fold_continuation_gets_the_value_byte_check() raises:
 
 
 def test_valid_obs_fold_still_unfolds() raises:
-    """Guard for H1-10: valid continuations (including an inner HTAB) fold."""
+    """Valid continuations (including an inner HTAB) fold."""
     var tab = List[UInt8]()
     tab.append(UInt8(ord("b")))
     tab.append(0x09)

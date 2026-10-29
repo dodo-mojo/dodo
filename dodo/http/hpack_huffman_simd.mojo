@@ -113,9 +113,9 @@ def _make_root_table() -> Array[UInt16, 256]:
     Returns the same 256-entry 8-bit fast lookup as an
     ``Array`` so it can be materialized once into the
     :data:`_ROOT_TABLE` alias at compile time -- the decoder then
-    pays zero per-call table-build cost (the build was previously
-    ~256 iterations of canonical-table accessors on every header
-    string, which dominated header decode under load).
+    pays zero per-call table-build cost. Building it per call is ~256
+    iterations of canonical-table accessors on every header string,
+    which dominates header decode under load.
     """
     var table = Array[UInt16, 256](fill=UInt16(0))
     for sym in range(256):

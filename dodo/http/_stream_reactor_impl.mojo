@@ -64,9 +64,9 @@ from ._offload_pool import (
     offload_take_done,
     unavailable_response,
 )
-from ._reactor.keepalive_scan import _monotonic_ms
 from ._reactor.offload_loop import close_offload_port
 from ._server.config import ServerConfig
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 def _shed_503_bytes(retry_after_s: Int) -> List[UInt8]:
@@ -155,13 +155,13 @@ struct _StreamOffload(Movable):
                 continue
             conn._offload_slots.append(_OffloadSlot(job))
             if self.timeout_ms > 0:
-                self.deadlines[job] = _monotonic_ms() + self.timeout_ms
+                self.deadlines[job] = monotonic_now_ms() + self.timeout_ms
 
     def poll_timeout_ms(self, cap_ms: Int) -> Int:
         """How long to block: until the earliest handler deadline, at
         most ``cap_ms``."""
         var wait = cap_ms
-        var now = _monotonic_ms()
+        var now = monotonic_now_ms()
         for kv in self.deadlines.items():
             var left = kv.value - now
             if left < wait:
@@ -170,7 +170,7 @@ struct _StreamOffload(Movable):
 
     def expired(mut self) -> List[Int]:
         """Jobs whose handler deadline ran out; forgotten here."""
-        var now = _monotonic_ms()
+        var now = monotonic_now_ms()
         var out = List[Int]()
         for kv in self.deadlines.items():
             if kv.value <= now:
@@ -568,7 +568,7 @@ def _run_stream_loop_impl[
         if settle_deadline == 0 and load_stop_flag(stopping_addr):
             if off.outstanding() == 0:
                 break
-            settle_deadline = _monotonic_ms() + max(
+            settle_deadline = monotonic_now_ms() + max(
                 config.shutdown_timeout_ms, 0
             )
             try:
@@ -588,7 +588,7 @@ def _run_stream_loop_impl[
         if settle_deadline != 0:
             if (
                 _offload_settled(conns, interests)
-                or _monotonic_ms() >= settle_deadline
+                or monotonic_now_ms() >= settle_deadline
             ):
                 break
         var n = reactor.poll(off.poll_timeout_ms(poll_timeout_ms), events)

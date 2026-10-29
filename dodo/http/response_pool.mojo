@@ -46,17 +46,8 @@ existing ``dodo.runtime.Pool[Response]`` typed allocator.
 ``release`` moves the supplied Response into a fresh cell and
 pushes the address. Net allocation cost: ``alloc/free`` per
 acquire/release pair, but the underlying body + header List
-buffers are **preserved across the move**, which is the actual
-B6 win.
-
-Wiring into the reactor's per-connection state machine
-(``dodo.http._server_reactor_impl.ConnHandle``) is a follow-up
-commit that bolts onto this primitive without changing the
-serializer's hot-path layout. The primitive exists today so
-the wiring change is a mechanical swap of
-``Response(status=200, ...)`` for
-``response_pool.acquire(status=200, ...)``.
-
+buffers are **preserved across the move**, which is the point of
+the pool.
 
 Not wired, for a structural reason rather than a measurement. The hot-path response is built by the handler
 (``resp = handler.serve(req^).lower()`` in ``ConnHandle``), so there is

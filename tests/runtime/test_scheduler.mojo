@@ -58,9 +58,6 @@ struct _NopFrontend(Copyable, Frontend):
 
     var tag: Int
 
-    def requires_per_worker_listener(self) -> Bool:
-        return False
-
     def run_worker(
         mut self,
         listener_fd: Int,
@@ -130,7 +127,7 @@ def test_scheduler_drain_returns_per_worker_reports() raises:
         assert_equal(reports[i].timed_out, 0)
         assert_equal(reports[i].in_flight_at_deadline, 0)
     assert_true(not s.is_running())
-    # D9: idle workers exit cleanly, so no worker is reported crashed.
+    # Idle workers exit cleanly, so no worker is reported crashed.
     assert_equal(s.crashed_worker_count(), 0)
 
 
@@ -239,9 +236,6 @@ struct _StubbornFrontend(Copyable, Frontend):
     handler, then exits."""
 
     var hold_ms: Int
-
-    def requires_per_worker_listener(self) -> Bool:
-        return False
 
     def run_worker(
         mut self,
@@ -407,7 +401,7 @@ def test_listener_fds_must_cover_every_address() raises:
     assert_true(not _fd_open(bound[0]), "the handed-over fd leaked")
 
 
-# ── CONC-03: drain must not free the stop flag under a detached worker ──────
+# ── Drain must not free the stop flag under a detached worker ──────
 
 
 def _ld(addr: Int) -> Int64:
@@ -430,9 +424,6 @@ struct _GateFrontend(Copyable, Frontend):
     returns to an ordinary serve loop that polls the stop flag."""
 
     var cells: Int  # [0] gate, [1] stop-flag addr seen, [2] outcome
-
-    def requires_per_worker_listener(self) -> Bool:
-        return False
 
     def run_worker(
         mut self,
@@ -519,7 +510,7 @@ def test_drain_keeps_the_stop_flag_allocated_for_a_detached_worker() raises:
     assert_equal(Int(outcome), 1, "the detached worker never saw the stop")
 
 
-# ── CONC-04: drain must still free the joined workers' listeners ────────────
+# ── Drain must still free the joined workers' listeners ────────────
 
 
 @fieldwise_init
@@ -529,9 +520,6 @@ struct _OneStuckFrontend(Copyable, Frontend):
     stuck worker publishes its listener fds."""
 
     var cells: Int  # [0] ticket, [1] gate, [2] primary fd, [3] extra fd
-
-    def requires_per_worker_listener(self) -> Bool:
-        return False
 
     def run_worker(
         mut self,
@@ -631,7 +619,7 @@ def test_drain_closes_the_joined_workers_extra_listeners() raises:
     _drain_with_one_stuck(extras)
 
 
-# ── CONC-05: drain must not close the shared listener under a worker ────────
+# ── Drain must not close the shared listener under a worker ────────
 
 
 @fieldwise_init
@@ -640,9 +628,6 @@ struct _GateShared(Copyable, Frontend):
     "in a handler" until the gate opens."""
 
     var cells: Int  # [0] gate, [1] listener fd seen (+1), [2] done
-
-    def requires_per_worker_listener(self) -> Bool:
-        return False
 
     def run_worker(
         mut self,

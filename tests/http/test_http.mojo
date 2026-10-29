@@ -279,7 +279,7 @@ def test_url_query_string() raises:
 
 
 def test_url_authority_ends_at_query() raises:
-    """APP-23: the authority ends at the first '?' (RFC 3986 §3.2), so a
+    """The authority ends at the first '?' (RFC 3986 §3.2), so a
     '@' in the query is not userinfo and the host cannot be confused."""
     var u = Url.parse("http://evil.com?@good.com/")
     assert_equal(u.host, "evil.com")
@@ -298,7 +298,7 @@ def test_url_authority_ends_at_query() raises:
 
 
 def test_url_fragment_starts_at_first_hash() raises:
-    """APP-23: the fragment starts at the first '#', so a later '#'
+    """The fragment starts at the first '#', so a later '#'
     cannot smuggle an '@' into the authority."""
     var u = Url.parse("http://evil.com#@good.com#x")
     assert_equal(u.host, "evil.com")
@@ -310,7 +310,7 @@ def test_url_fragment_starts_at_first_hash() raises:
 
 
 def test_url_userinfo_split_at_last_at() raises:
-    """APP-25: userinfo ends at the LAST '@' of the authority, so a second
+    """Userinfo ends at the LAST '@' of the authority, so a second
     '@' cannot leave an '@' in the host (WHATWG / curl pick ``good.com``)."""
     var u = Url.parse("http://a@evil.com@good.com/")
     assert_equal(u.host, "good.com")

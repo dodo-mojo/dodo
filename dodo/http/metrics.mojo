@@ -47,10 +47,8 @@ worker threads, no atomic increment required.
 
 For multi-worker aggregation (i.e. exposing a process-wide
 ``/metrics``), caller wires a small aggregator that snapshots
-every worker's registry and concatenates the rendered text. A
-follow-up will swap the per-cell type to ``Atomic`` once it
-drops the ``Copyable`` requirement (or once we land an
-``Pointer``-backed ``AtomicArray``).
+every worker's registry and concatenates the rendered text. The
+cells are not ``Atomic`` because ``Atomic`` is not ``Copyable``.
 
 Cardinality discipline:
 

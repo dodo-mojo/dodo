@@ -2,8 +2,7 @@
 
 The per-connection state machine (``ConnHandle`` and the keep-alive
 helpers) lives in ``dodo.http._reactor``; the epoll/kqueue loops in
-``dodo.http._server_reactor_epoll``; the io_uring buffer-ring loop in
-``dodo.http._server_reactor_uring``.
+``dodo.http._server_reactor_epoll``.
 """
 
 from ._reactor import (
@@ -14,7 +13,6 @@ from ._reactor import (
     StepResult,
     ConnHandle,
     _detect_h2c_upgrade_inline,
-    _monotonic_ms,
     _is_content_length,
     _is_date,
     _is_connection,
@@ -39,9 +37,3 @@ from ._server_reactor_epoll import (
     run_reactor_loop_shared,
     run_reactor_loop_cancel,
 )
-
-from ._server_reactor_uring import (
-    run_uring_bufring_reactor_loop,
-    run_uring_bufring_reactor_loop_shared,
-)
-from ._server_uring_setup import _probe_bufring_setup_flags

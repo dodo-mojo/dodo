@@ -20,17 +20,12 @@
 - [ ] Enable GitHub Pages for docs at `dodo-mojo.github.io/dodo`.
 - [ ] PyPI `dodo-mojo`: only if we ship a pip-installable CLI.
 - [ ] Review, after the offload pool lands: is it worth folding `serve_cancellable`'s `Cancel` support and the streaming loop into the unified loop, so the remaining separate loops can be deleted? Weigh the code removed against the risk and the performance-pass numbers.
-- [ ] Rebuild the live-server checks the import dropped (they needed upstream's benchmark and example servers): h2spec, the Autobahn WebSocket suite, curl/h2load interop, and ASan/TSan runs. Each needs a small test server under `tests/`. The audit probes (`research/flare-audit/probe.py`) belong there too.
-- [ ] Lingering close (after an early error response) runs only on the unified loop for cleartext. The HTTP/1.1-only loops (`serve_cancellable`, io_uring) and TLS still close at once.
-- [ ] `H1LeniencyConfig.allow_lf_only_line_endings` only reaches the parser: the reactor frames on CRLFCRLF, so a bare-LF head never completes. Support it in the reactor or drop the flag.
-- [ ] The io_uring buffer-ring loop is never chosen with the default config (it needs every timeout off and `max_connections < 0`). Decide whether it should arm timers or be removed. It also sets `Request.peer` to a loopback placeholder.
+- [ ] Live-server checks: `tests/live/` runs h2spec and the Autobahn WebSocket suite against `tests/live/live_server.mojo`, with ASan/TSan through `LIVE_SANITIZE`. Still missing: curl/h2load interop, the audit probes (`research/flare-audit/probe.py`), and a CI job that runs them.
 - [ ] `RequestView` (zero-copy request) has no server loop since `serve_view` was removed. The performance pass decides whether the unified loop parses into it or it is deleted.
 - [ ] Keep-alive idle timeout defaults to 500 ms; `docs/design.md` says 5 s. Settle it in the performance pass (short is cheaper under load, long saves reconnects).
-- [ ] Dedupe the status reason-phrase tables: two copies (`_server/write.mojo`, `streaming_serialize.mojo`).
-- [ ] Decide on `json` and `mozz` (git dependencies from the upstream author): keep, vendor, or replace.
+- [ ] Decide on `mozz` (git dependency from the upstream author, fuzzers only): keep, vendor, or replace. `json` is vendored as `dodo/json`.
 - [ ] Model workers (ADR-0005): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`.
 - [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer.
-- [ ] Dedupe `_monotonic_ms`: four copies (`client_pool`, `tls_pool`, `keepalive_scan`, `runtime._libc_time`), and the client-pool ones allocate on every call.
 
 ## Developer experience and AI agents (Phase 2 and later)
 
