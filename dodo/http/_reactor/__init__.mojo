@@ -4,9 +4,7 @@ This sub-package owns the per-connection halves of the reactor-backed
 HTTP server, split across three sibling files:
 
 * :mod:`dodo.http._reactor.conn_handle` -- the ``ConnHandle`` state
-  machine itself, the ``BYTE_SOURCE_*`` comptime tags shared by the
-  reader entry points, and the per-conn helpers parameterised on
-  those tags.
+  machine itself.
 * :mod:`dodo.http._reactor.keepalive_scan` -- ``STATE_*`` constants,
   ``StepResult`` return shape, monotonic-clock reader, byte-level
   case-insensitive matchers for the response serializer, raw-bytes
@@ -18,7 +16,7 @@ HTTP server, split across three sibling files:
 
 The sister module ``dodo.http._server_reactor_impl`` owns the
 I/O-bearing pieces (reactor entry-point loops, ``Pool[ConnHandle]``
-glue, io_uring buffer-ring glue) and re-exports every public
+glue) and re-exports every public
 symbol below for back-compat with existing imports across
 ``dodo/http/``, ``dodo/http2/``, ``dodo/runtime/``, the test suite,
 and the fuzz corpus.
@@ -26,11 +24,7 @@ and the fuzz corpus.
 Internal namespace: nothing here is part of the public ``dodo`` API.
 """
 
-from .conn_handle import (
-    BYTE_SOURCE_BUFRING,
-    BYTE_SOURCE_RECV,
-    ConnHandle,
-)
+from .conn_handle import ConnHandle
 from .keepalive_scan import (
     STATE_CLOSING,
     STATE_READING,

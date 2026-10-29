@@ -59,6 +59,7 @@ from ..io import Readable
 from .config import TlsConfig, TlsVerify
 from ..net.error import Timeout
 from ._server_ffi import (
+    _do_ssl_shutdown,
     SSL_IO_EOF_UNCLEAN,
     SSL_IO_WANT_READ,
     SSL_IO_WANT_WRITE,
@@ -254,11 +255,6 @@ def _do_ssl_write(
         lib, "dodo_ssl_write"
     )
     return Int(f(ssl, Int(data.unsafe_ptr()), c_int(len(data))))
-
-
-def _do_ssl_shutdown(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
-    var f = dl_sym[def(Int) thin abi("C") -> c_int](lib, "dodo_ssl_shutdown")
-    return Int(f(ssl))
 
 
 def _do_ssl_get_version(imm lib: OwnedDLHandle, ssl: Int) raises -> String:

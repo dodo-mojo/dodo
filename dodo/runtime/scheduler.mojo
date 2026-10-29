@@ -301,10 +301,7 @@ struct Scheduler[F: Frontend](Movable):
           accept event, idle workers absorb spikes, p99.99 σ
           is uniformly tighter under sustained load for 7-22 %
           less req/s depending on path (see
-          ``docs/benchmark.md``). Frontends that *require*
-          per-worker listeners (the io_uring buffer-ring
-          frontend) override this via
-          :meth:`Frontend.requires_per_worker_listener`.
+          ``docs/benchmark.md``).
         - The frontend value is cloned into each worker via
           ``F.copy()``.
     """
@@ -336,12 +333,11 @@ struct Scheduler[F: Frontend](Movable):
     # since a worker may still ``accept`` on it.
     var _shared_listener_fd: Int
     var _per_worker_listener_addrs: List[Int]
-    """When the io_uring buffer-ring path is active, the
-    Scheduler pre-binds one SO_REUSEPORT listener per worker on
-    its own thread (serialised binds avoid any concurrent-bind
-    race). Each entry is the heap address of an owned
-    ``TcpListener``; freed in ``shutdown()`` after all workers
-    join. Empty on the epoll path."""
+    """With per-worker listeners, the Scheduler pre-binds one
+    SO_REUSEPORT listener per worker on its own thread (serialised
+    binds avoid any concurrent-bind race). Each entry is the heap
+    address of an owned ``TcpListener``; freed in ``shutdown()``
+    after all workers join. Empty with a shared listener."""
     var _ctx_addrs: List[Int]
     # Heap-allocated Bool, owned by this Scheduler. Address is stable
     # across struct moves; every worker's ``_WorkerCtx.stopping_addr``
@@ -390,9 +386,8 @@ struct Scheduler[F: Frontend](Movable):
     ) raises -> Scheduler[Self.F]:
         """Spawn ``num_workers`` threads sharing one listener.
 
-        The scheduler binds its listener(s) according to
-        :meth:`Frontend.requires_per_worker_listener` plus the
-        ``DODO_REUSEPORT_WORKERS`` env knob, then hands one fd
+        The scheduler binds its listener(s) according to the
+        ``DODO_REUSEPORT_WORKERS`` env knob and the number of addresses, then hands one fd
         per worker into :meth:`Frontend.run_worker`. The frontend
         encapsulates everything protocol-specific (handler,
         request config, HTTP/2 settings, auto-protocol toggle,
@@ -467,14 +462,8 @@ struct Scheduler[F: Frontend](Movable):
 
         # Listener binding strategy. Defaults to per-worker
         # SO_REUSEPORT (matches actix_web; highest steady-state
-        # throughput on dev-box workloads). Override paths:
+        # throughput on dev-box workloads). Override path:
         #
-        # * **Frontend forces per-worker** (e.g. io_uring buffer-
-        #   ring): :meth:`Frontend.requires_per_worker_listener`
-        #   returns True. The scheduler binds N SO_REUSEPORT
-        #   listeners on its own thread (serialised binds avoid
-        #   any concurrent-bind race) and hands one to each
-        #   worker.
         # * **DODO_REUSEPORT_WORKERS=0**: opt back into a single
         #   ``bind_shared`` listener with ``EPOLLEXCLUSIVE`` (7-22 %
         #   less req/s for a uniformly tighter p99.99 σ; see
@@ -486,10 +475,6 @@ struct Scheduler[F: Frontend](Movable):
         # workers) so an ``AddressInUse`` from a faulty
         # configuration raises on the caller's thread, not inside
         # an opaque pthread.
-        var frontend_demands_per_worker = (
-            frontend.requires_per_worker_listener()
-        )
-
         # Per-worker ``SO_REUSEPORT`` listeners (each worker
         # accept(2)s on its own fd; kernel hashes new 4-tuples to
         # one of N listeners) are the **default** for
@@ -515,19 +500,16 @@ struct Scheduler[F: Frontend](Movable):
         var listener_ptr = Pointer[TcpListener, MutUntrackedOrigin](
             unsafe_from_address=null_addr
         )
-        # Both the io_uring buffer-ring path and the opt-in epoll
-        # reuseport mode pre-bind per-worker SO_REUSEPORT listeners
+        # Reuseport mode pre-binds per-worker SO_REUSEPORT listeners
         # on this thread (serialised binds avoid concurrent-bind
-        # races) and skip the shared listener.
+        # races) and skips the shared listener.
         # Several addresses means per-worker SO_REUSEPORT listeners on
         # every one of them: there is no shared-listener shape for
         # N addresses x M workers, and mixing a shared primary with
         # per-worker extras would give the two halves different accept
         # semantics on the same server.
         var prebind_per_worker = (
-            frontend_demands_per_worker
-            or use_reuseport_workers
-            or len(extra_addrs) > 0
+            use_reuseport_workers or len(extra_addrs) > 0
         )
 
         # Probe-bind each address on this thread so an unusable one
@@ -605,7 +587,7 @@ struct Scheduler[F: Frontend](Movable):
 
         # Per-worker listeners are bound serially on this thread before
         # any pthread spawns: N pthreads each calling bind_reuseport at
-        # crashes the multi-worker bufring loop.
+        # can race in the kernel and crash a worker.
         # A failed bind raises rather than leaving a worker without a
         # listener.
         if prebind_per_worker:

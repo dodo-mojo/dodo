@@ -62,9 +62,6 @@ struct _NopFrontend(Copyable, Frontend):
 
     var tag: Int
 
-    def requires_per_worker_listener(self) -> Bool:
-        return False
-
     def run_worker(
         mut self,
         listener_fd: Int,

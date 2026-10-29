@@ -8,9 +8,8 @@ flavoured frontend dodo needs:
 - :class:`HttpFrontend[H]` — the dynamic-handler frontend. Wraps
   a user :trait:`Handler` plus a :class:`ServerConfig` and an
   optional :class:`dodo.http2.Http2Config`. Selects between the
-  HTTP/1.1-only loop, the unified HTTP/1.1 + HTTP/2 preface-peek
-  loop, and the io_uring buffer-ring loop based on its config
-  flags + the runtime backend probe.
+  HTTP/1.1-only loop and the unified HTTP/1.1 + HTTP/2 preface-peek
+  loop based on its config.
 - :class:`StreamFrontend[H]`: the :trait:`StreamHandler` frontend
   behind multi-worker ``serve_streaming``.
 
@@ -20,21 +19,15 @@ boundary. See :mod:`dodo.runtime.frontend` for the
 trait contract.
 """
 
-from std.os import getenv
-from std.sys.info import CompilationTarget
 
 from dodo.http.handler import Handler
 from dodo.http.server import ServerConfig
-from dodo.http._server_reactor_impl import (
-    run_reactor_loop_shared,
-    run_uring_bufring_reactor_loop_shared,
-)
+from dodo.http._server_reactor_impl import run_reactor_loop_shared
 from dodo.http._stream_reactor_impl import run_stream_reactor_loop_shared
 from dodo.http._unified_reactor_impl import run_unified_reactor_loop_shared
 from dodo.http.streaming_server import StreamHandler
 from dodo.http2.server import Http2Config
 from dodo.runtime.frontend import Frontend
-from dodo.runtime.uring_reactor import use_uring_backend
 from dodo.ws.server_h2 import WsH2Hooks
 
 
@@ -43,16 +36,12 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
 
     Carries the per-worker HTTP state (handler, request config,
     HTTP/2 settings, auto-protocol toggle) and dispatches into
-    one of three reactor entry points per accepted connection:
+    one of two reactor entry points:
 
-    1. **io_uring buffer-ring path** (Linux + ``use_bufring``):
-       :func:`run_uring_bufring_reactor_loop_shared`. Signalled
-       to the scheduler via :meth:`requires_per_worker_listener`
-       so each worker gets its own SO_REUSEPORT listener.
-    2. **Unified HTTP/1.1 + HTTP/2** (``auto_protocol``):
-       :func:`run_unified_reactor_loop_shared`. Per-connection
-       preface peek selects the protocol.
-    3. **HTTP/1.1 only** (default):
+    1. **Unified HTTP/1.1 + HTTP/2** (``auto_protocol``, TLS, or
+       several addresses): :func:`run_unified_reactor_loop_shared`.
+       Per-connection preface peek selects the protocol.
+    2. **HTTP/1.1 only** (otherwise):
        :func:`run_reactor_loop_shared`.
 
     Every path runs a handler's ``Offload`` requests on the offload
@@ -116,27 +105,6 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
         self.tls_ctx_addr = tls_ctx_addr
         self.ws_hooks = ws_hooks.copy()
 
-    def requires_per_worker_listener(self) -> Bool:
-        """The io_uring buffer-ring path needs per-worker listeners.
-
-        See the trait docstring for the full rationale: the
-        kernel-side accept fan-out happens at multishot accept
-        arming time, and a shared listener with EPOLLEXCLUSIVE
-        would funnel every accept event through one entry. For
-        every other backend the scheduler is free to pick its
-        listener strategy from the ``DODO_REUSEPORT_WORKERS``
-        env knob (which still applies to the epoll handler /
-        unified paths).
-        """
-        comptime if CompilationTarget.is_linux():
-            if (
-                use_uring_backend()
-                and self.config.use_bufring
-                and self.tls_ctx_addr == 0
-            ):
-                return True
-        return False
-
     def run_worker(
         mut self,
         listener_fd: Int,
@@ -146,25 +114,6 @@ struct HttpFrontend[H: Handler & Copyable](Copyable, Frontend):
     ):
         """Pick the reactor entry point and run it until ``stopping`` flips."""
         try:
-            comptime if CompilationTarget.is_linux():
-                if (
-                    use_uring_backend()
-                    and self.config.use_bufring
-                    and self.tls_ctx_addr == 0
-                    and len(extra_fds) == 0
-                ):
-                    # The buffer-ring loop registers exactly one
-                    # listener, so it is not eligible once this worker
-                    # owns listeners on several addresses; fall through
-                    # to the unified loop, which is.
-                    run_uring_bufring_reactor_loop_shared[Self.H](
-                        listener_fd,
-                        self.config,
-                        self.handler,
-                        stopping,
-                        stats_addr,
-                    )
-                    return
             if self.auto_protocol or self.tls_ctx_addr != 0 or extra_fds:
                 var ws = Optional[WsH2Hooks](None)
                 if self.ws_hooks:
@@ -224,11 +173,6 @@ struct StreamFrontend[H: StreamHandler & Copyable](Copyable, Frontend):
         self.max_in_flight = max_in_flight
         self.retry_after_s = retry_after_s
         self.config = config^
-
-    def requires_per_worker_listener(self) -> Bool:
-        """Streaming is fine with either listener strategy (honours the
-        ``DODO_REUSEPORT_WORKERS`` knob via the scheduler)."""
-        return False
 
     def run_worker(
         mut self,

@@ -26,7 +26,7 @@ internals.
 Flags are consumed by the H1 request parser
 (:func:`dodo.http.server._parse_http_request_bytes`) when wired
 through :attr:`dodo.http.server.ServerConfig.h1_leniency`. The
-ten request-message flags (every flag except the two chunked-
+nine request-message flags (every flag except the two chunked-
 extension flags below) flip parser behaviour today; the
 conformance corpus under ``tests/conformance/h1/`` carries one accept
 + one reject fixture per flag.
@@ -50,8 +50,8 @@ var strict = H1LeniencyConfig()
 
 # Compatible with chatty legacy clients.
 var compat = H1LeniencyConfig(
-    allow_lf_only_line_endings=True,
     allow_mixed_case_method=True,
+    allow_leading_whitespace_before_request_line=True,
 )
 ```
 
@@ -77,18 +77,6 @@ struct H1LeniencyConfig(Copyable):
     pass that lands alongside server-side chunked-body support;
     they currently have no parser-side effect.
     """
-
-    var allow_lf_only_line_endings: Bool
-    """Accept bare ``LF`` (``\\n``) as a line terminator in
-    place of ``CRLF`` (``\\r\\n``). RFC 9112 §2.2 requires
-    ``CRLF``; many older clients emit bare ``LF`` between the
-    request line, headers, and the trailing blank line. The
-    parser's tokeniser still rejects mixed terminators (``CR``
-    not followed by ``LF``). The reactor's raw-byte framing
-    (``Transfer-Encoding`` / ``Content-Length``) always reads the
-    request line and header lines as ending at ``LF``, so it
-    frames the request the way this flag makes the parser read it;
-    the end of the header block is still the first ``CRLF CRLF``."""
 
     var allow_mixed_case_method: Bool
     """Accept method tokens with mixed case (e.g. ``Get`` /
@@ -204,7 +192,6 @@ struct H1LeniencyConfig(Copyable):
     def __init__(
         out self,
         *,
-        allow_lf_only_line_endings: Bool = False,
         allow_mixed_case_method: Bool = False,
         allow_ows_around_colon: Bool = False,
         allow_obs_fold: Bool = False,
@@ -223,7 +210,6 @@ struct H1LeniencyConfig(Copyable):
         keyword arguments so the call site shows which
         relaxations are enabled.
         """
-        self.allow_lf_only_line_endings = allow_lf_only_line_endings
         self.allow_mixed_case_method = allow_mixed_case_method
         self.allow_ows_around_colon = allow_ows_around_colon
         self.allow_obs_fold = allow_obs_fold
@@ -257,8 +243,7 @@ struct H1LeniencyConfig(Copyable):
         flags are tripped.
         """
         return (
-            self.allow_lf_only_line_endings
-            or self.allow_mixed_case_method
+            self.allow_mixed_case_method
             or self.allow_ows_around_colon
             or self.allow_obs_fold
             or self.allow_oversized_request_uri

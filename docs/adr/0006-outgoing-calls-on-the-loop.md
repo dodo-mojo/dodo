@@ -1,6 +1,6 @@
 # ADR-0006: Outgoing calls on the event loop
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-27
 
 ## Context

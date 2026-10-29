@@ -39,6 +39,7 @@ from dodo.tls._server_ffi import (
     _do_ssl_get_alpn_selected,
     _do_ssl_get_sni_host,
     _do_ssl_free,
+    _do_ssl_shutdown,
 )
 
 
@@ -177,6 +178,19 @@ struct TlsTransport(Movable):
         if n == SSL_IO_CLOSED or n == SSL_IO_FATAL:
             self.phase = TLS_CLOSED
         return n
+
+    def send_close_notify(mut self) raises:
+        """Send a ``close_notify`` alert without waiting for the peer's.
+
+        One non-blocking ``SSL_shutdown``. If the socket can't take the
+        alert right now it is dropped: the caller is closing anyway, and
+        the alert only tells the client the response was not truncated.
+        The phase moves to ``TLS_CLOSED``; no more records are sent.
+        """
+        if self.ssl_addr == 0:
+            return
+        _ = _do_ssl_shutdown(self._lib, self.ssl_addr)
+        self.phase = TLS_CLOSED
 
     def send(mut self, bytes: Span[UInt8, _], off: Int = 0) raises -> Int:
         """Non-blocking ``SSL_write`` of ``bytes[off:]``.

@@ -1,6 +1,6 @@
 # ADR-0005: Model workers in supervised child processes
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-27
 
 ## Context
