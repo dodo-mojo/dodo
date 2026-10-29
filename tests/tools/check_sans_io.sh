@@ -30,7 +30,6 @@ SANS_IO_FILES=(
     "dodo/http2/state.mojo"
     "dodo/http/proto/h2c_upgrade.mojo"
     "dodo/http/proto/ascii.mojo"
-    "dodo/http/_bufring_ledger.mojo"
 )
 
 FORBIDDEN_PREFIXES=(

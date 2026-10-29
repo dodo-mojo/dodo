@@ -6,7 +6,7 @@ join, listener bind, shared-stop flag, drain accounting) and the
 HTTP / HTTP/2 / future-protocol layers above it. Every protocol
 that wants to ride the multicore scheduler implements
 :trait:`Frontend` once (the unified HTTP/1.1+HTTP/2 path, the
-io_uring buffer-ring path, the streaming path); the scheduler stays
+streaming path); the scheduler stays
 oblivious to which one runs.
 
 The runtime depends on this trait only, never on protocol packages.
@@ -21,7 +21,7 @@ with:
   Whether that fd is a per-worker ``SO_REUSEPORT`` listener or a
   shared listener the kernel routes via ``EPOLLEXCLUSIVE`` is the
   scheduler's binding decision (driven by the ``DODO_REUSEPORT_WORKERS``
-  env knob and :meth:`Frontend.requires_per_worker_listener`).
+  env knob).
   The frontend never closes ``listener_fd`` -- the scheduler owns
   the lifetime.
 - ``stopping``: a heap-allocated ``Bool`` shared across every
@@ -81,23 +81,5 @@ trait Frontend(Copyable, Deinitable):
                 accept on more than one address must not silently
                 ignore a non-empty list -- an address the caller
                 bound would then never be served.
-        """
-        ...
-
-    def requires_per_worker_listener(self) -> Bool:
-        """Return ``True`` if this frontend cannot share a single listener fd.
-
-        Some serving paths (notably the io_uring buffer-ring
-        path) need each worker to have its own ``SO_REUSEPORT``
-        listener -- the kernel-side fan-out happens at accept
-        time and a shared listener with ``EPOLLEXCLUSIVE`` would
-        funnel every accept event through one entry. The
-        scheduler honours this signal: when it returns ``True``
-        the scheduler always binds per-worker SO_REUSEPORT
-        listeners, ignoring the ``DODO_REUSEPORT_WORKERS=0``
-        env knob.
-
-        Default false: the frontend is fine with whichever
-        listener strategy the scheduler picks.
         """
         ...

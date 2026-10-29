@@ -1,15 +1,13 @@
 """``dodo.http._server.config`` -- HTTP server configuration carrier.
 
 The :class:`ServerConfig` value type (read/buffer sizing, timeouts,
-keep-alive policy, leniency + bufring toggles) plus the startup
-``DODO_BUFRING_HANDLER`` env read. Extracted from ``dodo.http.server`` to
+keep-alive policy, leniency). Extracted from ``dodo.http.server`` to
 keep the reactor module within the file-size budget;
 ``dodo.http.server`` re-exports every name so existing
 ``from dodo.http.server import ServerConfig`` call sites keep
 resolving unchanged.
 """
 
-from std.os import getenv
 from std.collections import Optional
 
 from ..proto.h1_leniency import H1LeniencyConfig
@@ -176,14 +174,6 @@ struct ServerConfig(Copyable):
             gets 408. 0 disables. Large uploads on slow links still
             work; a client trickling bytes to hold the connection does
             not.
-        use_bufring: Opt into the io_uring buffer-ring single-worker
-            reactor (HTTP/1.1-only, single-listener-only) on Linux
-            ``>= 6.0``. When ``False`` (default), every entry point
-            consults the ``DODO_BUFRING_HANDLER=1`` env var **once
-            at startup** and OR-equals the result into this field;
-            subsequent dispatch decisions read this field directly.
-            That guarantees a runtime flip of the env var mid-flight
-            cannot reroute live connections.
         h1_leniency: HTTP/1.1 parser leniency configuration. Strict
             by default (every flag off); each named flag relaxes a
             specific RFC 9112 grammar branch. See
@@ -232,17 +222,6 @@ struct ServerConfig(Copyable):
     Default ``False`` -- the standard full-parse behaviour.
     Set ``True`` on production servers whose handler shape
     doesn't depend on headers."""
-    var use_bufring: Bool
-    """Opt into the io_uring buffer-ring single-worker reactor.
-
-    Defaults to ``False``. ``HttpServer.serve`` and
-    ``Scheduler.start`` consult ``DODO_BUFRING_HANDLER=1``
-    once at startup and ``or``-equal the result into this
-    field; downstream dispatch reads this field directly so
-    a mid-flight env-var flip cannot reroute live connections.
-    Linux-only, HTTP/1.1-only, single-listener-only -- the
-    field is silently ignored on macOS / for HTTP/2 / for
-    a multi-address ``HttpServer.bind(List[SocketAddr])``."""
     var h1_leniency: H1LeniencyConfig
     """HTTP/1.1 parser leniency configuration. Strict by default
     (every flag off); each named flag relaxes a specific RFC 9112
@@ -286,7 +265,6 @@ struct ServerConfig(Copyable):
         header_timeout_ms: Int = 10_000,
         min_body_rate: Int = 240,
         skip_header_decode_for_short_requests: Bool = False,
-        use_bufring: Bool = False,
         var h1_leniency: H1LeniencyConfig = H1LeniencyConfig(),
         max_connections: Int = 0,
         var ws: WsUpgrade = WsUpgrade(),
@@ -312,7 +290,6 @@ struct ServerConfig(Copyable):
         self.skip_header_decode_for_short_requests = (
             skip_header_decode_for_short_requests
         )
-        self.use_bufring = use_bufring
         self.h1_leniency = h1_leniency^
         self.max_connections = max_connections
         self.ws = ws^
@@ -405,38 +382,3 @@ struct ServerConfig(Copyable):
             " ServerConfig.read_body_timeout_ms (or one must be 0 to"
             " disable)"
         )
-
-
-def bufring_gap(cfg: ServerConfig) -> String:
-    """What ``cfg`` needs that the io_uring buffer-ring loop does not do,
-    or ``""`` when that loop can serve it.
-
-    The loop serves plain HTTP/1.1 and arms no timers and no connection
-    cap, so a config that relies on any of them is served by the reactor
-    loop instead: running it there would drop the limit silently.
-    """
-    if cfg.ws.handler or cfg.ws.reactor:
-        return "WebSocket upgrades"
-    if (
-        cfg.idle_timeout_ms > 0
-        or cfg.write_timeout_ms > 0
-        or cfg.read_body_timeout_ms > 0
-        or cfg.request_timeout_ms > 0
-        or cfg.header_timeout_ms > 0
-        or cfg.min_body_rate > 0
-    ):
-        return "timeouts"
-    if cfg.max_connections > 0:
-        return "max_connections"
-    return ""
-
-
-def _resolve_bufring_handler_env() -> Bool:
-    """Read ``DODO_BUFRING_HANDLER`` once at startup.
-
-    The env-var read lives at the entry point of every reactor
-    loop overload; consumers (the reactor loops, the scheduler
-    workers) then read ``ServerConfig.use_bufring`` directly so
-    a mid-flight ``setenv`` cannot reroute live connections.
-    """
-    return getenv("DODO_BUFRING_HANDLER") == "1"

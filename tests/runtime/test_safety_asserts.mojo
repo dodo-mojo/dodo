@@ -40,7 +40,6 @@ from dodo.runtime import (
     BufferPool,
     DateCache,
     IoVecBuf,
-    is_io_uring_available,
     writev_buf_all,
 )
 from dodo.http import (
@@ -235,19 +234,6 @@ def test_simd_cookie_scan_empty_input_no_assert() raises:
     var offsets = List[Int]()
     simd_cookie_scan(Span[UInt8, origin_of(input)](input), offsets)
     assert_equal(len(offsets), 0)
-
-
-# ── io_uring happy paths (Linux-conditional) ─────────────────────
-
-
-def test_io_uring_feature_detection_no_assert() raises:
-    """``is_io_uring_available()`` runs through the syscall FFI on
-    Linux and the comptime-no-op path on non-Linux. Neither must
-    fire any debug_assert.
-    """
-    var available = is_io_uring_available()
-    # Just verify the call returns; the value is platform-dependent.
-    _ = available
 
 
 def main() raises:

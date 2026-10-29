@@ -241,7 +241,7 @@ def test_simd_memmem_smoke() raises:
 
 def test_h1_leniency_default_is_strict() raises:
     var cfg = _ExperimentalH1LeniencyConfig()
-    assert_true(not cfg.allow_lf_only_line_endings)
+    assert_true(not cfg.allow_mixed_case_method)
     assert_true(not cfg.allow_obs_fold)
 
 

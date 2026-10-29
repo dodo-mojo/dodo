@@ -1,25 +1,15 @@
-"""Regression: a request that arrives in more than one receive completion
-must be answered by the io_uring buffer-ring loop, and must not stall or
-spin the loop while it waits for the rest.
+"""Requests that arrive in pieces, or pipelined, on the default loop.
 
-The bug: after staging bytes, the loop's inline cycle called
-``on_readable_from_buf`` again for as long as ``read_buf`` was non-empty.
-With only part of a request buffered that call consumes nothing and asks
-for more input, so the loop never left the inline cycle: the request was
-never answered, every other connection stalled behind it, and one core sat
-at 100 %. The epoll loops avoid this with ``has_buffered_request()``; the
-buffer-ring loop now uses the same condition.
-
-Each scenario runs against its own forked server (so one wedged server
-cannot hide behind the next scenario) and in both send modes: the
-synchronous-send drive and ``DODO_SUBMIT_SEND=1``. A 2 s receive timeout
-turns a hung server into a failed assertion instead of a hung test.
-Linux + io_uring only; skips cleanly elsewhere.
+A request split across several reads must be answered without stalling
+or spinning the loop while it waits for the rest, and pipelined requests
+(whole, split, or chunked) must each get their response. Each scenario
+runs against its own forked server, so one wedged server cannot hide
+behind the next, and a 2 s receive timeout turns a hung server into a
+failed assertion instead of a hung test.
 """
 
-from std.ffi import c_int, c_size_t, c_uint, external_call
+from std.ffi import c_int, c_size_t, c_uint
 from std.memory import stack_allocation
-from std.sys.info import CompilationTarget
 from std.testing import assert_equal, assert_true, TestSuite
 
 from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
@@ -43,21 +33,6 @@ from dodo.net._libc import (
     _strerror,
     get_errno,
 )
-from dodo.runtime.uring_reactor import use_uring_backend
-
-
-def _bufring_config() -> ServerConfig:
-    """A config the buffer-ring loop serves: it arms no timers, so a
-    config with any timeout set is served by the reactor loop instead."""
-    return ServerConfig(
-        idle_timeout_ms=0,
-        write_timeout_ms=0,
-        read_body_timeout_ms=0,
-        request_timeout_ms=0,
-        header_timeout_ms=0,
-        min_body_rate=0,
-        max_connections=-1,
-    )
 
 
 comptime _OK: String = "HTTP/1.1 200"
@@ -69,13 +44,6 @@ comptime _SCN_PIPELINED_THEN_SPLIT: Int = 4
 comptime _SCN_PIPELINED_CHUNKED: Int = 5
 comptime _SCN_LARGE_RESPONSE: Int = 6
 comptime _BIG: Int = 32 * 1024 * 1024
-
-
-@always_inline
-def _setenv(name: String, value: String, overwrite: c_int = c_int(1)) -> c_int:
-    return external_call["setenv", c_int](
-        name.unsafe_ptr(), value.unsafe_ptr(), overwrite
-    )
 
 
 def _connect_loopback(port: UInt16) raises -> c_int:
@@ -270,21 +238,9 @@ def _scenario(port: UInt16, which: Int) raises -> String:
     return err
 
 
-def _run(which: Int, submit_send: Bool) raises:
-    """Fork a bufring server in the requested send mode and run one
-    scenario against it."""
-    comptime if not CompilationTarget.is_linux():
-        print("(skipped: io_uring is Linux-only)")
-        return
-    if not use_uring_backend():
-        print(
-            "(skipped: kernel lacks io_uring or DODO_DISABLE_IO_URING is set)"
-        )
-        return
-
-    _ = _setenv("DODO_BUFRING_HANDLER", "1")
-    _ = _setenv("DODO_SUBMIT_SEND", "1" if submit_send else "0")
-    var srv = HttpServer.bind(SocketAddr.localhost(0), _bufring_config())
+def _run(which: Int) raises:
+    """Fork a server and run one scenario against it."""
+    var srv = HttpServer.bind(SocketAddr.localhost(0), ServerConfig())
     var port = UInt16(srv.local_addr().port)
     assert_true(Int(port) > 0, "server must bind to a positive port")
 
@@ -306,124 +262,36 @@ def _run(which: Int, submit_send: Bool) raises:
 
     _ = kill(pid, SIGKILL)
     waitpid(pid)
-
-    if err == "no connection":
-        print("(skipped: io_uring bufring serve loop did not accept)")
-        return
     assert_equal(err, "")
 
 
-def test_split_body_sync() raises:
-    _run(_SCN_SPLIT_BODY, False)
+def test_split_body() raises:
+    _run(_SCN_SPLIT_BODY)
 
 
-def test_split_body_submit_send() raises:
-    _run(_SCN_SPLIT_BODY, True)
+def test_large_body() raises:
+    _run(_SCN_LARGE_BODY)
 
 
-def test_large_body_sync() raises:
-    _run(_SCN_LARGE_BODY, False)
+def test_partial_request_does_not_stall_other_connections() raises:
+    _run(_SCN_OTHER_CONN)
 
 
-def test_large_body_submit_send() raises:
-    _run(_SCN_LARGE_BODY, True)
+def test_large_response() raises:
+    _run(_SCN_LARGE_RESPONSE)
 
 
-def test_partial_request_does_not_stall_other_connections_sync() raises:
-    _run(_SCN_OTHER_CONN, False)
+def test_pipelined_burst() raises:
+    _run(_SCN_PIPELINED)
 
 
-def test_partial_request_does_not_stall_other_connections_submit_send() raises:
-    _run(_SCN_OTHER_CONN, True)
+def test_pipelined_then_split() raises:
+    _run(_SCN_PIPELINED_THEN_SPLIT)
 
 
-def test_large_response_sync() raises:
-    _run(_SCN_LARGE_RESPONSE, False)
-
-
-def test_large_response_submit_send() raises:
-    _run(_SCN_LARGE_RESPONSE, True)
-
-
-def test_timeouts_keep_the_reactor_loop() raises:
-    """The buffer-ring loop arms no timers, so a server that asks for it
-    with an idle timeout set is served by the reactor loop, which drops a
-    connection that sends nothing."""
-    comptime if not CompilationTarget.is_linux():
-        print("(skipped: io_uring is Linux-only)")
-        return
-    if not use_uring_backend():
-        print("(skipped: kernel lacks io_uring)")
-        return
-    _ = _setenv("DODO_BUFRING_HANDLER", "1")
-    var srv = HttpServer.bind(
-        SocketAddr.localhost(0), ServerConfig(idle_timeout_ms=200)
-    )
-    var port = UInt16(srv.local_addr().port)
-    var pid = fork()
-    if pid == 0:
-        try:
-            var h = _Handler()
-            srv.serve(h^)
-        except:
-            pass
-        exit()
-    usleep(120000)
-    var n = -2
-    var fd = _connect_loopback(port)
-    if Int(fd) >= 0:
-        var buf = stack_allocation[16, UInt8]()
-        n = Int(_recv(fd, buf, c_size_t(16), c_int(0)))
-        _ = _close(fd)
-    _ = kill(pid, SIGKILL)
-    waitpid(pid)
-    assert_equal(n, 0, "idle connection must be closed by the server")
-
-
-def test_pipelined_burst_sync() raises:
-    _run(_SCN_PIPELINED, False)
-
-
-def test_pipelined_burst_submit_send() raises:
-    _run(_SCN_PIPELINED, True)
-
-
-def test_pipelined_then_split_sync() raises:
-    _run(_SCN_PIPELINED_THEN_SPLIT, False)
-
-
-def test_pipelined_then_split_submit_send() raises:
-    _run(_SCN_PIPELINED_THEN_SPLIT, True)
-
-
-def test_pipelined_chunked_sync() raises:
-    _run(_SCN_PIPELINED_CHUNKED, False)
-
-
-def test_pipelined_chunked_submit_send() raises:
-    _run(_SCN_PIPELINED_CHUNKED, True)
+def test_pipelined_chunked() raises:
+    _run(_SCN_PIPELINED_CHUNKED)
 
 
 def main() raises:
-    print("=" * 60)
-    print("test_uring_bufring_partial.mojo - partial requests, bufring loop")
-    print("=" * 60)
-    var suite = TestSuite()
-    suite.test[test_split_body_sync]()
-    suite.test[test_split_body_submit_send]()
-    suite.test[test_large_body_sync]()
-    suite.test[test_large_body_submit_send]()
-    suite.test[test_partial_request_does_not_stall_other_connections_sync]()
-    suite.test[
-        test_partial_request_does_not_stall_other_connections_submit_send
-    ]()
-    suite.test[test_large_response_sync]()
-    suite.test[test_large_response_submit_send]()
-    suite.test[test_timeouts_keep_the_reactor_loop]()
-    suite.test[test_pipelined_burst_sync]()
-    suite.test[test_pipelined_burst_submit_send]()
-    suite.test[test_pipelined_then_split_sync]()
-    suite.test[test_pipelined_then_split_submit_send]()
-    suite.test[test_pipelined_chunked_sync]()
-    suite.test[test_pipelined_chunked_submit_send]()
-    suite^.run()
+    TestSuite.discover_tests[__functions_in_module()]().run()

@@ -98,9 +98,6 @@ def _apply_leniency(j: Value) raises -> H1LeniencyConfig:
     ``leniency`` overlay. Missing fields fall back to strict
     defaults."""
     return H1LeniencyConfig(
-        allow_lf_only_line_endings=_bool_or(
-            j, "allow_lf_only_line_endings", False
-        ),
         allow_mixed_case_method=_bool_or(j, "allow_mixed_case_method", False),
         allow_ows_around_colon=_bool_or(j, "allow_ows_around_colon", False),
         allow_obs_fold=_bool_or(j, "allow_obs_fold", False),
@@ -214,10 +211,10 @@ def test_leniency_overlay_flips_strict_default() raises:
     # Construct a fixture-shaped leniency object and confirm the
     # overlay flips the appropriate flag while leaving the rest
     # strict.
-    var j = loads(String('{"allow_lf_only_line_endings": true}'))
+    var j = loads(String('{"allow_mixed_case_method": true}'))
     var cfg = _apply_leniency(j)
-    assert_true(cfg.allow_lf_only_line_endings)
-    assert_false(cfg.allow_mixed_case_method)
+    assert_true(cfg.allow_mixed_case_method)
+    assert_false(cfg.allow_obs_fold)
     assert_true(cfg.any_enabled())
 
 

@@ -267,6 +267,11 @@ def _do_ssl_get_sni_host(
     return String(unsafe_from_utf8=Span[UInt8, _](buf[:n]))
 
 
+def _do_ssl_shutdown(imm lib: OwnedDLHandle, ssl: Int) raises -> Int:
+    var f = dl_sym[def(Int) thin abi("C") -> c_int](lib, "dodo_ssl_shutdown")
+    return Int(f(ssl))
+
+
 def _do_ssl_free(imm lib: OwnedDLHandle, ssl_addr: Int) raises:
     var f = dl_sym[def(Int) thin abi("C") -> None](lib, "dodo_ssl_free")
     f(ssl_addr)

@@ -147,9 +147,8 @@ def request_te_framing(
     var saw_te = False
     var saw_cl = False
     # Skip the request line: header names only start after its line end.
-    # A line ends at LF, with the CR before it dropped, the way the parser
-    # reads it under ``allow_lf_only_line_endings``. Strict mode rejects a
-    # bare LF, so this only widens what the reactor sees, never what the
+    # A line ends at LF, with the CR before it dropped. The parser rejects
+    # a bare LF, so this only widens what the reactor sees, never what the
     # parser accepts.
     var i = 0
     while i < n and buf[i] != UInt8(10):

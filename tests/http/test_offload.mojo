@@ -13,7 +13,6 @@ from std.ffi import external_call
 from std.os import remove
 from std.collections import Dict
 from std.os.path import exists
-from std.sys.info import CompilationTarget
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from dodo.http import (
@@ -34,10 +33,7 @@ from dodo.http import (
 from dodo.http.streaming_server import run_stream_connection
 from dodo.http.cancel import CancelReason
 from dodo.http.server import ServerConfig
-from dodo.http._server_reactor_impl import (
-    run_reactor_loop_shared,
-    run_uring_bufring_reactor_loop,
-)
+from dodo.http._server_reactor_impl import run_reactor_loop_shared
 from dodo.http2 import (
     Frame,
     FrameFlags,
@@ -51,7 +47,6 @@ from dodo.http2 import (
 )
 from dodo.net import SocketAddr
 from dodo.runtime import Pool
-from dodo.runtime.uring_reactor import use_uring_backend
 from dodo.runtime._thread import ThreadHandle, _OpaquePtr, _null_ptr
 from dodo.runtime.scheduler_stats import store_stop_flag
 from dodo.tcp import TcpListener, TcpStream
@@ -347,21 +342,11 @@ def _spawn_server(
     ``cancel`` (``serve_cancellable`` with ``_CancelGate`` in front),
     ``cancel-moveonly`` (that inside ``_MoveOnlyCancel``), ``stream``
     (``serve_streaming`` with ``_StreamFront``), ``h1`` (the
-    HTTP/1.1-only loop) or ``bufring`` (the io_uring buffer ring).
-    Returns (pid, port). With one worker, writing
+    HTTP/1.1-only loop). Returns (pid, port). With one worker, writing
     ``<prefix>stop`` stops it gracefully and it writes ``<prefix>exited``
     once ``serve`` returns. The process then stays up until the test
     writes ``<prefix>quit``, and writes ``<prefix>bye`` on its way out,
     so a test can see that the pool finished cleanly after ``serve``."""
-    if loop == "bufring":
-        # That loop arms no other timers and no connection cap.
-        config.idle_timeout_ms = 0
-        config.write_timeout_ms = 0
-        config.read_body_timeout_ms = 0
-        config.request_timeout_ms = 0
-        config.header_timeout_ms = 0
-        config.min_body_rate = 0
-        config.max_connections = -1
     var srv = _bind(config^, tls)
     var port = UInt16(srv.local_addr().port)
     var pid = fork()
@@ -394,12 +379,6 @@ def _spawn_server(
                     h,
                     srv._stopping,
                 )
-            elif loop == "bufring":
-                comptime if CompilationTarget.is_linux():
-                    var h = _router(prefix)
-                    run_uring_bufring_reactor_loop(
-                        srv._listener, srv.config, h, srv._stopping
-                    )
             elif loop == "moveonly":
                 srv.serve(_MoveOnly(_router(prefix)))
             else:
@@ -667,13 +646,6 @@ def _loop_tag(loop: String) -> String:
     return "-" + loop
 
 
-def _have_bufring() -> Bool:
-    """Whether this host can run the io_uring buffer-ring loop."""
-    comptime if not CompilationTarget.is_linux():
-        return False
-    return use_uring_backend()
-
-
 def _tag(tls: Bool) -> String:
     if tls:
         return "-tls"
@@ -701,26 +673,6 @@ def test_router_without_offload_never_blocks() raises:
 
 
 # ── HTTP/1.1 ───────────────────────────────────────────────────────────────
-
-
-def test_bufring_keeps_serving_a_handler_that_may_block() raises:
-    """The io_uring buffer ring has the pool, so opting into it with an
-    ``Offload`` route keeps it."""
-    if not _have_bufring():
-        return
-    var config = ServerConfig(
-        idle_timeout_ms=0,
-        write_timeout_ms=0,
-        read_body_timeout_ms=0,
-        request_timeout_ms=0,
-        header_timeout_ms=0,
-        min_body_rate=0,
-        max_connections=-1,
-        use_bufring=True,
-    )
-    var srv = HttpServer.bind(SocketAddr.localhost(0), config^)
-    srv._resolve_bufring()
-    assert_true(srv.config.use_bufring)
 
 
 def _h1_offloaded_response_and_keep_alive(
@@ -764,12 +716,6 @@ def test_h1_offloaded_response_and_keep_alive_cancellable() raises:
 
 def test_h1_offloaded_response_and_keep_alive_h1_loop() raises:
     _h1_offloaded_response_and_keep_alive(False, loop="h1")
-
-
-def test_h1_offloaded_response_and_keep_alive_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_offloaded_response_and_keep_alive(False, loop="bufring")
 
 
 def _h1_slow_offload_does_not_stall_other_connections(
@@ -823,12 +769,6 @@ def test_h1_slow_offload_does_not_stall_other_connections_stream() raises:
     _h1_slow_offload_does_not_stall_other_connections(False, loop="stream")
 
 
-def test_h1_slow_offload_does_not_stall_other_connections_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_slow_offload_does_not_stall_other_connections(False, loop="bufring")
-
-
 def _h1_pipelined_requests_answer_in_order(
     tls: Bool, loop: String = "unified"
 ) raises:
@@ -879,12 +819,6 @@ def test_h1_pipelined_requests_answer_in_order_h1_loop() raises:
     _h1_pipelined_requests_answer_in_order(False, loop="h1")
 
 
-def test_h1_pipelined_requests_answer_in_order_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_pipelined_requests_answer_in_order(False, loop="bufring")
-
-
 def _h1_timeout_answers_503_and_cancels(
     tls: Bool, loop: String = "unified"
 ) raises:
@@ -931,12 +865,6 @@ def test_h1_timeout_answers_503_and_cancels_h1_loop() raises:
 
 def test_h1_timeout_answers_503_and_cancels_stream() raises:
     _h1_timeout_answers_503_and_cancels(False, loop="stream")
-
-
-def test_h1_timeout_answers_503_and_cancels_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_timeout_answers_503_and_cancels(False, loop="bufring")
 
 
 def _h1_full_queue_answers_503_at_once(
@@ -1007,12 +935,6 @@ def test_h1_full_queue_answers_503_at_once_h1_loop() raises:
     _h1_full_queue_answers_503_at_once(False, loop="h1")
 
 
-def test_h1_full_queue_answers_503_at_once_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_full_queue_answers_503_at_once(False, loop="bufring")
-
-
 def _h1_client_close_cancels_the_handler(
     tls: Bool, loop: String = "unified"
 ) raises:
@@ -1054,12 +976,6 @@ def test_h1_client_close_cancels_the_handler_stream() raises:
     _h1_client_close_cancels_the_handler(False, loop="stream")
 
 
-def test_h1_client_close_cancels_the_handler_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_client_close_cancels_the_handler(False, loop="bufring")
-
-
 def _h1_handler_error_is_500(tls: Bool, loop: String = "unified") raises:
     var prefix = _prefix("h1raise" + _tag(tls) + _loop_tag(loop))
     var srv = _spawn_server(prefix, ServerConfig(), tls, loop=loop)
@@ -1092,12 +1008,6 @@ def test_h1_handler_error_is_500_h1_loop() raises:
 
 def test_h1_handler_error_is_500_stream() raises:
     _h1_handler_error_is_500(False, loop="stream")
-
-
-def test_h1_handler_error_is_500_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_handler_error_is_500(False, loop="bufring")
 
 
 def _h1_shutdown_waits_for_the_offloaded_request(
@@ -1151,12 +1061,6 @@ def test_h1_shutdown_waits_for_the_offloaded_request_h1_loop() raises:
 
 def test_h1_shutdown_waits_for_the_offloaded_request_stream() raises:
     _h1_shutdown_waits_for_the_offloaded_request(False, loop="stream")
-
-
-def test_h1_shutdown_waits_for_the_offloaded_request_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_shutdown_waits_for_the_offloaded_request(False, loop="bufring")
 
 
 def _h1_shutdown_gives_up_after_its_timeout(
@@ -1215,12 +1119,6 @@ def test_h1_shutdown_gives_up_after_its_timeout_h1_loop() raises:
 
 def test_h1_shutdown_gives_up_after_its_timeout_stream() raises:
     _h1_shutdown_gives_up_after_its_timeout(False, loop="stream")
-
-
-def test_h1_shutdown_gives_up_after_its_timeout_bufring() raises:
-    if not _have_bufring():
-        return
-    _h1_shutdown_gives_up_after_its_timeout(False, loop="bufring")
 
 
 def test_h1_shutdown_gives_up_after_its_timeout_move_only() raises:

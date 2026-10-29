@@ -725,27 +725,6 @@ def test_unlimited_body_cap_serves_request() raises:
     client.close()
 
 
-def test_unlimited_body_cap_bufring_path() raises:
-    """The io_uring buffer-ring ingest path has the same cap."""
-    var listener = TcpListener.bind(SocketAddr.localhost(0))
-    var port = listener.local_addr().port
-    var client = TcpStream.connect(SocketAddr.localhost(port))
-    var server = listener.accept()
-    server._socket.set_nonblocking(True)
-    listener.close()
-    var ch = ConnHandle(server^)
-    var cfg = _default_config()
-    cfg.max_body_size = Int.MAX
-    var h = FnHandler(_echo_handler)
-    var req = _bytes_of("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-    _ = ch.on_readable_from_buf(Span[UInt8](req), h, cfg)
-    assert_equal(ch.state, STATE_WRITING)
-    assert_false(ch.should_close)
-    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
-    assert_true(" 200 " in wire)
-    client.close()
-
-
 def test_body_cap_still_rejects_oversized_input() raises:
     """The subtraction form keeps rejecting a buffer larger than
     ``max_header_size + max_body_size`` (here 64 + 64 = 128 bytes)."""
@@ -755,6 +734,35 @@ def test_body_cap_still_rejects_oversized_input() raises:
     var big = String("POST / HTTP/1.1\r\nHost: x\r\nX: ") + String("a") * 200
     var wire = _queued_error(big, _echo_handler, cfg)
     assert_true(" 413 " in wire)
+
+
+def test_endless_head_stops_reading_past_the_head_budget() raises:
+    """A head that never ends gets its 431 once it passes the head budget.
+    The drain used to read on until the socket was empty, pulling the
+    whole stream into memory first."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    cfg.max_header_size = 1024
+    cfg.max_uri_length = 1024
+    var head = String("GET / HTTP/1.1\r\nHost: x\r\nX: ") + String("a") * 60_000
+    client.write_all(Span[UInt8](_bytes_of(head)))
+    _ = _drive_readable(ch, r, _echo_handler, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_true(" 431 " in wire, wire)
+    # One 8 KB read past the 2 KB budget, at most.
+    assert_true(
+        len(ch.read_buf) <= 2048 + 8192,
+        "read " + String(len(ch.read_buf)) + " bytes of an endless head",
+    )
+    client.close()
 
 
 def test_response_includes_date_header_from_cache() raises:
