@@ -240,11 +240,12 @@ def test_on_readable_cancel_dispatches_through_cancel_handler() raises:
     )
     assert_true(Int(n) == len(first))
 
+    # Each retry waits 2 ms, so 500 retries give a slow CI runner 1 s.
     var cfg = ServerConfig()
     var h = _RecordingCancelHandler(0)
     var step_pump = handle.on_readable_cancel(h, cfg)
     var pump_attempts = 0
-    while (not step_pump.want_write) and pump_attempts < 50:
+    while (not step_pump.want_write) and pump_attempts < 500:
         pump_attempts += 1
         usleep(2000)
         step_pump = handle.on_readable_cancel(h, cfg)
@@ -257,7 +258,7 @@ def test_on_readable_cancel_dispatches_through_cancel_handler() raises:
 
     var got = List[UInt8]()
     var attempts = 0
-    while not client.response_ready(sid) and attempts < 50:
+    while not client.response_ready(sid) and attempts < 500:
         attempts += 1
         var buf = stack_allocation[8192, UInt8]()
         var got_n = _recv(client_fd, buf, c_size_t(8192), c_int(0))
@@ -269,6 +270,7 @@ def test_on_readable_cancel_dispatches_through_cancel_handler() raises:
         else:
             _ = handle.on_writable(cfg)
             _ = handle.on_readable_cancel(h, cfg)
+            usleep(2000)
     assert_true(client.response_ready(sid), "h2 response did not arrive")
     var resp = client.take_response(sid)
     assert_equal(resp.status, 200)
