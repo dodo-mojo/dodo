@@ -191,7 +191,7 @@ A harness is everything around the model: assembling prompts, calling models, ru
 - `dodo eval` and `dodo trace`
 
 **Reuse candidates and spikes:**
-- Flare's template engine and its JSON library, `ehsanmok/json`, which has schema and reflection modules.
+- Flare's template engine. `dodo.json` keeps the reflection serde but not the upstream schema module, so tool schemas build on reflection.
 - Phase 0 must confirm that Mojo 1.2's compile-time reflection can list struct fields for schema generation.
 
 ### 5.2 Computer vision (`dodo.vision`)
@@ -300,6 +300,7 @@ The first landscape search only found Lightbug and m0. A closer look at the modu
 | GitHub home | org **`dodo-mojo`**, main repo `dodo-mojo/dodo` | 2026-10-26 |
 | Package names | Mojo/conda package `dodo` (modular-community channel), CLI binary `dodo`, PyPI `dodo-mojo` (only if we ship a pip-installable CLI) | 2026-10-26 |
 | Networking core | **Hard fork of Flare v0.13.0**, renamed and owned by dodo ([ADR-0003](adr/0003-fork-flare-core.md)) | 2026-10-26 |
+| JSON | **Vendored `json` v0.4.2 as `dodo/json`**. `loads` parses with simdjson (C++, through our FFI wrapper, 1.5 to 2.2x faster than the pure-Mojo parser), which stays as the fallback. `Value`, the writer and reflection serde come along; the GPU, schema, query, patch and streaming parts do not. | 2026-10-29 |
 
 ### Still open
 
