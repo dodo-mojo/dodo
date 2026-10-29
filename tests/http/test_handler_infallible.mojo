@@ -54,11 +54,11 @@ struct HealthHandler(Copyable, HandlerInfallible):
 def test_handler_infallible_direct_call() raises:
     """A struct implementing :trait:`HandlerInfallible` can be called
     directly without a ``try`` / ``except`` block at the call site."""
-    var h = StaticOk("hello v0.7")
+    var h = StaticOk("hello")
     var req = Request(method="GET", url="/", version="HTTP/1.1")
     var resp = h.serve(req)  # No ``raises`` keyword required at the call.
     assert_equal(resp.status, 200)
-    assert_equal(resp.text(), "hello v0.7")
+    assert_equal(resp.text(), "hello")
 
 
 def test_with_raises_adapts_infallible_to_handler() raises:

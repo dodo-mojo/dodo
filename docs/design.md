@@ -63,6 +63,7 @@ The networking layers start as an imported fork (ADR-0003), so their package nam
   - `Offload(handler)` runs a handler on an offload thread pool and wakes the loop through its wake fd (ADR-0004).
   - GPU work is enqueued on the worker's `DeviceContext` stream, and completion is polled from the loop, so the CPU never sits waiting on the GPU.
   - In dev mode `dodo.prof` flags handlers that hold a loop longer than a threshold.
+- Outgoing calls (other APIs, model servers, later databases) run on the same loop: a handler starts several at once and parks until they answer, costing no threads (ADR-0006, proposed).
 - If Mojo gains stable async later, handlers can become `async def` without changing the I/O layer.
 - **Phase 0 spike:** confirm thread creation (`parallelize` vs. pthreads via FFI) and epoll from Mojo 1.2.
 
@@ -87,6 +88,20 @@ The networking layers start as an imported fork (ADR-0003), so their package nam
 | TLS (OpenSSL/BoringSSL via FFI) | Phase 5 | Until then, run behind Caddy, nginx or a cloud load balancer. That's also standard practice in production. |
 | HTTP/2 | Phase 5 | Needed for gRPC and direct browser connections without a proxy. Large attack surface (HPACK, flow control, Rapid Reset). |
 | HTTP/3 / QUIC | Not planned | Proxies and CDNs handle it in front of the app. |
+
+### 3.4 One process or several
+
+One process is dodo's default because it pays off when data is big or shared: images, frames and tensors go from the request to the model without a copy or a network hop, one batching queue groups requests from every worker, tokens stream straight to the client, and there is one thing to deploy. For small JSON calls the hop to another service costs well under a millisecond, so it is rarely the reason to keep things together.
+
+Split when there is a real reason: one GPU shared by many web replicas (each replica would load its own weights), crash isolation, or parts that need to scale or deploy on their own. A monorepo is about code, not processes; it can hold one dodo app or many services.
+
+| Setup | What runs where |
+|---|---|
+| All in one | HTTP, models and kernels in one dodo process |
+| Supervised workers | Models or kernels in child processes that dodo starts, watches, limits and restarts; data passes through shared memory (ADR-0005, proposed) |
+| Distributed | dodo serves HTTP and calls remote model servers, or is one service among many |
+
+Model workers get CPU, RAM and GPU memory limits, each as a ratio or an amount of **the box**: the container's limits when dodo runs in Docker or Kubernetes, otherwise the machine. Kubernetes needs nothing separate; dodo reads a pod's limits the same way and adds `/healthz`, `/readyz` and draining on `SIGTERM`.
 
 ## 4. Developer API (sketch)
 
@@ -176,7 +191,7 @@ A harness is everything around the model: assembling prompts, calling models, ru
 - `dodo eval` and `dodo trace`
 
 **Reuse candidates and spikes:**
-- Flare's template engine and its JSON library, `ehsanmok/json`, which has schema and reflection modules.
+- Flare's template engine. `dodo.json` keeps the reflection serde but not the upstream schema module, so tool schemas build on reflection.
 - Phase 0 must confirm that Mojo 1.2's compile-time reflection can list struct fields for schema generation.
 
 ### 5.2 Computer vision (`dodo.vision`)
@@ -219,6 +234,7 @@ All profiling output is saved as files plus a JSON summary, so an agent can read
 | Piece | Details |
 |---|---|
 | `dodo` CLI | `new`, `dev` (rebuild and restart on save; the listening socket is kept open so no requests drop), `run`, `test`, `fuzz`, `bench`, `profile`, `routes`, `doctor` (checks toolchain, WSL, GPU, ports), `docs`. Every command supports `--json` and has stable exit codes. No interactive prompts without a TTY. |
+| Version-pinned docs | `dodo docs pull` fetches agent-friendly Markdown docs for the Mojo and dodo versions the project uses into `.dodo/docs/` (or the versions asked for: `dodo docs pull mojo@1.2 dodo@0.1`), with a Mojo 1.x cheat sheet of what changed. AGENTS.md points there, and `dodo docs search` searches them. Agents know little Mojo, so this comes first. |
 | AGENTS.md | In the dodo repo and generated in every new project: layout, commands, conventions, how to test, what not to touch. |
 | MCP server | `dodo mcp` exposes tools: `routes.list`, `request.send`, `test.run`, `logs.tail`, `profile.run`, `bench.run`, `docs.search`, `scaffold.add_route`. Agents get the same powers as the CLI, with structured results. |
 | Docs | Every page is Markdown in the repo, published with `llms.txt` and `llms-full.txt`. Every code example is compiled in CI, so docs can't drift. |
@@ -284,6 +300,7 @@ The first landscape search only found Lightbug and m0. A closer look at the modu
 | GitHub home | org **`dodo-mojo`**, main repo `dodo-mojo/dodo` | 2026-10-26 |
 | Package names | Mojo/conda package `dodo` (modular-community channel), CLI binary `dodo`, PyPI `dodo-mojo` (only if we ship a pip-installable CLI) | 2026-10-26 |
 | Networking core | **Hard fork of Flare v0.13.0**, renamed and owned by dodo ([ADR-0003](adr/0003-fork-flare-core.md)) | 2026-10-26 |
+| JSON | **Vendored `json` v0.4.2 as `dodo/json`**. `loads` parses with simdjson (C++, through our FFI wrapper, 1.5 to 2.2x faster than the pure-Mojo parser), which stays as the fallback. `Value`, the writer and reflection serde come along; the GPU, schema, query, patch and streaming parts do not. | 2026-10-29 |
 
 ### Still open
 

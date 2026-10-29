@@ -155,9 +155,6 @@ from test_tls_acceptor import (
     test_acceptor_reload_repeated_safe as test_tls_acceptor__test_acceptor_reload_repeated_safe,
 )
 from test_tls_acceptor import (
-    test_acceptor_info_placeholder_returns_empty as test_tls_acceptor__test_acceptor_info_placeholder_returns_empty,
-)
-from test_tls_acceptor import (
     test_acceptor_with_alpn_succeeds as test_tls_acceptor__test_acceptor_with_alpn_succeeds,
 )
 from test_tls_acceptor import (
@@ -168,9 +165,6 @@ from test_tls_acceptor import (
 )
 from test_tls_acceptor import (
     test_tls_server_error_writes_message_and_code as test_tls_acceptor__test_tls_server_error_writes_message_and_code,
-)
-from test_tls_acceptor import (
-    test_tls_server_not_implemented_default_message as test_tls_acceptor__test_tls_server_not_implemented_default_message,
 )
 from test_tls_acceptor import (
     test_acceptor_construct_slice_derived_paths as test_tls_acceptor__test_acceptor_construct_slice_derived_paths,
@@ -204,9 +198,6 @@ from test_tls_handshake_live import (
 )
 from test_tls_handshake_live import (
     test_acceptor_alpn_empty_skips_set_alpn_call as test_tls_handshake_live__test_acceptor_alpn_empty_skips_set_alpn_call,
-)
-from test_tls_handshake_live import (
-    test_tls_info_default_fields_for_pre_handshake as test_tls_handshake_live__test_tls_info_default_fields_for_pre_handshake,
 )
 from test_tls_handshake_live import (
     test_reload_round_trip as test_tls_handshake_live__test_reload_round_trip,
@@ -384,9 +375,6 @@ def main() raises:
     ]()
     suite.test[test_tls_acceptor__test_acceptor_reload_swaps_cert]()
     suite.test[test_tls_acceptor__test_acceptor_reload_repeated_safe]()
-    suite.test[
-        test_tls_acceptor__test_acceptor_info_placeholder_returns_empty
-    ]()
     suite.test[test_tls_acceptor__test_acceptor_with_alpn_succeeds]()
     suite.test[test_tls_acceptor__test_acceptor_with_mtls_succeeds]()
     suite.test[
@@ -394,9 +382,6 @@ def main() raises:
     ]()
     suite.test[
         test_tls_acceptor__test_tls_server_error_writes_message_and_code
-    ]()
-    suite.test[
-        test_tls_acceptor__test_tls_server_not_implemented_default_message
     ]()
     suite.test[test_tls_acceptor__test_acceptor_construct_slice_derived_paths]()
     suite.test[test_tls_acceptor__test_acceptor_reload_slice_derived_paths]()
@@ -422,9 +407,6 @@ def main() raises:
     ]()
     suite.test[
         test_tls_handshake_live__test_acceptor_alpn_empty_skips_set_alpn_call
-    ]()
-    suite.test[
-        test_tls_handshake_live__test_tls_info_default_fields_for_pre_handshake
     ]()
     suite.test[test_tls_handshake_live__test_reload_round_trip]()
     suite.test[test_tls_handshake_live__test_reload_repeated_safe]()

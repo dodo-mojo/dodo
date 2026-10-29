@@ -326,7 +326,7 @@ struct TimerWheel(Movable):
         -- promoted into the wheel, and fired if due -- at the next slot-0
         boundary, ``_WHEEL_SLOTS - _current_slot`` ticks away. While the
         overflow list is non-empty the hint is therefore capped at that
-        boundary, both for the slot scan and for the fallback (RT-01):
+        boundary, both for the slot scan and for the fallback:
         a full-rotation fallback would be up to 511 ms late.
         """
         var limit = _WHEEL_SLOTS

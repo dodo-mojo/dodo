@@ -56,7 +56,7 @@ def test_urldecode_bad_hex_raises() raises:
 
 
 def test_urldecode_rejects_ill_formed_utf8() raises:
-    """APP-24: escapes that decode to ill-formed UTF-8 are rejected, never
+    """Escapes that decode to ill-formed UTF-8 are rejected, never
     wrapped in a ``String`` (lone lead, stray continuation, overlong,
     surrogate, truncated sequence, out-of-range lead)."""
     var bad = List[String]()
@@ -73,7 +73,7 @@ def test_urldecode_rejects_ill_formed_utf8() raises:
 
 
 def test_urldecode_accepts_well_formed_utf8() raises:
-    """APP-24: well-formed multi-byte escapes still decode."""
+    """Well-formed multi-byte escapes still decode."""
     assert_equal(urldecode("%C3%A9"), "é")
     assert_equal(urldecode("%E2%82%AC"), "€")
     assert_equal(urldecode("%F0%9F%98%80"), "😀")
@@ -168,7 +168,7 @@ def test_parse_bad_escape_raises() raises:
 
 
 def test_parse_ill_formed_utf8_raises() raises:
-    """APP-24: an ill-formed name or value in a form body is an error
+    """An ill-formed name or value in a form body is an error
     (reachable from any request body through ``Form``)."""
     with assert_raises():
         _ = parse_form_urlencoded("a=%F0")

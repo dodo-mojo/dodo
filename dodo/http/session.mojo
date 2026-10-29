@@ -469,8 +469,8 @@ struct InMemorySessionStore(Copyable, SessionStore):
 
     Concurrency note: the implementation is single-worker; for
     multi-worker mode the store is per-worker (each worker keeps
-    its own table). A shared backend (Redis, DB) is a follow-up
-    behind the same trait.
+    its own table). A shared backend (Redis, DB) can implement the
+    same trait.
     """
 
     var _key: List[UInt8]

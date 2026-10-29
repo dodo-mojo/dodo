@@ -8,7 +8,11 @@ preview = ["pixi-build"]  # needed for the git source dependencies below
 [activation]
 # Build the C/C++ FFI wrappers on activation. Each script skips work when
 # its library is up to date.
-scripts = ["dodo/tls/ffi/build.sh", "dodo/http/ffi/build.sh"]
+scripts = [
+    "dodo/tls/ffi/build.sh",
+    "dodo/http/ffi/build.sh",
+    "dodo/json/ffi/build.sh",
+]
 
 [dependencies]
 mojo = ">=1.2.0,<2.0.0"
@@ -19,7 +23,7 @@ libdeflate = ">=1.22,<2"         # gzip encoding
 libbrotlicommon = ">=1.2.1,<2"   # br
 libbrotlidec = ">=1.2.1,<2"
 libbrotlienc = ">=1.2.1,<2"
-json = { git = "https://github.com/ehsanmok/json.git", tag = "v0.4.2" }
+simdjson = ">=4.6.11,<5"         # JSON parsing
 
 # The activation scripts compile the wrappers with g++ on Linux.
 [target.linux-64.dependencies]

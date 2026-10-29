@@ -89,7 +89,7 @@ def test_bind_then_query_local_path() raises:
 
 
 def test_queried_local_path_round_trips_non_ascii() raises:
-    """NET-06: ``fill_sockaddr_un`` writes the path's UTF-8 bytes but the
+    """``fill_sockaddr_un`` writes the path's UTF-8 bytes but the
     reader turned every byte into ``chr(b)`` (Latin-1), so a path with
     ``é`` (C3 A9) came back as ``Ã©``."""
     var p = _tmp_uds_path("net06_é_日本")
@@ -102,7 +102,7 @@ def test_queried_local_path_round_trips_non_ascii() raises:
 
 
 def test_sockaddr_un_round_trips_utf8() raises:
-    """NET-06: ``read_path_from_sockaddr_un`` inverts
+    """``read_path_from_sockaddr_un`` inverts
     ``fill_sockaddr_un`` for ASCII and non-ASCII paths, and ignores
     whatever follows the NUL terminator."""
     var paths = List[String]()
@@ -313,7 +313,7 @@ def _bind_dgram(path: String) raises -> RawSocket:
 
 
 def test_bind_refuses_when_liveness_probe_is_inconclusive() raises:
-    """NET-07: the probe's ``except: pass`` treated every connect failure as
+    """The probe's ``except: pass`` treated every connect failure as
     "stale", so a live socket the caller could not connect to (EACCES, a
     different socket type, ...) was unlinked and taken over. Only a refusal
     proves a socket stale."""
@@ -336,7 +336,7 @@ def test_bind_refuses_when_liveness_probe_is_inconclusive() raises:
 
 
 def test_bind_refuses_unwritable_live_listener() raises:
-    """NET-07 (the original trigger): a live listener whose socket file the
+    """A live listener whose socket file the
     caller may not write answers the probe with EACCES. root bypasses the
     permission check, so this part only runs for a non-root user."""
     if _getuid() == 0:

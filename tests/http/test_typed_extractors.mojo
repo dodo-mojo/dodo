@@ -8,7 +8,7 @@
   so ``Extracted[H]`` maps them to 400.
 """
 
-from json import Value
+from dodo.json import Value
 
 from std.testing import assert_equal, assert_false, assert_raises, TestSuite
 

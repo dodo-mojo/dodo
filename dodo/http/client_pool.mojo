@@ -37,18 +37,12 @@ freed and any remaining fds are closed.
 """
 
 from std.collections import Dict
-from std.ffi import c_int, external_call
-from std.memory import Layout, Pointer, alloc
+from std.ffi import c_int
+from std.memory import Pointer
 from std.memory.alloc import unsafe_alloc
-from std.sys.info import CompilationTarget
 
 from dodo.net._libc import _close
-
-# CLOCK_MONOTONIC clock id: 1 on Linux, 6 on Darwin/macOS (id 1 is
-# undefined there, so clock_gettime would fail and the clock read 0).
-comptime _CLOCK_MONOTONIC: c_int = c_int(
-    6
-) if CompilationTarget.is_macos() else c_int(1)
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 # ── _ClientPoolState (heap-allocated) ────────────────────────────────────────
@@ -214,7 +208,7 @@ struct ClientPool(Copyable):
         var sp = self._state()
         if key not in sp[].entries:
             return -1
-        var now_ms = _monotonic_ms()
+        var now_ms = monotonic_now_ms()
         var deque = sp[].entries[key].copy()
         # LIFO with timeout-eviction: pop from the back; if it's
         # too old, ``_close`` it and try the next one. Any survivor
@@ -270,7 +264,7 @@ struct ClientPool(Copyable):
             return
         deque.append(fd)
         sp[].entries[key] = deque^
-        sp[].insertion_ts_ms[fd] = _monotonic_ms()
+        sp[].insertion_ts_ms[fd] = monotonic_now_ms()
 
     def _total_idle(imm self) -> Int:
         """Return the sum of every per-origin deque length.
@@ -310,29 +304,3 @@ struct ClientPool(Copyable):
         sp.unsafe_deinit_pointee()
         sp.unsafe_free()
         self._addr = 0
-
-
-# ── monotonic clock helper ──────────────────────────────────────────────────
-
-
-def _monotonic_ms() -> Int:
-    """Return ``CLOCK_MONOTONIC`` in milliseconds.
-
-    Uses the Linux ``clock_gettime`` FFI; on macOS the symbol
-    resolves through the libSystem shim that ships with the
-    OS. Falls back to ``0`` on FFI failure -- in that case the
-    timeout-eviction logic in :meth:`ClientPool.acquire` becomes
-    a no-op (every entry's age computes to 0), which is
-    conservative.
-    """
-    var ts_buf = alloc(Layout[Int](count=2)).unsafe_leak()
-    ts_buf[unsafe_offset=0] = 0
-    ts_buf[unsafe_offset=1] = 0
-    var rc = external_call["clock_gettime", c_int](_CLOCK_MONOTONIC, ts_buf)
-    if Int(rc) != 0:
-        ts_buf.unsafe_free()
-        return 0
-    var sec = ts_buf[unsafe_offset=0]
-    var nsec = ts_buf[unsafe_offset=1]
-    ts_buf.unsafe_free()
-    return sec * 1000 + nsec // 1_000_000

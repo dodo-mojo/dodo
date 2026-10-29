@@ -46,6 +46,9 @@ EXCLUDE = {
     # Stress/soak: runtime-bound, not compile-bound, so aggregating it buys
     # nothing and it would dominate the aggregate's wall clock.
     "tests/runtime/stress_scheduler.mojo",
+    # Points DODO_LIB_DIR at an empty directory; the library lookup is
+    # cached per process.
+    "tests/json/test_loads_fallback.mojo",
 }
 
 TEST_DEF = re.compile(r"^def (test_[A-Za-z0-9_]*)\s*\(", re.M)

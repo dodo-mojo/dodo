@@ -428,7 +428,7 @@ def test_v6_peer_addr() raises:
     listener.close()
 
 
-# ── accept ownership (NET-05) ─────────────────────────────────────────────────
+# ── accept ownership ─────────────────────────────────────────────────
 
 
 struct _FailingDecoder(_PeerDecoder):
@@ -465,7 +465,7 @@ def _fresh_socket_fd() raises -> Int32:
 
 
 def test_accept_closes_fd_when_peer_decode_fails() raises:
-    """NET-05: the accepted fd was decoded before it was wrapped, so a
+    """The accepted fd was decoded before it was wrapped, so a
     failing decode left nothing owning it."""
     var fd = _fresh_socket_fd()
     var buf = alloc(Layout[UInt8](count=128)).unsafe_leak()

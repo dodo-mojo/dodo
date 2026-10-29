@@ -30,10 +30,10 @@ from dodo.errors import (
     HttpStatusError,
     IoError,
     ValidationError,
-    http_reason_phrase,
     map_handler_error,
     parse_status_error,
 )
+from dodo.http.status_reason import status_reason
 
 
 # ── ValidationError ────────────────────────────────────────────────────────
@@ -235,9 +235,9 @@ def test_map_out_of_range_status_falls_back_to_500() raises:
 
 
 def test_reason_phrase_fallbacks() raises:
-    assert_equal(http_reason_phrase(404), String("Not Found"))
-    assert_equal(http_reason_phrase(599), String("Server Error"))
-    assert_equal(http_reason_phrase(450), String("Client Error"))
+    assert_equal(status_reason(404), String("Not Found"))
+    assert_equal(status_reason(599), String("Server Error"))
+    assert_equal(status_reason(450), String("Client Error"))
 
 
 def main() raises:

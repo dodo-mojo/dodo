@@ -161,7 +161,7 @@ def test_ip_addr_v6_link_local() raises:
 
 
 def test_ip_addr_multicast_v6_exact_ff00_8() raises:
-    """ENC-01: ``is_multicast`` tested ``startswith("ff")`` on the text, so
+    """``is_multicast`` tested ``startswith("ff")`` on the text, so
     first groups 0x00ff and 0x0ff0..0x0fff (printed ``ff::``, ``fff::``)
     were reported as multicast. Multicast is ``ff00::/8`` (RFC 4291 2.7)."""
     # Real multicast: first byte 0xff.

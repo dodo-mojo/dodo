@@ -67,7 +67,7 @@ def test_settings_ack_recorded() raises:
 
 
 def test_headers_on_stream_0_is_a_connection_error() raises:
-    """H2-06: HEADERS on stream 0 is a connection error of type
+    """HEADERS on stream 0 is a connection error of type
     PROTOCOL_ERROR (RFC 9113 sec 6.2). It used to raise out of
     ``handle_frame``, so the caller never saw a GOAWAY."""
     var c = Connection()
@@ -573,7 +573,7 @@ def _data_frame(sid: Int, n: Int, end_stream: Bool = False) -> Frame:
 
 
 def test_connection_receive_window_is_enforced() raises:
-    """H2-01: DATA past the connection receive window is a connection
+    """DATA past the connection receive window is a connection
     error of type FLOW_CONTROL_ERROR (RFC 9113 sec 6.9.1)."""
     var c = Connection()
     _ = _open_request(c, 1, False)
@@ -585,7 +585,7 @@ def test_connection_receive_window_is_enforced() raises:
 
 
 def test_connection_receive_window_is_debited_and_credited() raises:
-    """H2-01: every DATA payload is debited, and every WINDOW_UPDATE(0)
+    """Every DATA payload is debited, and every WINDOW_UPDATE(0)
     dodo emits is added back, so the window tracks what the peer sees."""
     var c = Connection()
     _ = _open_request(c, 1, False)
@@ -600,7 +600,7 @@ def test_connection_receive_window_is_debited_and_credited() raises:
 
 
 def test_withheld_connection_credit_restores_the_receive_window() raises:
-    """H2-01: credit withheld above the buffer cap is added to the
+    """Credit withheld above the buffer cap is added to the
     window only when it is released to the peer."""
     var c = Connection()
     c.recv_window = 0
@@ -652,7 +652,7 @@ def _five_byte_body_completes(
 
 
 def test_content_length_overflow_and_duplicates_are_rejected() raises:
-    """H2-05: a content-length that wraps Int64 (2^64 + 5 read as 5), one
+    """A content-length that wraps Int64 (2^64 + 5 read as 5), one
     that is empty or not 1*DIGIT, and differing duplicate fields are
     malformed (RFC 9110 sec 8.6, RFC 9113 sec 8.1.1): the stream is reset
     with PROTOCOL_ERROR instead of a 5-byte body completing."""
@@ -677,7 +677,7 @@ def test_content_length_overflow_and_duplicates_are_rejected() raises:
 
 
 def test_content_length_valid_forms_still_complete() raises:
-    """H2-05: the largest in-range value and repeated equal values are
+    """The largest in-range value and repeated equal values are
     still accepted; a 5-byte body completes under ``content-length: 5``,
     ``05`` and a repeated ``5``."""
     var c = Connection()
@@ -712,7 +712,7 @@ def _conn_credit(frames: List[Frame]) -> Int:
 
 
 def test_content_length_reset_returns_connection_credit() raises:
-    """H2-09: four requests reset for a content-length mismatch at
+    """Four requests reset for a content-length mismatch at
     END_STREAM (65535 DATA octets in all) must give the connection credit
     back, or the peer's window is 0 for good (RFC 9113 sec 6.9)."""
     var c = Connection()
@@ -731,7 +731,7 @@ def test_content_length_reset_returns_connection_credit() raises:
 
 
 def test_stream_window_overrun_reset_returns_connection_credit() raises:
-    """H2-09: DATA past the stream's receive window resets the stream with
+    """DATA past the stream's receive window resets the stream with
     FLOW_CONTROL_ERROR and still returns its connection credit."""
     var c = Connection()
     _ = _open_request(c, 1, False)
@@ -746,7 +746,7 @@ def test_stream_window_overrun_reset_returns_connection_credit() raises:
 
 
 def test_field_names_follow_rfc_9113_8_2_1() raises:
-    """H2-10: a field name holds none of 0x00-0x20, 0x41-0x5a, 0x7f-0xff,
+    """A field name holds none of 0x00-0x20, 0x41-0x5a, 0x7f-0xff,
     and no colon except as the pseudo-header prefix; a request carrying
     one is malformed (RFC 9113 sec 8.1.1, sec 8.2.1)."""
     var bad = List[String]()
@@ -777,7 +777,7 @@ def test_field_names_follow_rfc_9113_8_2_1() raises:
 
 
 def test_validate_request_fields_rejects_bad_name_octets() raises:
-    """H2-10: the shared validator (also used for HTTP/3) rejects the same
+    """The shared validator (also used for HTTP/3) rejects the same
     names, and still accepts the pseudo-header prefix colon."""
     var base = List[HpackHeader]()
     base.append(HpackHeader(":method", "GET"))
@@ -795,7 +795,7 @@ def test_validate_request_fields_rejects_bad_name_octets() raises:
 
 
 def test_a_refused_stream_id_cannot_be_opened_again() raises:
-    """H2-02: a stream refused with REFUSED_STREAM never enters the table,
+    """A stream refused with REFUSED_STREAM never enters the table,
     but its id is used up. A second HEADERS on it, even once capacity is
     free, is a connection error (RFC 9113 sec 5.1.1)."""
     var c = Connection()
@@ -833,7 +833,7 @@ def _goaway_frame(n: Int) -> Frame:
 
 
 def test_goaway_shorter_than_eight_octets_is_a_frame_size_error() raises:
-    """H2-07: GOAWAY carries last-stream-id and an error code, 8 octets at
+    """GOAWAY carries last-stream-id and an error code, 8 octets at
     least (RFC 9113 sec 6.8); a shorter one is FRAME_SIZE_ERROR (sec 4.2)
     and is not acted on."""
     var sizes = List[Int]()
@@ -859,7 +859,7 @@ def test_well_formed_goaway_is_still_accepted() raises:
 
 
 def test_zero_concurrent_streams_refuses_every_stream() raises:
-    """H2-11: SETTINGS_MAX_CONCURRENT_STREAMS = 0 is not special (RFC 9113
+    """SETTINGS_MAX_CONCURRENT_STREAMS = 0 is not special (RFC 9113
     sec 6.5.2); it admits no stream, so each request is refused with
     REFUSED_STREAM (sec 5.1.2) instead of being served."""
     var c = Connection()
@@ -892,7 +892,7 @@ def _frame_on(ty: FrameType, sid: Int, payload: List[UInt8]) -> Frame:
 
 
 def test_frames_on_an_even_stream_are_a_protocol_error_in_server_role() raises:
-    """H2-15: an even id is server-initiated and the server opens none, so
+    """An even id is server-initiated and the server opens none, so
     it is idle however high the client's request ids are. A WINDOW_UPDATE,
     RST_STREAM or DATA on it is a connection error PROTOCOL_ERROR
     (RFC 9113 sec 5.1, idle), not a frame on a closed stream (ignored, or
@@ -915,7 +915,7 @@ def test_frames_on_an_even_stream_are_a_protocol_error_in_server_role() raises:
 
 
 def test_frames_on_a_finished_odd_stream_are_still_closed_not_idle() raises:
-    """H2-15: an odd id at or below the highest one used, and no longer in
+    """An odd id at or below the highest one used, and no longer in
     the table, is closed: a late WINDOW_UPDATE is ignored."""
     var c = Connection()
     _ = _open_request(c, 1, True)
@@ -928,7 +928,7 @@ def test_frames_on_a_finished_odd_stream_are_still_closed_not_idle() raises:
 
 
 def test_self_dependent_priority_and_zero_window_update_on_idle_stream() raises:
-    """H2-16: RST_STREAM must not be sent on an idle stream (RFC 9113 sec
+    """RST_STREAM must not be sent on an idle stream (RFC 9113 sec
     5.1), so a self-dependent PRIORITY or a zero-increment WINDOW_UPDATE
     there is a connection error. Before, the server sent RST_STREAM and
     remembered the id as reset, and the later request on it lost its DATA."""
@@ -949,7 +949,7 @@ def test_self_dependent_priority_and_zero_window_update_on_idle_stream() raises:
 
 
 def test_self_dependent_priority_on_an_open_stream_is_still_a_stream_error() raises:
-    """H2-16: on a stream that exists the stream error is kept."""
+    """On a stream that exists the stream error is kept."""
     var c = Connection()
     _ = _open_request(c, 1, False)
     var out = c.handle_frame(
@@ -961,7 +961,7 @@ def test_self_dependent_priority_on_an_open_stream_is_still_a_stream_error() rai
 
 
 def test_zero_window_update_on_a_closed_stream_is_still_a_stream_error() raises:
-    """H2-16: a closed (not idle) stream keeps the stream-error answer."""
+    """A closed (not idle) stream keeps the stream-error answer."""
     var c = Connection()
     _ = _open_request(c, 1, True)
     _ = _open_request(c, 3, True)

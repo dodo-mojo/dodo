@@ -301,8 +301,8 @@ struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
     up the worker for the full natural duration; the 504 only
     suppresses its response. Tight cancel-cell wiring (the
     reactor flips a Cancel cell that the inner handler observes
-    and short-circuits on) requires reactor cooperation and
-    lands in a later commit.
+    and short-circuits on) would need reactor cooperation, which
+    it does not have.
 
     For codec-style sans-I/O handlers and the common case where
     misbehaving inners simply return slightly late, this

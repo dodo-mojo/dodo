@@ -110,7 +110,7 @@ Bad Request** with the error message in the body; the handler's
 # reflect[T] is auto-imported by Mojo; field access is
 # reflect[T].field_ref[idx].
 from std.collections import Optional
-from json import loads, Value, Null
+from ..json import loads, Value, Null
 
 from .handler import Handler
 from .headers import HeaderMap
@@ -819,7 +819,7 @@ struct Json(Copyable, Defaultable, Extractor):
     def apply(mut self, req: Request) raises:
         if len(req.body) == 0:
             raise Error("missing JSON body")
-        self.value = loads[target="cpu-simdjson"](req.text())
+        self.value = loads(req.text())
 
     @staticmethod
     def extract(req: Request) raises -> Self:

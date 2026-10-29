@@ -1,4 +1,4 @@
-"""A client accepted on fd 0 must still be served (MACH-01).
+"""A client accepted on fd 0 must still be served.
 
 A reactor loop that registers the listener under token 0 and each client
 under token = its fd breaks here. ``accept`` returns the lowest free fd, so

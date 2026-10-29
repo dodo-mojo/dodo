@@ -1,4 +1,4 @@
-"""``WsClient.connect`` checks the whole 101 (WS-04).
+"""``WsClient.connect`` checks the whole 101.
 
 RFC 6455 sec 4.1: the client MUST fail the connection unless the response
 has ``Upgrade: websocket``, a ``Connection`` field with the ``upgrade``

@@ -141,6 +141,7 @@ from .response import (
     stream_response,
 )
 from .response_pool import ResponsePool
+from .status_reason import status_reason
 from .handler import (
     Handler,
     CancelHandler,

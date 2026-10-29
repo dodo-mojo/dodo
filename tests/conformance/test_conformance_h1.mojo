@@ -15,7 +15,7 @@ reject.
 
 from std.pathlib import Path
 from std.testing import assert_equal, assert_false, assert_true
-from json import loads, Value, Null
+from dodo.json import loads, Value, Null
 
 from dodo.http.proto import H1LeniencyConfig
 from dodo.http.server import _parse_http_request_bytes

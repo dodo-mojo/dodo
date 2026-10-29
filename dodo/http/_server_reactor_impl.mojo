@@ -13,7 +13,6 @@ from ._reactor import (
     StepResult,
     ConnHandle,
     _detect_h2c_upgrade_inline,
-    _monotonic_ms,
     _is_content_length,
     _is_date,
     _is_connection,

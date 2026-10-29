@@ -28,19 +28,12 @@ multiplexed and handled on the h2 path, never returned to this pool.
 """
 
 from std.collections import Dict, List, Optional
-from std.ffi import c_int, external_call
-from std.memory import Layout, Pointer, alloc
+from std.memory import Pointer
 from std.memory.alloc import unsafe_alloc
-from std.sys.info import CompilationTarget
 
 from ...tls import TlsStream
 from ...runtime.pool import Pool
-
-# CLOCK_MONOTONIC clock id: 1 on Linux, 6 on Darwin/macOS (id 1 is
-# undefined there, so clock_gettime would fail and the clock read 0).
-comptime _CLOCK_MONOTONIC: c_int = c_int(
-    6
-) if CompilationTarget.is_macos() else c_int(1)
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 @fieldwise_init
@@ -136,7 +129,7 @@ struct TlsConnectionPool(Copyable):
         var sp = self._state()
         if key not in sp[].entries:
             return None
-        var now_ms = _monotonic_ms()
+        var now_ms = monotonic_now_ms()
         var deque = sp[].entries[key].copy()
         while len(deque) > 0:
             var addr = deque[len(deque) - 1]
@@ -180,7 +173,7 @@ struct TlsConnectionPool(Copyable):
         var addr = Pool[TlsStream].alloc_move(stream^)
         deque.append(addr)
         sp[].entries[key] = deque^
-        sp[].ts_ms[addr] = _monotonic_ms()
+        sp[].ts_ms[addr] = monotonic_now_ms()
 
     def idle_count(imm self) -> Int:
         """Total idle TLS streams across all origins."""
@@ -205,19 +198,3 @@ struct TlsConnectionPool(Copyable):
         sp.unsafe_deinit_pointee()
         sp.unsafe_free()
         self._addr = 0
-
-
-def _monotonic_ms() -> Int:
-    """``CLOCK_MONOTONIC`` in milliseconds; ``0`` on FFI failure
-    (which makes idle-timeout eviction a conservative no-op)."""
-    var ts_buf = alloc(Layout[Int](count=2)).unsafe_leak()
-    ts_buf[unsafe_offset=0] = 0
-    ts_buf[unsafe_offset=1] = 0
-    var rc = external_call["clock_gettime", c_int](_CLOCK_MONOTONIC, ts_buf)
-    if Int(rc) != 0:
-        ts_buf.unsafe_free()
-        return 0
-    var sec = ts_buf[unsafe_offset=0]
-    var nsec = ts_buf[unsafe_offset=1]
-    ts_buf.unsafe_free()
-    return sec * 1000 + nsec // 1_000_000

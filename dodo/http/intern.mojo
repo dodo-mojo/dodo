@@ -55,9 +55,9 @@ What this module provides
   then a tiny per-length switch (most lengths have ≤ 2
   candidates).
 
-Wiring into the parser is a follow-up; this module provides
-the primitive + tests + re-exports so the wiring change is
-mechanical.
+The request parser interns the method through
+``intern_method_bytes``. ``intern_common_value`` has no caller in the
+server.
 
 Implementation notes
 --------------------

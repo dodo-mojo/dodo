@@ -257,7 +257,7 @@ def _match_one(
             # ``*`` captures the rest of the path, so it is only valid as
             # the final pattern segment (the runtime ``Router`` rejects
             # anything else at registration). A pattern with a non-final
-            # ``*`` is invalid and matches nothing (APP-10).
+            # ``*`` is invalid and matches nothing.
             if j != len(pat_segs) - 1:
                 return False
             if i >= len(url_segs):

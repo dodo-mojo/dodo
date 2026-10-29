@@ -76,7 +76,7 @@ def test_happy_eyeballs_uneven_families() raises:
 
 
 def test_happy_eyeballs_keeps_preferred_ipv4_first() raises:
-    """NET-10: [v4, v6, v4] must stay led by the v4 the resolver ranked
+    """[v4, v6, v4] must stay led by the v4 the resolver ranked
     first, not be reordered to start with the v6."""
     var addrs = List[IpAddr]()
     addrs.append(IpAddr.parse("192.0.2.1"))

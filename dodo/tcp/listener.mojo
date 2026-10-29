@@ -42,8 +42,7 @@ trait _PeerDecoder:
 
     The production decoder (:struct:`_SockaddrDecoder`) cannot fail for the
     buffers ``accept(2)`` fills, so this one-method seam lets a test make the
-    decode raise and check that the accepted fd is still released. Internal;
-    see ``formal/Dodo/Bugs/NET_05.lean``.
+    decode raise and check that the accepted fd is still released. Internal.
     """
 
     def decode(self, buf: Pointer[UInt8, _]) raises -> SocketAddr:

@@ -223,7 +223,7 @@ def test_runs_on_different_thread() raises:
         )
 
 
-# ── Process-wide thread-count cap (D2) ──────────────────────────────────────
+# ── Process-wide thread-count cap ──────────────────────────────────────
 
 
 def test_pool_cap_enforced_and_recovers() raises:
@@ -281,7 +281,7 @@ def test_pool_cap_enforced_and_recovers() raises:
 
 
 def test_pool_cap_is_exactly_max_pool_size() raises:
-    """RT-06: exactly ``MAX_POOL_SIZE`` slots can be held at once; the next
+    """Exactly ``MAX_POOL_SIZE`` slots can be held at once; the next
     claim is refused. On macOS arm64 the variadic ``sem_open`` call used
     to fail (garbage ``value`` argument) and the fail-open acquire then
     admitted every claim, so the cap did not exist."""
@@ -308,7 +308,7 @@ def test_pool_cap_is_exactly_max_pool_size() raises:
     _pool_reset()
 
 
-# ── sem_open failure: no crash (RT-08), fail closed (RT-07) ─────────────────
+# ── sem_open failure: no crash, fail closed ─────────────────
 #
 # Each case forks a child (the pool semaphore is named by pid, so the
 # child has its own), fills the child's fd table so the next ``sem_open``
@@ -411,22 +411,22 @@ def _run_sem_failure_child(which: Int) raises -> Int:
 
 
 def test_acquire_survives_sem_open_failure() raises:
-    """RT-08: with the fd table full ``sem_open`` fails (EMFILE) and
+    """With the fd table full ``sem_open`` fails (EMFILE) and
     returns ``SEM_FAILED`` -- NULL on glibc, -1 on Darwin. The acquire
     must treat that as a failed open, not hand NULL to ``sem_trywait``
-    (SIGSEGV, which killed the whole server). RT-07: and it fails closed
+    (SIGSEGV, which killed the whole server). And it fails closed
     (refuses the slot)."""
     assert_equal(_run_sem_failure_child(_CASE_ACQUIRE_FAILS), _CHILD_REFUSED)
 
 
 def test_release_survives_sem_open_failure() raises:
-    """RT-08: ``_pool_release`` has the same ``SEM_FAILED`` test; with
+    """``_pool_release`` has the same ``SEM_FAILED`` test; with
     ``sem_open`` failing it must return instead of ``sem_post(NULL)``."""
     assert_equal(_run_sem_failure_child(_CASE_RELEASE_FAILS), _CHILD_ACQUIRED)
 
 
 def test_failed_sem_open_does_not_raise_the_cap() raises:
-    """RT-07: an acquire made while ``sem_open`` fails used to return True
+    """An acquire made while ``sem_open`` fails used to return True
     without decrementing, while its paired release did post, leaving the
     semaphore at 33 (cap raised for the rest of the process). The acquire
     now fails closed, so exactly ``MAX_POOL_SIZE`` slots are available

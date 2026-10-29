@@ -292,7 +292,7 @@ def _decodes(first: Int, second: Int, tail: Int = 0) -> Bool:
 
 
 def test_decode_reserved_opcode_raises() raises:
-    """WS-01: RFC 6455 sec 5.2 -- an unknown opcode fails the connection.
+    """RFC 6455 sec 5.2 -- an unknown opcode fails the connection.
 
     Opcodes 0x3-0x7 and 0xB-0xF are reserved. ``decode_one`` checked the
     RSV bits but not the opcode, so ``recv()`` returned such a frame to the

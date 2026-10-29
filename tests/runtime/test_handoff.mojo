@@ -143,7 +143,7 @@ def test_pool_disabled_peek_returns_minus_one() raises:
     assert_equal(pool.peek_idle_worker(0), -1)
 
 
-# ── Load-aware target selection (D1) ────────────────────────────────────────
+# ── Load-aware target selection ────────────────────────────────────────
 
 
 def test_choose_target_hands_off_under_skew() raises:
@@ -178,7 +178,7 @@ def test_choose_target_single_worker_keeps_local() raises:
 
 
 def test_peek_idle_skips_peer_whose_queue_is_full() raises:
-    """RT-04: ``peek_idle_worker`` returns -1 when no peer queue is below
+    """``peek_idle_worker`` returns -1 when no peer queue is below
     capacity. The scan used to start at ``capacity + 1`` and so returned a
     peer holding exactly ``capacity`` tokens, whose ``try_handoff`` fails."""
     var pool = WorkerHandoffPool(HandoffPolicy(True, 1, 1), 2)
@@ -188,7 +188,7 @@ def test_peek_idle_skips_peer_whose_queue_is_full() raises:
 
 
 def test_peek_idle_prefers_non_full_peer_over_full_one() raises:
-    """RT-04: with one full peer and one below capacity the result is the
+    """With one full peer and one below capacity the result is the
     non-full peer, whichever order they are in."""
     var pool = WorkerHandoffPool(HandoffPolicy(True, 2, 1), 3)
     _ = pool.try_handoff(1, 1)
@@ -203,7 +203,7 @@ def test_peek_idle_prefers_non_full_peer_over_full_one() raises:
 
 
 def test_choose_target_never_picks_full_peer() raises:
-    """RT-04: ``choose_handoff_target`` must not name a peer whose queue is
+    """``choose_handoff_target`` must not name a peer whose queue is
     full, so the following ``try_handoff`` is not a wasted attempt."""
     var pool = WorkerHandoffPool(HandoffPolicy(True, 1, 1), 2)
     _ = pool.try_handoff(1, 42)

@@ -220,8 +220,8 @@ def _parse_http_response(
 ) raises -> Response:
     """Parse a raw HTTP/1.1 response byte buffer.
 
-    Informational 1xx heads before the final response are skipped (a
-    ``103 Early Hints`` used to be returned as the response). 101 is
+    Informational 1xx heads before the final response are skipped, so a
+    ``103 Early Hints`` is never returned as the response. 101 is
     returned as is, for the h2c upgrade path. The body follows
     :func:`_response_framing`: ``method`` matters, since a response to
     HEAD has a Content-Length and no body.
@@ -842,10 +842,10 @@ def _read_http_response_framed[
     hung the request. Informational 1xx heads are read past.
 
     A chunked body is walked chunk by chunk (``scan_chunked_resume``).
-    It used to be found by searching the raw bytes for ``\\r\\n0\\r\\n``,
-    which stopped early when the *payload* contained that pattern --
-    leaving body bytes in the socket for the next pooled request to read
-    as its response -- and never matched an empty chunked body at all.
+    Searching the raw bytes for ``\\r\\n0\\r\\n`` instead would stop early
+    when the *payload* contains that pattern, leaving body bytes in the
+    socket for the next pooled request to read as its response, and
+    would never match an empty chunked body at all.
 
     Args:
         stream: The open stream to read from.

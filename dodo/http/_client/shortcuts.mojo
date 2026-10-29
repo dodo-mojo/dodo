@@ -8,7 +8,7 @@ these directly. For multiple requests, use a shared
 ``HttpClient`` instead.
 """
 
-from json import dumps, Value as JsonValue
+from ...json import dumps, Value as JsonValue
 
 from ..client import HttpClient
 from ..response import Response

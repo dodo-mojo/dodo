@@ -164,7 +164,7 @@ def _parse_http_request_bytes(
     for i in range(sp1):
         if not _is_token_char(req_line.unsafe_ptr()[unsafe_offset=i]):
             raise Error("invalid character in request method")
-    # B3: try the StaticString intern table first — covers the 9
+    # Try the StaticString intern table first — covers the 9
     # RFC 7231 method names (~99 % of real-world traffic is GET /
     # POST). On a hit, the returned String's backing comes from
     # a process-lifetime constant rather than from per-request

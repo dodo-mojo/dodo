@@ -57,10 +57,9 @@ What this module provides (only the primitive)
   / shrinks ``iov_base[i].iov_len`` for cells that were
   partially written).
 
-Wiring into the HTTP/1.1 response serializer is a follow-up
-commit that bolts onto this primitive without changing the
-response struct's hot-path layout. The primitive exists today
-so the wiring change is mechanical.
+The HTTP/1.1 response serializer does not use it: the chunked write
+path measured the copy it would save and kept one contiguous buffer
+(see ``dodo/http/response_stream.mojo``).
 
 iovec layout
 ------------
@@ -343,7 +342,7 @@ def writev_buf_all(mut iov: IoVecBuf, fd: Int, total_bytes: Int) raises:
         if sent <= 0:
             # ``writev_buf`` already raised on -1, so this is ``writev``
             # making no progress (0) with bytes still owed. Returning
-            # here told the caller everything was written (RT-02).
+            # here told the caller everything was written.
             raise NetworkError(
                 "writev returned 0 with "
                 + String(remaining)

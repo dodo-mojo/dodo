@@ -95,7 +95,7 @@ def _origin_allowed(origin: String, config: CorsConfig) -> Bool:
         if entry == "*":
             # A credentialed response may not use ``*``, so under
             # credentials the entry authorises nothing, but the scan must
-            # go on: the allowlist is a set, not an ordered list (APP-21).
+            # go on: the allowlist is a set, not an ordered list.
             if not config.allow_credentials:
                 return True
             continue
@@ -112,7 +112,7 @@ def _ensure_vary_origin(mut resp: Response) raises:
     ``Vary: Origin`` on every response of the resource, including those the
     middleware does not stamp (no ``Origin``, rejected origin, rejected
     preflight); otherwise a shared cache can hand an ACAO-less response to a
-    CORS request, or one origin's ACAO to another (APP-22).
+    CORS request, or one origin's ACAO to another.
     """
     for v in resp.headers.get_all("vary"):
         if v == "Origin":

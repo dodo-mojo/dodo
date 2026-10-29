@@ -2,7 +2,7 @@
 
 from std.collections import Dict, Optional
 from std.memory import Layout, Pointer, alloc
-from json import loads, Value
+from ..json import loads, Value
 
 from .cancel import Cancel
 from .headers import HeaderMap
@@ -444,7 +444,7 @@ struct Request(Movable):
         Raises:
             Error: If the body is not valid JSON.
         """
-        return loads[target="cpu-simdjson"](self.text())
+        return loads(self.text())
 
     def content_length(self) -> Int:
         """Return the Content-Length header value, or 0 if absent or not

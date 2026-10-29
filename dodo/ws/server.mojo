@@ -33,10 +33,9 @@ from .protocol import _close_reply_payload
 from ..crypto.base64 import base64_decode as _b64_decode_srv
 from ..crypto.base64 import base64_encode as _b64_encode_srv
 from ..http.response import Status
-from ..tcp import TcpListener, TcpStream
+from ..tcp import TcpListener, TcpStream, accept_fd
 from ..net import SocketAddr, NetworkError, _find_dodo_lib
 from ..runtime._thread import ThreadHandle, _OpaquePtr, _null_ptr
-from ..runtime.reuseport import bind_reuseport
 from ..utils.dylib import dl_sym
 
 # RFC 6455 §1.3 magic GUID
@@ -1005,21 +1004,17 @@ struct WsServer(Movable):
 
         ``num_workers <= 1`` falls back to the single-threaded
         :meth:`serve` shape (one worker on the current thread).
-        ``num_workers >= 2`` binds ``num_workers`` ``SO_REUSEPORT``
-        listeners on the same port (kernel-level load balancing
-        across worker threads, matching the
-        :class:`dodo.http.HttpServer` multi-worker shape) and
-        spawns one pthread per worker. Each worker runs its own
-        single-threaded accept loop, so the per-connection
-        upgrade + handler dispatch is unchanged.
+        ``num_workers >= 2`` spawns one thread per worker, and every
+        worker accepts from the bound listener itself. Nothing is
+        closed or bound again, so the port never goes without a
+        listener while the workers start, and connections already
+        in the backlog are served. Each worker runs its own
+        single-threaded accept loop, so the per-connection upgrade
+        and handler dispatch is unchanged.
 
-        The original :attr:`_listener` (whose port the
-        ``SO_REUSEPORT`` listeners bind to) is closed so its
-        backlog doesn't accept connections that would never be
-        served. Workers are joined before this method returns,
-        which today means it never returns: the workers run
-        forever (no drain machinery yet). Use ``Ctrl-C`` /
-        ``kill`` to terminate.
+        Workers are joined before this method returns, which today
+        means it never returns: the workers run forever (no drain
+        machinery yet). Use ``Ctrl-C`` / ``kill`` to terminate.
 
         Args:
             handler: Per-connection callback (same shape as the
@@ -1031,7 +1026,6 @@ struct WsServer(Movable):
                 Values > 256 are rejected.
 
         Raises:
-            NetworkError: On listener bind failure for any worker.
             Error: On ``pthread_create`` failure when
                 ``num_workers >= 2``.
         """
@@ -1040,12 +1034,7 @@ struct WsServer(Movable):
             return
         if num_workers > 256:
             raise Error("WsServer.serve: num_workers must be <= 256")
-        var addr = self._listener.local_addr()
-        # Close the original listener so its backlog doesn't
-        # silently swallow connections we never serve. The
-        # SO_REUSEPORT listeners below take over the port.
-        self._listener.close()
-        _ws_serve_multicore(addr, handler, num_workers)
+        _ws_serve_multicore(self._listener.as_raw_fd(), handler, num_workers)
 
     def serve[H: WsHandler](mut self, var handler: H) raises:
         """Accept WebSocket connections, dispatching each to a stateful
@@ -1270,16 +1259,15 @@ def _spawn_ws_offload(
 struct _WsWorkerCtx(Movable):
     """Heap-allocated per-worker context for :func:`_ws_serve_multicore`.
 
-    Carries a *fully-bound* per-worker ``SO_REUSEPORT`` listener
-    (the parent thread does the bind so the bind itself is
-    serialised across workers and there is no concurrent-bind
-    race) plus a copy of the ``def`` handler function pointer.
-    Mojo ``def`` function pointers are trivially copyable, so
-    every worker shares the same callable with no per-worker
-    closure state.
+    Carries the fd of the server's listener, borrowed: the
+    ``WsServer`` owns it and outlives the workers, since
+    :func:`_ws_serve_multicore` joins them before it returns. It
+    also carries a copy of the ``def`` handler function pointer.
+    Mojo ``def`` function pointers are trivially copyable, so every
+    worker shares the same callable with no per-worker closure state.
     """
 
-    var listener: TcpListener
+    var listener_fd: c_int
     var handler: def(mut WsConnection) raises thin -> None
 
 
@@ -1303,7 +1291,7 @@ def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
     var ctx_ptr = raw.unsafe_bitcast[_WsWorkerCtx]()
     try:
         while True:
-            var stream = ctx_ptr[].listener.accept()
+            var stream = accept_fd(ctx_ptr[].listener_fd)
             var peer = stream.peer_addr()
             _handle_ws_connection(stream^, peer, ctx_ptr[].handler)
     except:
@@ -1314,18 +1302,15 @@ def _ws_worker_entry(arg: _OpaquePtr) -> _OpaquePtr:
 
 
 def _ws_serve_multicore(
-    addr: SocketAddr,
+    listener_fd: c_int,
     handler: def(mut WsConnection) raises thin -> None,
     num_workers: Int,
 ) raises:
-    """Spawn ``num_workers`` WebSocket worker threads sharing a port.
+    """Spawn ``num_workers`` WebSocket worker threads sharing one listener.
 
-    Each worker binds its own ``SO_REUSEPORT`` listener on the
-    parent thread (so the binds are serialised, no concurrent-
-    bind race), then runs an independent single-threaded accept
-    loop. The kernel hashes new 4-tuples across the listener set
-    so accept fairness is at the OS level, identical to the
-    :class:`dodo.http.HttpServer` multi-worker path.
+    Every worker runs an independent single-threaded accept loop on
+    the same listener (``listener_fd``, borrowed from the caller),
+    and the kernel hands each new connection to one waiting worker.
 
     Workers are spawned via :class:`dodo.runtime.ThreadHandle`
     and joined before this function returns. Today the workers
@@ -1357,8 +1342,7 @@ def _ws_serve_multicore(
     )
 
     for i in range(num_workers):
-        var listener = bind_reuseport(addr)
-        var ctx = _WsWorkerCtx(listener^, handler)
+        var ctx = _WsWorkerCtx(listener_fd, handler)
         var ctx_ptr = unsafe_alloc[_WsWorkerCtx](1)
         debug_assert[assert_mode="safe"](
             Int(ctx_ptr) != 0,
