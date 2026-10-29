@@ -162,13 +162,12 @@ def _is_field_value_char(c: UInt8) -> Bool:
     return False
 
 
-def _read_line_buf_lenient(
-    data: Span[UInt8, _], mut pos: Int, allow_lf_only: Bool
-) raises -> String:
-    """Read one line, enforcing CRLF in strict mode.
+def _read_line_crlf(data: Span[UInt8, _], mut pos: Int) raises -> String:
+    """Read one line, which must end in CRLF.
 
-    Strict (``allow_lf_only=False``) rejects bare LF terminators
-    per RFC 9112 §2.2; lenient accepts both CRLF and LF. Bytes
+    A bare LF terminator is refused (RFC 9112 §2.2): the reactor frames
+    the head on CRLFCRLF, so accepting one here would let the parser and
+    the framing disagree on where the head ends. Bytes
     are passed through verbatim so the parser's per-byte
     validators can inspect them (NUL / control / obs-text
     handling lives at the parser).
@@ -190,10 +189,8 @@ def _read_line_buf_lenient(
         end = n
 
     # ``end == start`` is the empty line that ends the header block.
-    # It needs the same CRLF as any other line: a lone LF there made
-    # this parser end the headers while the reactor, which frames on
-    # CRLFCRLF, kept reading them.
-    if not allow_lf_only and end < n and end >= start and not saw_cr_before_lf:
+    # It needs the same CRLF as any other line.
+    if end < n and not saw_cr_before_lf:
         raise Error("bare LF line terminator (RFC 9112 §2.2 requires CRLF)")
 
     pos = end + 1 if end < n else end

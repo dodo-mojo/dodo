@@ -1005,7 +1005,7 @@ from ._server.parse_util import (
     _is_token_char,
     _parse_int_str,
     _read_line_buf,
-    _read_line_buf_lenient,
+    _read_line_crlf,
     _scan_content_length,
 )
 from ._server.responses import (

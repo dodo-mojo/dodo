@@ -742,10 +742,7 @@ struct ConnHandle(Movable):
             self.continue_sent = False
             var end = _find_crlfcrlf(self.read_buf, 0)
             if end < 0:
-                if (
-                    not config.h1_leniency.allow_lf_only_line_endings
-                    and _has_bare_lf(self.read_buf)
-                ):
+                if _has_bare_lf(self.read_buf):
                     self._queue_error(400, "Bad Request")
                     return Optional[StepResult](self._transition_to_writing())
                 # The head is the request line (up to max_uri_length)
