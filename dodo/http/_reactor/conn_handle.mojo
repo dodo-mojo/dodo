@@ -532,6 +532,7 @@ struct ConnHandle(Movable):
         if self.tls:
             return self._drain_recv_tls[flips_cancel_on_close](config)
         var chunk = stack_allocation[8192, UInt8]()
+        var head_checked = False
         while True:
             var got = _recv(self.fd(), chunk, c_size_t(8192), c_int(0))
             if got > 0:
@@ -551,6 +552,10 @@ struct ConnHandle(Movable):
                     self._note_head_from_buf()
                     self._queue_error(413, "Content Too Large")
                     return Optional[StepResult](self._transition_to_writing())
+                if not head_checked and self._past_head_budget(config):
+                    head_checked = True
+                    if _find_crlfcrlf(self.read_buf, 0) < 0:
+                        break
                 # A read that did not fill the chunk emptied the socket
                 # (``recv`` returns what is queued, up to the chunk), so
                 # another call would only report EAGAIN. Registration is
@@ -586,6 +591,19 @@ struct ConnHandle(Movable):
                 )
         return Optional[StepResult]()
 
+    def _past_head_budget(self, config: ServerConfig) -> Bool:
+        """True when no head has been framed yet and ``read_buf`` holds
+        more than a head may take.
+
+        The drain loops then check once for a complete head. Without one,
+        they stop reading: the caller answers 431, and reading on would
+        only pull a client's endless head into memory first.
+        """
+        if self.headers_end >= 0:
+            return False
+        var head_budget = config.max_header_size + config.max_uri_length
+        return len(self.read_buf) > head_budget
+
     def _drain_recv_tls[
         flips_cancel_on_close: Bool
     ](mut self, config: ServerConfig) raises -> Optional[StepResult]:
@@ -596,6 +614,7 @@ struct ConnHandle(Movable):
         and is treated exactly like a cleartext peer FIN, so keep-alive
         teardown and cancel semantics are identical on both transports.
         """
+        var head_checked = False
         while True:
             var got = self.tls.value().recv(self.read_buf, 8192)
             if got > 0:
@@ -606,6 +625,10 @@ struct ConnHandle(Movable):
                     self._note_head_from_buf()
                     self._queue_error(413, "Content Too Large")
                     return Optional[StepResult](self._transition_to_writing())
+                if not head_checked and self._past_head_budget(config):
+                    head_checked = True
+                    if _find_crlfcrlf(self.read_buf, 0) < 0:
+                        break
                 continue
             if got == SSL_IO_WANT_READ:
                 break

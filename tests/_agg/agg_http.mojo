@@ -3881,6 +3881,9 @@ from test_server_reactor_state import (
     test_body_cap_still_rejects_oversized_input as test_server_reactor_state__test_body_cap_still_rejects_oversized_input,
 )
 from test_server_reactor_state import (
+    test_endless_head_stops_reading_past_the_head_budget as test_server_reactor_state__test_endless_head_stops_reading_past_the_head_budget,
+)
+from test_server_reactor_state import (
     test_response_includes_date_header_from_cache as test_server_reactor_state__test_response_includes_date_header_from_cache,
 )
 from test_server_reactor_state import (
@@ -6724,6 +6727,9 @@ def main() raises:
     ]()
     suite.test[
         test_server_reactor_state__test_body_cap_still_rejects_oversized_input
+    ]()
+    suite.test[
+        test_server_reactor_state__test_endless_head_stops_reading_past_the_head_budget
     ]()
     suite.test[
         test_server_reactor_state__test_response_includes_date_header_from_cache
