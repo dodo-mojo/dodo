@@ -520,7 +520,7 @@ def test_push_promise_is_a_connection_error() raises:
 
     It used to be answered with RST_STREAM on the promised id and dropped,
     which skipped its HPACK block and left the decoder table out of step
-    with the server's encoder (H2-17).
+    with the server's encoder.
     """
     var client = Http2ClientConnection()
     var server = Http2Connection()
@@ -560,7 +560,7 @@ def test_push_promise_is_a_connection_error() raises:
 
 
 def test_push_promise_block_cannot_desync_later_responses() raises:
-    """H2-17: a PUSH_PROMISE whose block inserts into the server's HPACK
+    """A PUSH_PROMISE whose block inserts into the server's HPACK
     table must end the connection, not be dropped: a later response that
     indexes that insert would decode to a header the server never sent."""
     var client = Http2ClientConnection()
@@ -682,7 +682,7 @@ def test_pending_body_drains_on_window_update() raises:
 
 
 def test_late_frames_on_a_taken_stream_are_ignored() raises:
-    """H2-03: a WINDOW_UPDATE or RST_STREAM(NO_ERROR) that reaches the
+    """A WINDOW_UPDATE or RST_STREAM(NO_ERROR) that reaches the
     client after take_response() popped the stream is a frame on a closed
     stream (RFC 9113 sec 5.1), not on an idle one."""
     var kinds = List[Int]()
@@ -702,7 +702,7 @@ def test_late_frames_on_a_taken_stream_are_ignored() raises:
 
 
 def test_late_frame_on_a_stream_never_opened_is_a_protocol_error() raises:
-    """H2-03: the idle test is not weakened: an odd id above every id the
+    """The idle test is not weakened: an odd id above every id the
     client opened, and any even id, are still idle."""
     var ids = List[Int]()
     ids.append(3)
@@ -720,7 +720,7 @@ def test_late_frame_on_a_stream_never_opened_is_a_protocol_error() raises:
 
 
 def test_reduced_table_size_is_a_ceiling_not_an_immediate_resize() raises:
-    """HPACK-03: advertising SETTINGS_HEADER_TABLE_SIZE = 0 must not shrink
+    """Advertising SETTINGS_HEADER_TABLE_SIZE = 0 must not shrink
     the client's decoder before the server has seen it and sent a size
     update (RFC 7541 sec 4.2); the setting only caps that update."""
     var cfg = Http2ClientConfig()
@@ -731,7 +731,7 @@ def test_reduced_table_size_is_a_ceiling_not_an_immediate_resize() raises:
 
 
 def test_headers_on_a_stream_the_client_never_opened_is_a_connection_error() raises:
-    """H2-04: with push disabled the server cannot open a stream, and an odd
+    """With push disabled the server cannot open a stream, and an odd
     id the client never allocated is idle too. A response HEADERS on either
     is GOAWAY(PROTOCOL_ERROR), not a response the caller is told is ready
     (RFC 9113 sec 5.1.1)."""
@@ -751,7 +751,7 @@ def test_headers_on_a_stream_the_client_never_opened_is_a_connection_error() rai
 
 
 def test_headers_on_an_opened_stream_are_still_a_response() raises:
-    """H2-04: the response to a stream the client did open is unaffected."""
+    """The response to a stream the client did open is unaffected."""
     var client = Http2ClientConnection()
     var server = Http2Connection()
     _shuttle(client, server)
@@ -782,7 +782,7 @@ def _client_with_ended_response() raises -> Tuple[Http2ClientConnection, Int]:
 
 
 def test_last_body_chunk_closes_a_half_closed_remote_stream() raises:
-    """H2-12: the client's END_STREAM on a stream the server already ended
+    """The client's END_STREAM on a stream the server already ended
     closes it (RFC 9113 sec 5.1); a later DATA is STREAM_CLOSED. The last
     chunk used to leave it half-closed (local), so the late DATA was
     buffered."""
@@ -806,7 +806,7 @@ def test_last_body_chunk_closes_a_half_closed_remote_stream() raises:
 
 
 def test_last_body_chunk_on_an_open_stream_half_closes_local() raises:
-    """H2-12: the common case is unchanged: END_STREAM on an open stream
+    """The common case is unchanged: END_STREAM on an open stream
     leaves it half-closed (local)."""
     var client = Http2ClientConnection()
     _ = client.drain()
@@ -839,7 +839,7 @@ def _data_frame_count(bytes: List[UInt8]) raises -> Int:
 
 
 def test_send_data_on_a_closed_stream_sends_nothing() raises:
-    """H2-13: after the stream is closed (here by the server's RST_STREAM)
+    """After the stream is closed (here by the server's RST_STREAM)
     the client must not send DATA on it (RFC 9113 sec 5.1, closed) and the
     stream stays closed. send_data used to queue the frame and move the
     state back to half-closed (local)."""
@@ -875,7 +875,7 @@ def test_send_data_on_a_closed_stream_sends_nothing() raises:
 
 
 def test_send_data_on_an_open_stream_still_sends() raises:
-    """H2-13: the guard does not affect a live stream."""
+    """The guard does not affect a live stream."""
     var client = Http2ClientConnection()
     _ = client.drain()
     var sid = client.next_stream_id()
@@ -889,7 +889,7 @@ def test_send_data_on_an_open_stream_still_sends() raises:
 
 
 def test_headers_after_the_servers_end_stream_is_stream_closed() raises:
-    """H2-14: once the server has ended its response (the stream is
+    """Once the server has ended its response (the stream is
     half-closed (remote)) another HEADERS from it is a STREAM_CLOSED
     connection error (RFC 9113 sec 5.1), as on the server side. It used to
     be accepted and decoded as a second response."""
@@ -903,7 +903,7 @@ def test_headers_after_the_servers_end_stream_is_stream_closed() raises:
 
 
 def test_trailers_after_a_response_head_are_still_accepted() raises:
-    """H2-14: HEADERS (no END_STREAM) then trailers HEADERS (END_STREAM)
+    """HEADERS (no END_STREAM) then trailers HEADERS (END_STREAM)
     is a normal response and must not be rejected."""
     var client = Http2ClientConnection()
     _ = client.drain()
@@ -939,7 +939,7 @@ def _frame_header(n: Int, ty: UInt8, sid: Int) -> List[UInt8]:
 
 
 def test_oversized_frame_is_a_frame_size_error_not_a_raise() raises:
-    """H2-18: RFC 9113 sec 4.2. A frame over the advertised
+    """RFC 9113 sec 4.2. A frame over the advertised
     SETTINGS_MAX_FRAME_SIZE draws GOAWAY(FRAME_SIZE_ERROR). Before, feed
     raised, and the callers let the raise propagate: the connection ended
     with no GOAWAY. Input after the error is discarded."""
@@ -953,7 +953,7 @@ def test_oversized_frame_is_a_frame_size_error_not_a_raise() raises:
 
 
 def test_frame_at_the_advertised_size_is_not_refused() raises:
-    """H2-18: the limit is inclusive. A header declaring exactly 16384
+    """The limit is inclusive. A header declaring exactly 16384
     octets just waits for the payload."""
     var client = Http2ClientConnection()
     _ = client.drain()
@@ -1005,7 +1005,7 @@ def _bodiless_get(
 
 
 def test_no_stream_window_update_for_the_data_that_closes_a_stream() raises:
-    """H2-19: RFC 9113 sec 5.1. A response's last DATA frame closes a
+    """RFC 9113 sec 5.1. A response's last DATA frame closes a
     stream whose request already ended. Sending WINDOW_UPDATE on it is a
     frame on a closed stream; the connection-level credit still goes."""
     var client = Http2ClientConnection()
@@ -1026,7 +1026,7 @@ def test_no_stream_window_update_for_the_data_that_closes_a_stream() raises:
 
 
 def test_stream_window_update_is_still_sent_while_the_stream_is_open() raises:
-    """H2-19: DATA without END_STREAM keeps the stream-level credit."""
+    """DATA without END_STREAM keeps the stream-level credit."""
     var client = Http2ClientConnection()
     var sid = _bodiless_get(client)
     var body = List[UInt8]()
@@ -1038,7 +1038,7 @@ def test_stream_window_update_is_still_sent_while_the_stream_is_open() raises:
 
 
 def test_data_on_a_stream_the_server_reset_is_stream_closed() raises:
-    """H2-20: RFC 9113 sec 5.1. Any frame but PRIORITY after RST_STREAM is
+    """RFC 9113 sec 5.1. Any frame but PRIORITY after RST_STREAM is
     STREAM_CLOSED. The "no response head yet" test ran first, so DATA on a
     stream the server reset before answering drew PROTOCOL_ERROR."""
     var client = Http2ClientConnection()
@@ -1061,11 +1061,11 @@ def test_data_on_a_stream_the_server_reset_is_stream_closed() raises:
 
 
 def test_data_before_the_response_head_is_a_stream_error() raises:
-    """DOC-03: on a live stream with no response head, DATA is a malformed
+    """On a live stream with no response head, DATA is a malformed
     response (RFC 9113 sec 8.1, 8.1.1) and so a stream error: the stream is
     reset with PROTOCOL_ERROR, the frame's connection credit is returned, no
     GOAWAY is sent, and a sibling stream keeps working. It used to be a
-    connection error (and H2-20 had asserted that)."""
+    connection error."""
     var client = Http2ClientConnection()
     var sid = _bodiless_get(client, False)
     var sibling = _bodiless_get(client, False)

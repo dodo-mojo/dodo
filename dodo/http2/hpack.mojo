@@ -56,7 +56,7 @@ def _octets_to_string(b: Span[UInt8, _]) -> String:
     replaced each malformed byte by U+FFFD (3 octets). Either way the
     stored entry was larger than the peer's, the decoder evicted entries
     the peer still indexed, and a legal block failed with
-    COMPRESSION_ERROR (HPACK-01).
+    COMPRESSION_ERROR.
 
     The result is therefore an octet string that is not necessarily valid
     UTF-8: RFC 9113 sec 8.2.1 allows any octet in a field value except NUL,
@@ -388,9 +388,8 @@ struct HpackDecoder(Copyable, Defaultable):
         var decoded = 0
         # Fields [0, charged) are already counted against the budget. A
         # field is charged before the next one is decoded and, for the
-        # last one, after the loop; it used to be charged only at the top
-        # of the next iteration, so a block's last field was never
-        # counted (HPACK-02).
+        # last one, after the loop. Charging only at the top of the next
+        # iteration would never count a block's last field.
         var charged = 0
         while off < len(buf):
             if budget > 0:
@@ -482,8 +481,8 @@ struct HpackEncoder(Copyable, Defaultable):
     information leaks across requests.
 
     ``allow_huffman`` gates ``H=1`` literal emission. When
-    ``False`` (default) the encoder emits raw ``H=0`` literals,
-    matching the legacy wire output byte-for-byte. When ``True``
+    ``False`` (default) the encoder emits raw ``H=0`` literals.
+    When ``True``
     each literal is emitted as the shorter of raw vs Huffman
     (the Huffman length is computed first; the raw form wins
     on tie). Since the dynamic table is empty either way, no
@@ -493,9 +492,9 @@ struct HpackEncoder(Copyable, Defaultable):
     bytes. Callers that worry about a *per-request* compression-
     side channel against secret tokens should leave the flag off.
 
-    A future follow-up can teach the encoder to look up the static
-    table for the most common headers (``:status``, ``:method``,
-    etc.) without touching the dynamic table.
+    The static table is searched by name only, never for a full
+    name-value pair, so ``:method: GET`` still sends ``GET`` as a
+    literal.
     """
 
     var allow_huffman: Bool

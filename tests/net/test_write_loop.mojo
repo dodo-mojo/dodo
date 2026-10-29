@@ -1,9 +1,8 @@
 """Tests for the shared ``write_all`` loop (``dodo.net._write_loop``).
 
-NET-02: ``TcpStream.write_all`` / ``UnixStream.write_all`` added the result
-of ``send(2)`` to their progress counter without checking for ``0``. POSIX
-lets ``send`` return ``0`` for a non-empty buffer; the loop then called
-``send`` again forever. No supported kernel does this on a blocking stream
+POSIX lets ``send(2)`` return ``0`` for a non-empty buffer, and a loop
+that adds that to its progress counter calls ``send`` again forever. The
+loop must treat ``0`` as a failure. No supported kernel does this on a blocking stream
 socket, so the loop is driven here through a scripted writer.
 """
 
@@ -90,7 +89,7 @@ def test_write_all_empty_data_makes_no_call() raises:
 
 
 def test_write_all_raises_when_send_returns_zero() raises:
-    """NET-02: a 0 return with bytes remaining must raise, not spin."""
+    """A 0 return with bytes remaining must raise, not spin."""
     # 1000 zero returns, then the script runs out (stands in for the EIO
     # that ended the livelock in the repro).
     var zeros = List[Int]()

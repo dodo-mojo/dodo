@@ -13,7 +13,7 @@
 from std.memory import unsafe_memcpy, stack_allocation
 from std.ffi import c_int, c_uint, external_call
 
-from json import dumps, Value as JsonValue
+from ..json import dumps, Value as JsonValue
 
 from ..runtime._libc_time import libc_nanosleep_ms, monotonic_now_ms
 from ..runtime.reuseport import bind_reuseport_if_free
@@ -236,9 +236,8 @@ struct HttpServer(Movable):
         accepted connection through the same handler. Useful for
         binding the same service on both IPv4 and IPv6, on
         multiple ports for split traffic classes (e.g. internal
-        admin port + public service port), or on a UNIX socket
-        plus a TCP socket sharing one process (after the upcoming
-        ``UdsListener`` integration).
+        admin port + public service port). UNIX sockets are not
+        accepted here.
 
         ``addrs`` must be non-empty. The first address is the
         "primary" listener (used by ``local_addr()`` and any
@@ -1065,7 +1064,6 @@ from ._server.responses import (
 from ._server.write import (
     _append_str,
     _ascii_lower,
-    _status_reason,
     _write_response,
     _write_response_buffered,
 )

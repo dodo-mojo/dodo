@@ -107,7 +107,7 @@ def test_h1_header_limit_and_invalid_cap() raises:
 
 
 def test_h1_rejects_a_bare_lf_head() raises:
-    """H1-07: the streaming reader shares the buffered head rules."""
+    """The streaming reader shares the buffered head rules."""
     for wire in [
         (
             "HTTP/1.1 200 OK\nX: a\n\nSet-Cookie: s=evil\r\nContent-Length:"

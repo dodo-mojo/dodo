@@ -41,7 +41,7 @@ is portable, tiny, and matches dodo's "shared-nothing per worker"
 discipline — every worker's reactor still owns its own fd set, the
 handoff just changes *which* worker owns a brand-new fd.
 
-Scope, stated plainly (D1): this rebalances only **newly accepted**
+Scope, stated plainly: this rebalances only **newly accepted**
 connections at accept time (:meth:`WorkerHandoffPool.choose_handoff_target`
 picks an idle peer under skew). **Established keep-alive connections
 are never migrated** — moving a live connection's fd *and* its
@@ -325,7 +325,7 @@ struct WorkerHandoffPool(Movable):
         var best = -1
         # Only peers strictly below capacity qualify: starting at
         # ``capacity + 1`` returned a peer whose queue was exactly full,
-        # for which the following ``try_handoff`` always fails (RT-04).
+        # for which the following ``try_handoff`` always fails.
         var best_size = self.policy.capacity
         for i in range(self.num):
             if i == exclude:

@@ -192,10 +192,10 @@ struct UnixListener(Movable):
         """
         var sock = RawSocket(AF_UNIX, SOCK_STREAM)
         if unlink_existing:
-            # Remove only a stale socket. The path used to be unlinked
-            # whatever it was: a regular file was deleted, and a live
-            # server's socket vanished from under it, so the new bind
-            # "succeeded" and the old server stopped getting clients.
+            # Remove only a stale socket. Unlinking whatever is there
+            # would delete a regular file, or pull a live server's socket
+            # from under it so the new bind "succeeds" and the old server
+            # stops getting clients.
             var k = lstat_kind(path)
             if k[0] == PATH_OTHER:
                 raise NetworkError(
@@ -203,8 +203,8 @@ struct UnixListener(Movable):
                 )
             if k[0] == PATH_SOCKET:
                 # Only a refused probe proves the socket stale: any other
-                # failure (EACCES, ...) says nothing about liveness and
-                # used to be swallowed, unlinking a live server's socket.
+                # failure (EACCES, ...) says nothing about liveness, and
+                # treating it as stale would unlink a live server's socket.
                 if not _socket_path_is_stale(path):
                     raise AddressInUse(path, Int(ErrNo.EADDRINUSE.value))
                 _ = unlink_path(path)

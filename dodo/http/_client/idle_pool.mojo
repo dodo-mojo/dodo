@@ -16,8 +16,8 @@ cell addresses.
 from std.collections import Dict, List, Optional
 from std.memory import Layout, Pointer, alloc
 
-from dodo.http.client_pool import _monotonic_ms
 from dodo.runtime.pool import Pool, PoolableConn
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 @fieldwise_init
@@ -99,7 +99,7 @@ struct IdleConnPool[T: PoolableConn](Copyable):
         var sp = self._state()
         if key not in sp[].entries:
             return None
-        var now_ms = _monotonic_ms()
+        var now_ms = monotonic_now_ms()
         var deque = sp[].entries[key].copy()
         while len(deque) > 0:
             var addr = deque[len(deque) - 1]
@@ -140,7 +140,7 @@ struct IdleConnPool[T: PoolableConn](Copyable):
         var addr = Pool[Self.T].alloc_move(conn^)
         deque.append(addr)
         sp[].entries[key] = deque^
-        sp[].ts_ms[addr] = _monotonic_ms()
+        sp[].ts_ms[addr] = monotonic_now_ms()
 
     def idle_count(imm self) -> Int:
         """Total idle connections across all origins."""

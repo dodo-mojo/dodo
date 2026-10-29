@@ -5,7 +5,7 @@ The streaming-response value type pins:
 - Generic over ``B: Body`` so handlers can return
   ``StreamingResponse[InlineBody]`` (Content-Length framing) or
   ``StreamingResponse[ChunkedBody[Source]]`` (chunked framing).
-- The reactor pull loop (C5) drives ``body.next_chunk(cancel)``
+- The reactor pull loop drives ``body.next_chunk(cancel)``
   per writable edge; ``content_length()`` selects the framing.
 - Helpers (``ok``, ``is_redirect``, ``is_client_error``,
   ``is_server_error``) match the ``Response`` shape so

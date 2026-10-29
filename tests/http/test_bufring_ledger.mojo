@@ -1,10 +1,9 @@
 """Unit tests for the buffer-ring receive kernel (``dodo.http._bufring_ledger``).
 
 ``classify_recv`` decides what the io_uring buffer-ring loop does with every
-receive completion. The invariant that matters (proved in
-``formal/Dodo/Kernels/BufLedger.lean``): a completion that took a provided
-buffer gives it back exactly once, so the ring never drains. Issue #37 was
-the stale-completion path skipping that return.
+receive completion. The invariant that matters: a completion that took a
+provided buffer gives it back exactly once, so the ring never drains,
+including on the stale-completion path.
 """
 
 from std.testing import assert_equal, assert_false, assert_true, TestSuite

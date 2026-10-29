@@ -432,8 +432,9 @@ struct Connection(Copyable, Defaultable):
     ``buffered_request_bytes`` is over the cap."""
     var reset_by_us: List[Int]
     """Streams we sent RST_STREAM on, most recent last, bounded. DATA the
-    peer had in flight for them is dropped quietly; it used to be a
-    connection-level STREAM_CLOSED that tore down every other stream."""
+    peer had in flight for them is dropped quietly, so it does not
+    become a connection-level STREAM_CLOSED that tears down every other
+    stream."""
     var header_block_refuse: Int
     """Non-zero: the open block belongs to a stream being refused, with
     this RST_STREAM error code. The block is still decoded when it
@@ -510,7 +511,7 @@ struct Connection(Copyable, Defaultable):
 
         # SETTINGS_HEADER_TABLE_SIZE = 0x1 — only when != RFC 7541 default.
         # The advertised value, not the decoder's current size: the
-        # latter stays at 4096 until the peer's size update (HPACK-03).
+        # latter stays at 4096 until the peer's size update.
         if self.hpack_decoder.settings_max_size != 4096:
             self._append_setting(p, 0x1, self.hpack_decoder.settings_max_size)
 
@@ -591,13 +592,13 @@ struct Connection(Copyable, Defaultable):
         id. Client role:
         ``last_peer_stream_id`` stays 0, so use the highest id this client
         opened; an even id is server-initiated and, with push disabled, is
-        never opened (H2-03).
+        never opened.
         """
         if self.is_client:
             return sid > self.max_local_stream_id or (sid % 2) == 0
         # Server role: a client opens only odd ids (sec 5.1.1) and the
         # server opens none (push is disabled), so every even id is idle
-        # whatever the highest request id is (H2-15).
+        # whatever the highest request id is.
         return sid > self.last_peer_stream_id or (sid % 2) == 0
 
     def _prune_threshold(self) -> Int:
@@ -682,7 +683,7 @@ struct Connection(Copyable, Defaultable):
 
         Every connection-level credit this endpoint grants goes through
         here, so ``recv_window`` always equals the window the peer is
-        entitled to (RFC 9113 sec 6.9.1). H2-01.
+        entitled to (RFC 9113 sec 6.9.1).
         """
         self.recv_window += credit
         return Self._window_update_frame(0, credit)
@@ -804,10 +805,10 @@ struct Connection(Copyable, Defaultable):
 
         RFC 9110 sec 8.6: ``Content-Length = 1*DIGIT``; a recipient MUST
         prevent integer-conversion overflow, and a message whose
-        content-length fields differ is malformed. The value used to be
-        folded into a wrapping 64-bit ``Int`` (2^64 + 5 read as 5) from the
-        first field only, so dodo's view of the body length could differ
-        from an intermediary's (H2-05).
+        content-length fields differ is malformed. Folding the value into
+        a wrapping 64-bit ``Int`` (2^64 + 5 read as 5), or reading only the
+        first field, would let dodo's view of the body length differ from
+        an intermediary's.
         """
         var declared = -1
         for i in range(len(hdrs)):
@@ -1163,7 +1164,7 @@ struct Connection(Copyable, Defaultable):
             ) & 0x7FFFFFFF
             if dep == sid:
                 # sec 5.1: RST_STREAM must not be sent on an idle stream,
-                # so there the only report is a connection error (H2-16).
+                # so there the only report is a connection error.
                 if sid not in self.streams and self._idle_id(sid):
                     return self._conn_error(
                         Http2ErrorCode.PROTOCOL_ERROR().value
@@ -1308,7 +1309,7 @@ struct Connection(Copyable, Defaultable):
                     return self._conn_error(
                         Http2ErrorCode.PROTOCOL_ERROR().value
                     )
-                # sec 5.1: no RST_STREAM on an idle stream (H2-16).
+                # sec 5.1: no RST_STREAM on an idle stream.
                 if sid not in self.streams and self._idle_id(sid):
                     return self._conn_error(
                         Http2ErrorCode.PROTOCOL_ERROR().value
@@ -1448,7 +1449,7 @@ struct Connection(Copyable, Defaultable):
             # frame is then processed. Until this check existed the
             # connection window was never enforced, so the 64 MiB
             # buffered-request cap below only stopped a peer that chose to
-            # obey the credit it withheld (H2-01).
+            # obey the credit it withheld.
             if plen > self.recv_window:
                 return self._conn_error(
                     Http2ErrorCode.FLOW_CONTROL_ERROR().value
@@ -1479,7 +1480,7 @@ struct Connection(Copyable, Defaultable):
                 # allowed to arrive on it. Tested before the "no response
                 # head yet" case below: a stream the server reset before
                 # answering is closed, so its DATA is STREAM_CLOSED, not
-                # PROTOCOL_ERROR (RFC 9113 sec 5.1, H2-20).
+                # PROTOCOL_ERROR (RFC 9113 sec 5.1).
                 self._put_stream(s^)
                 return self._conn_error(Http2ErrorCode.STREAM_CLOSED().value)
             if self.is_client and not s.headers_complete:
@@ -1487,7 +1488,7 @@ struct Connection(Copyable, Defaultable):
                 # is malformed, and a malformed response is a stream error
                 # (sec 5.4.2), so one bad stream cannot take its siblings
                 # down. Reset it, and return the frame's connection credit
-                # as the 204-body branch below does (DOC-03).
+                # as the 204-body branch below does.
                 out.append(
                     self._rst_stream_frame(
                         sid, Http2ErrorCode.PROTOCOL_ERROR().value
@@ -1519,7 +1520,7 @@ struct Connection(Copyable, Defaultable):
                 self._put_stream(s^)
                 # The discarded DATA still counted against the connection
                 # window (RFC 9113 sec 6.9): give its credit back or the
-                # peer's window shrinks for good (H2-09).
+                # peer's window shrinks for good.
                 if len(f.payload) > 0:
                     out.append(self._conn_window_update(len(f.payload)))
                 return out^
@@ -1608,7 +1609,7 @@ struct Connection(Copyable, Defaultable):
                     )
                     s.state = StreamState.CLOSED()
                     self._put_stream(s^)
-                    # Credit for the discarded DATA goes back too (H2-09).
+                    # Credit for the discarded DATA goes back too.
                     if len(f.payload) > 0:
                         out.append(self._conn_window_update(len(f.payload)))
                     return out^
@@ -1625,7 +1626,7 @@ struct Connection(Copyable, Defaultable):
             # sec 5.1: nothing but PRIORITY may be sent on a closed
             # stream, and the credit of a stream this frame just closed
             # is useless to the peer, so no stream-level WINDOW_UPDATE
-            # for it (H2-19). The connection-level one below still goes.
+            # for it. The connection-level one below still goes.
             var stream_closed = s.state.value == StreamState.CLOSED().value
             self._put_stream(s^)
             # Connection credit lets unrelated streams progress; each
@@ -1803,7 +1804,7 @@ struct Connection(Copyable, Defaultable):
         Carries ``:status`` + real headers with END_HEADERS but never
         END_STREAM -- DATA frames (and possibly trailing HEADERS) follow
         on later writable edges. Companion to :meth:`make_response` for
-        the h2 server-streaming path (K1).
+        the h2 server-streaming path.
         """
         var hh = List[HpackHeader]()
         hh.append(HpackHeader(":status", String(status)))
@@ -1869,7 +1870,7 @@ def validate_request_fields(
         # name or value may hold NUL, CR or LF; a name holds no
         # whitespace, controls or octets >= 0x7f, and no colon except as
         # the pseudo-header prefix (a name like ``a:b`` is a header
-        # injection once re-serialised as HTTP/1.1; H2-10). A value has no
+        # injection once re-serialised as HTTP/1.1). A value has no
         # leading or trailing whitespace. CR / LF in a value used to reach
         # take_request, where HeaderMap raised and took the whole
         # connection down.

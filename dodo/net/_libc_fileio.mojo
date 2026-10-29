@@ -20,8 +20,7 @@ Two call shapes are provided:
 
 * ``DodoRawIO`` - a cached handle + function-pointer struct. Owners (like
   ``Reactor``) construct one at init time and call ``io.read() / io.write()``
-  on the hot path. No dlopen/dlsym per call. Pattern lifted straight from
-  ``ehsanmok/json``'s ``SimdjsonFFI``.
+  on the hot path. No dlopen/dlsym per call.
 * ``_read_fd`` / ``_write_fd`` - thin module-level helpers that open the
   library per call. Convenient for one-off use from tests and non-hot-path
   call sites; do **not** use in anything that runs per-request or per-wakeup.
@@ -76,9 +75,7 @@ struct DodoRawIO(Movable):
 
     Construct once per owner (typically a ``Reactor``), then call
     ``read()`` / ``write()`` on the hot path without paying a dlopen
-    cost per syscall. See the module comment above for the full
-    rationale and the ``ehsanmok/json`` ``SimdjsonFFI`` pattern we
-    inherit from.
+    cost per syscall. See the module comment above for the rationale.
     """
 
     var _lib: OwnedDLHandle

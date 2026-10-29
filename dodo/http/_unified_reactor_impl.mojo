@@ -121,7 +121,6 @@ from ._server_reactor_impl import (
     _conn_alloc_addr,
     _conn_free_addr,
     _conn_ptr_from_int,
-    _monotonic_ms,
     _poll_timeout_ms,
     _accept_errno_is_retry,
     _arm_accept_timer,
@@ -152,6 +151,7 @@ from ._reactor.tls_conn_handle import (
 )
 from ._reactor.tls_transport import TlsTransport
 from dodo.tls._server_ffi import ServerCtx
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 # ── Per-conn dispatch helpers ──────────────────────────────────────────────
@@ -791,7 +791,7 @@ def _accept_loop_unified_fd(
 
     ``max_connections`` (0 = unlimited) caps the per-worker live table
     and the errno decides the stop/skip action -- same admission
-    contract as the HTTP/1.1 ``_accept_loop_fd`` (D8).
+    contract as the HTTP/1.1 ``_accept_loop_fd``.
 
     When ``bal`` is enabled and this worker holds clearly more
     connections than the least-loaded peer, the new stream goes to that
@@ -891,7 +891,7 @@ def _unified_handle_conn_event[
         # the 101 has flushed. `_drive_h1_writable` applies the step
         # without migrating, so a 101 held back by a full send buffer
         # would leave the connection write-armed and re-announcing the
-        # upgrade on every poll (APP-47). With the handle in
+        # upgrade on every poll. With the handle in
         # STATE_WRITING, `on_readable` is a no-op that hands over to
         # `on_writable` inside `_drive_h1`.
         var h1_ptr = _conn_ptr_from_int(_addr(packed))
@@ -1354,7 +1354,7 @@ def _run_unified_loop_for_fd[
     and the dispatch is byte-for-byte what it was.
     """
     var reactor = Reactor()
-    var wheel = TimerWheel(now_ms=UInt64(_monotonic_ms()))
+    var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()
 
@@ -1404,7 +1404,7 @@ def _run_unified_loop_for_fd[
         if settle_deadline == 0 and load_stop_flag(stopping_addr):
             if offload_outstanding(offload_port) == 0:
                 break
-            settle_deadline = _monotonic_ms() + max(
+            settle_deadline = monotonic_now_ms() + max(
                 config.shutdown_timeout_ms, 0
             )
             _begin_offload_settle(
@@ -1417,7 +1417,7 @@ def _run_unified_loop_for_fd[
                 timers,
             )
         if settle_deadline != 0:
-            if _offload_settled(conns) or _monotonic_ms() >= settle_deadline:
+            if _offload_settled(conns) or monotonic_now_ms() >= settle_deadline:
                 break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         bal.publish(len(conns))
@@ -1439,7 +1439,7 @@ def _run_unified_loop_for_fd[
                 tls_ctx_addr,
             )
 
-        var now_ms = UInt64(_monotonic_ms())
+        var now_ms = UInt64(monotonic_now_ms())
         var fired_fds = List[Int]()
         var fired_ids = List[UInt64]()
         _collect_fired_timers(now_ms, wheel, timers, fired_fds, fired_ids)

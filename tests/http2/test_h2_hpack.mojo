@@ -387,7 +387,7 @@ def _literal_with_indexing(name: String, value: List[UInt8]) -> List[UInt8]:
 
 
 def test_invalid_utf8_value_keeps_the_table_in_step_with_the_peer() raises:
-    """HPACK-01: a legal value made of 0xFF octets must be stored byte for
+    """A legal value made of 0xFF octets must be stored byte for
     byte. Rebuilding it as lossy UTF-8 (each bad octet becomes U+FFFD, 3
     octets) made the entry bigger than the peer's, evicted entries the peer
     still indexes, and killed the connection on the next block (RFC 7541
@@ -427,7 +427,7 @@ def _literal_block(name: String, value_len: Int) -> List[UInt8]:
 
 
 def test_the_last_field_of_a_block_counts_against_the_budget() raises:
-    """HPACK-02: every decoded field is charged, the last one included. A
+    """Every decoded field is charged, the last one included. A
     one-field block of 133 octets used to pass a budget of 50, since a
     field was only charged when the next one was about to be decoded."""
     var dec = HpackDecoder()
@@ -437,7 +437,7 @@ def test_the_last_field_of_a_block_counts_against_the_budget() raises:
 
 
 def test_the_budget_is_inclusive_and_covers_the_whole_block() raises:
-    """HPACK-02: a block exactly at the budget decodes; one octet under
+    """A block exactly at the budget decodes; one octet under
     is refused, whether the overrun is the first, the last or the sum."""
     var block = _literal_block("x", 100)  # 133
     var dec = HpackDecoder()
@@ -456,7 +456,7 @@ def test_the_budget_is_inclusive_and_covers_the_whole_block() raises:
 
 
 def test_no_budget_means_unlimited() raises:
-    """HPACK-02: budget 0 (the default) keeps the old unbounded behaviour."""
+    """Budget 0 (the default) keeps the old unbounded behaviour."""
     var dec = HpackDecoder()
     var block = _literal_block("x", 100)
     assert_equal(len(dec.decode(Span[UInt8, _](block))), 1)

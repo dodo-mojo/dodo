@@ -220,7 +220,7 @@ def _rejected_as_too_long(host: String) -> Bool:
 
 
 def test_resolve_accepts_253_byte_name() raises:
-    """NET-08: a 253-byte name is the longest valid one and is not
+    """A 253-byte name is the longest valid one and is not
     rejected by validation."""
     var host = _max_name(False)
     assert_equal(host.byte_length(), 253)
@@ -228,7 +228,7 @@ def test_resolve_accepts_253_byte_name() raises:
 
 
 def test_resolve_accepts_253_byte_absolute_name() raises:
-    """NET-08: RFC 1035 bounds the wire form at 255 octets, i.e. 253 text
+    """RFC 1035 bounds the wire form at 255 octets, i.e. 253 text
     bytes *not counting* the trailing root dot, so the absolute spelling of
     a maximal name (254 bytes ending in ``.``) is valid."""
     var host = _max_name(True)
@@ -237,7 +237,7 @@ def test_resolve_accepts_253_byte_absolute_name() raises:
 
 
 def test_resolve_rejects_254_byte_name_without_root_dot() raises:
-    """NET-08 boundary: one byte more than the maximum is still too long,
+    """Boundary: one byte more than the maximum is still too long,
     with or without a trailing dot."""
     var host = _max_name(False)
     host = String("e") + host  # 254 bytes, no trailing dot
@@ -289,7 +289,7 @@ def _too_long_message(prefix: String) raises -> String:
 
 
 def test_too_long_message_does_not_split_a_two_byte_char() raises:
-    """NET-09: the message quotes the first 20 bytes of the host; with
+    """The message quotes the first 20 bytes of the host; with
     ``é`` (C3 A9) at bytes 19-20 that cut a character in half."""
     var msg = _too_long_message(String("a" * 19) + "é")
     assert_true("too long" in msg)

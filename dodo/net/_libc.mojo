@@ -465,9 +465,9 @@ def _os_error(op: String) -> String:
 def _socket(family: c_int, kind: c_int, protocol: c_int) -> c_int:
     """Wrapper around ``socket(2)``. The socket is close-on-exec.
 
-    Every dodo socket used to be inherited by any child the process
-    exec'd: listeners kept a port bound past a restart, and client
-    connections stayed open in a subprocess. On Linux the flag is
+    Without it, any child the process exec'd inherits every socket:
+    listeners keep a port bound past a restart, and client connections
+    stay open in a subprocess. On Linux the flag is
     set atomically with ``SOCK_CLOEXEC``, so a fork+exec on another
     thread cannot slip in between; macOS sets it right after.
 

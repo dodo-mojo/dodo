@@ -34,6 +34,7 @@ STANDALONE=(
   tests/http/test_uring_bufring_buffers.mojo
   tests/http/test_uring_bufring_partial.mojo
   tests/runtime/stress_scheduler.mojo
+  tests/json/test_loads_fallback.mojo
 )
 
 echo "── prerequisites ──"

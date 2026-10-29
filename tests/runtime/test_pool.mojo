@@ -6,7 +6,7 @@ of the library calls ``Pool[T].alloc_move`` / ``Pool[T].free`` and
 stays at the typed-``Int``-address layer.
 
 The "AddressSanitizer clean on a 24h soak" gate from design-0.5
-§1.2 is Linux-only and lands with the soak commit (S3.7); this
+§1.2 is Linux-only and lands with the soak commit; this
 test file covers the happy path + lifetime semantics that any
 allocator must get right.
 

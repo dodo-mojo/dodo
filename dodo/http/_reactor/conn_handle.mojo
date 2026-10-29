@@ -64,7 +64,7 @@ from dodo.http.server import (
 )
 from dodo.http._server.config import MIN_BODY_RATE_GRACE_MS
 from dodo.http._server.parse import parse_error_status
-from dodo.http._server.write import _status_reason
+from dodo.http.status_reason import status_reason
 from dodo.net import SocketAddr
 from dodo.net._libc import _recv, _send, _shutdown, MSG_NOSIGNAL, SHUT_WR
 from dodo.tcp import TcpStream
@@ -89,7 +89,6 @@ from .keepalive_scan import (
     _is_content_length,
     _is_date,
     _has_header_line,
-    _monotonic_ms,
     _wants_close,
 )
 from dodo.http.proto.chunked import (
@@ -115,6 +114,7 @@ from dodo.tls._server_ffi import (
     SSL_IO_WANT_READ,
     SSL_IO_WANT_WRITE,
 )
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 # ── Dispatch-config comptime tags ─────────────────────────────────────────────
@@ -345,7 +345,7 @@ struct ConnHandle(Movable):
     on this connection."""
 
     var body_src: Optional[ChunkSourceBox]
-    """Active streaming body source (K1), ``None`` for the buffered
+    """Active streaming body source, ``None`` for the buffered
     path. Set from ``Response.body_stream`` at response completion; the
     ``on_writable`` refill loop pulls a bounded batch of chunks per
     writable edge, frames them as ``Transfer-Encoding: chunked``, and
@@ -551,7 +551,7 @@ struct ConnHandle(Movable):
                 unsafe_memcpy(dest=dst, src=chunk, count=got_int)
                 # Compare without the sum: ``max_header_size +
                 # max_body_size`` wraps for an "unlimited" body cap such
-                # as ``Int.MAX`` (APP-06). ``len`` and ``max_header_size``
+                # as ``Int.MAX``. ``len`` and ``max_header_size``
                 # are non-negative, so the subtraction cannot overflow.
                 if (
                     len(self.read_buf) - config.max_header_size
@@ -747,13 +747,13 @@ struct ConnHandle(Movable):
         # the whole request, head and body, from its first byte.
         # An error queued while the request is still incomplete must know
         # whether it answers a HEAD (no content, RFC 9110 sec 9.3.2); the
-        # parsed ``req.method`` is not available yet (APP-05).
+        # parsed ``req.method`` is not available yet.
         self._note_head_from_buf()
         var timed = (
             config.request_timeout_ms > 0 or config.header_timeout_ms > 0
         )
         if len(self.read_buf) > 0 and timed:
-            var now = _monotonic_ms()
+            var now = monotonic_now_ms()
             if self.request_started_ms == 0:
                 self.request_started_ms = now
             else:
@@ -796,7 +796,7 @@ struct ConnHandle(Movable):
                 )
             self.headers_end = end
             if config.min_body_rate > 0:
-                self.body_started_ms = _monotonic_ms()
+                self.body_started_ms = monotonic_now_ms()
             var te = request_te_framing(
                 Span[UInt8, _](self.read_buf),
                 self.headers_end,
@@ -908,7 +908,7 @@ struct ConnHandle(Movable):
         into ``STATE_WRITING``.
         """
         self._consume_request()
-        # Streaming path (K1): a handler that returned a streaming
+        # Streaming path: a handler that returned a streaming
         # Response carries a chunk source. Take it onto the connection,
         # emit chunked-framed headers, and let ``on_writable`` pull the
         # body chunk-by-chunk. The buffered path is unchanged.
@@ -2080,7 +2080,7 @@ struct ConnHandle(Movable):
         """While the request head has not been fully scanned
         (``headers_end < 0``) the method is read off the buffered request
         line, so an error queued now (431 / 408 / 413 ...) is answered
-        without content when it replies to a HEAD (APP-05). Once the head
+        without content when it replies to a HEAD. Once the head
         is scanned the flag is left alone: after dispatch ``read_buf`` may
         already start with the next pipelined request."""
         if self.headers_end < 0:
@@ -2091,7 +2091,7 @@ struct ConnHandle(Movable):
         period at less than ``config.min_body_rate`` bytes a second."""
         if config.min_body_rate <= 0 or self.body_started_ms == 0:
             return False
-        var elapsed = _monotonic_ms() - self.body_started_ms
+        var elapsed = monotonic_now_ms() - self.body_started_ms
         if elapsed <= MIN_BODY_RATE_GRACE_MS:
             return False
         var received = len(self.read_buf) - self.headers_end
@@ -2101,13 +2101,13 @@ struct ConnHandle(Movable):
         """Answer a request the parser refused, with the status its
         message names (400 unless it is a 413, 414, 417, 431, 501 or 505)."""
         var status = parse_error_status(message)
-        self._queue_error(status, _status_reason(status))
+        self._queue_error(status, status_reason(status))
 
     def _queue_error(mut self, status: Int, reason: String) -> None:
         """Build a minimal error response into ``write_buf`` and mark close.
 
         The response is serialised with ``self.head_request`` so an error
-        answering a HEAD request carries no content (APP-05)."""
+        answering a HEAD request carries no content."""
         self.should_close = True
         # A client that timed out is slow by definition; lingering would
         # only let it hold the connection longer.
@@ -2125,7 +2125,7 @@ struct ConnHandle(Movable):
         _ = _shutdown(self.fd(), SHUT_WR)
         self.state = STATE_LINGERING
         self.read_buf.clear()
-        self.linger_started_ms = _monotonic_ms()
+        self.linger_started_ms = monotonic_now_ms()
         return StepResult(
             want_read=True,
             want_write=False,
@@ -2149,7 +2149,7 @@ struct ConnHandle(Movable):
             if e == ErrNo.EAGAIN or e == ErrNo.EWOULDBLOCK:
                 break
             return StepResult(done=True)
-        if _monotonic_ms() - self.linger_started_ms > LINGER_TOTAL_MS:
+        if monotonic_now_ms() - self.linger_started_ms > LINGER_TOTAL_MS:
             return StepResult(done=True)
         return StepResult(
             want_read=True,

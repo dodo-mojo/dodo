@@ -8,9 +8,8 @@ Drives the C-side ``dodo_ssl_ctx_new_server`` /
 ``dodo_ssl_get_sni_host`` / ``dodo_ssl_free`` directly through
 the Mojo bindings in ``dodo/tls/_server_ffi.mojo``.
 
-The wire-level handshake test (TlsStream.connect against a
-TlsAcceptor) lands in C7 alongside the reactor state machine.
-This file exercises:
+The wire-level handshake is covered by
+``test_tls_handshake_live.mojo``. This file exercises:
 
 - ``ServerCtx.new`` succeeds with a real cert / key pair (the
   bench-tls-setup self-signed cert at ``build/test-certs/``).

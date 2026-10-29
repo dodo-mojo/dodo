@@ -4,7 +4,7 @@ Both streams implement ``write_all`` as "call ``send(2)`` until every byte is
 out". The loop lives here, generic over a one-shot writer, so that it can be
 unit-tested against a writer that returns results ``send(2)`` never returns
 for a blocking stream socket on Linux or macOS (notably ``0`` for a non-empty
-buffer, which POSIX permits). See ``formal/Dodo/Bugs/NET_02.lean``.
+buffer, which POSIX permits).
 """
 
 from .error import NetworkError

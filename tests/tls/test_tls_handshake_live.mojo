@@ -1,6 +1,6 @@
 """Live-handshake tests for TlsAcceptor.
 
-C7 wired ``TlsAcceptor`` through to the C6 FFI:
+``TlsAcceptor`` drives the OpenSSL FFI:
 ``handshake_fd`` returns a live-populated ``TlsInfo`` (with the
 negotiated ALPN protocol + SNI hostname), ``reload`` swaps the
 cert atomically, and ``require_client_cert`` triggers the FFI's
@@ -63,12 +63,10 @@ comptime _KEY: String = "build/test-certs/server.key"
 
 
 def test_acceptor_with_alpn_constructs_clean() raises:
-    """C7 wired the constructor to call
-    ``ServerCtx.set_alpn(wire_format_protos)`` when
-    ``config.alpn`` is non-empty. This test pins the
-    no-crash contract; the wire-level "ALPN actually
-    negotiated to h2" test requires a fork+exec client which is
-    deferred to the reactor follow-up's test plan.
+    """The constructor calls ``ServerCtx.set_alpn(wire_format_protos)``
+    when ``config.alpn`` is non-empty. This pins the no-crash contract;
+    ALPN negotiating h2 on the wire is covered by the HTTPS reactor
+    tests.
     """
     var alpn = List[String]()
     alpn.append("h2")
@@ -88,24 +86,6 @@ def test_acceptor_alpn_empty_skips_set_alpn_call() raises:
     var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
     var acc = TlsAcceptor(cfg^)
     assert_equal(len(acc.config.alpn), 0)
-
-
-def test_tls_info_default_fields_for_pre_handshake() raises:
-    """Per the C7 contract, ``acceptor.info_placeholder()``
-    returns a default ``TlsInfo`` with empty strings — used by
-    code paths that need a TlsInfo before the handshake fires
-    (the live ``handshake_fd`` path returns a populated value;
-    ``info_placeholder`` is the default-constructed source for
-    fallback semantics).
-    """
-    var cfg = TlsServerConfig(cert_file=_CERT, key_file=_KEY)
-    var acc = TlsAcceptor(cfg^)
-    var info = acc.info_placeholder()
-    assert_equal(info.protocol, "")
-    assert_equal(info.cipher, "")
-    assert_equal(info.sni_host, "")
-    assert_equal(info.alpn_protocol, "")
-    assert_equal(info.client_cert_subject, "")
 
 
 # ── Cert reload ──────────────────────────────────────────────
@@ -137,7 +117,7 @@ def test_reload_repeated_safe() raises:
 
 
 def test_acceptor_mtls_constructs_with_self_signed_ca() raises:
-    """C7 wires ``require_client_cert=True`` +
+    """The constructor wires ``require_client_cert=True`` +
     ``client_ca_bundle`` through to
     ``ServerCtx.set_verify_client_cert(ca_path)``. The CA
     bundle here is the same self-signed cert (it's its own CA);
@@ -157,8 +137,7 @@ def test_acceptor_mtls_constructs_with_self_signed_ca() raises:
 def test_acceptor_mtls_misconfig_rejected() raises:
     """``require_client_cert=True`` without ``client_ca_bundle``
     is the misconfiguration TlsServerConfig.__init__ rejects
-    (S3.4 / pre-existing). Re-pinned here to confirm C7 didn't
-    regress the validation order — the config check must fire
+    The config check must fire
     BEFORE the ``ServerCtx.new`` FFI call in the acceptor
     constructor."""
     from std.testing import assert_raises
@@ -192,8 +171,8 @@ def test_acceptor_mtls_with_bad_ca_path_raises() raises:
 def main() raises:
     print("=" * 60)
     print(
-        "test_tls_handshake_live.mojo — C8-C10 contract (TlsInfo /"
-        " ALPN / cert reload / mTLS)"
+        "test_tls_handshake_live.mojo — TlsInfo, ALPN, cert reload,"
+        " mTLS"
     )
     print("=" * 60)
     print()

@@ -7,27 +7,16 @@ chain. ``TlsServerConfig`` carries the acceptor's policy: cert /
 key paths, ALPN protocols to advertise, optional CA bundle for
 mTLS client-cert verification.
 
-This commit ships the **type infrastructure**: ``TlsServerConfig``,
-``TlsAcceptor`` shell, ``TlsInfo`` value type, ``TlsServerError``
-hierarchy, plus the public re-exports through ``dodo.tls`` and
-the root ``dodo`` package. The reactor-side handshake state
-machine — non-blocking ``SSL_accept`` driven by edge-triggered
-readable / writable events — is a focused follow-up that lands
-once the OpenSSL ``SSL_CTX_*`` server-side surface is wired into
-the existing ``dodo/tls/ffi/openssl_wrapper.cpp``.
-
-Why split: the C-side handshake state machine is ~150 lines of
-``SSL_accept`` + ``SSL_get_error`` + ``BIO`` plumbing, plus
-matching reactor surgery. The API surface here lets per-request
-``TlsInfo`` plumbing, cert reload, and mTLS all plug into the
-public surface; the actual cipher-on-the-wire bits land
-together in a single follow-up.
+The HTTPS server builds its ``SSL_CTX`` here (``into_ctx``) and runs
+each handshake without blocking inside the reactor
+(``dodo/http/_reactor/tls_conn_handle.mojo``). ``handshake_fd`` is a
+blocking handshake for one fd, used by tests and simple tools.
 
 Public API:
 
     from dodo.tls import (
         TlsServerConfig, TlsAcceptor, TlsInfo,
-        TlsServerError, TlsServerNotImplemented,
+        TlsServerError,
     )
 
     var cfg = TlsServerConfig(
@@ -37,9 +26,8 @@ Public API:
         require_client_cert=False, # mTLS off by default
         client_ca_bundle="",
     )
-    var acceptor = TlsAcceptor.bind(addr, cfg)
-    # acceptor.serve(handler) — flips on with the reactor
-    # follow-up that lands the SSL_accept state machine.
+    var acceptor = TlsAcceptor(cfg^)
+    var ssl_and_info = acceptor.handshake_fd(fd)
 """
 
 from std.format import Writable, Writer
@@ -108,25 +96,6 @@ struct TlsServerError(Copyable, Writable):
             String(self.code),
             ")",
         )
-
-
-struct TlsServerNotImplemented(Copyable, Writable):
-    """Marker raised to signal that the reactor-side handshake
-    state machine is not available. Distinct type so callers can
-    match on it for graceful degradation and fall back to the
-    blocking ``handshake_fd`` path.
-    """
-
-    var message: String
-
-    def __init__(out self):
-        self.message = (
-            "TlsAcceptor reactor-side SSL_accept state machine is"
-            " not available; use the blocking handshake_fd path."
-        )
-
-    def write_to[W: Writer](self, mut writer: W):
-        writer.write(self.message)
 
 
 # ── TlsServerConfig ────────────────────────────────────────────────────────
@@ -317,20 +286,17 @@ struct TlsAcceptor(Movable):
     """Server-side TLS acceptor.
 
     Wraps a ``TlsServerConfig`` and a real ``ServerCtx`` (the
-    OpenSSL ``SSL_CTX*`` produced by C6's FFI). Constructor
+    OpenSSL ``SSL_CTX*``). The constructor
     validates the cert + key + ALPN + mTLS config and raises if
     any are bad, so configuration errors fail at server-bind
     time rather than at the first inbound handshake.
 
     Per-connection use:
 
-    1. After ``listener.accept()`` returns a ``TcpStream``, call
-       ``acceptor.handshake(stream) raises -> Tuple[TlsStream,
-       TlsInfo]``. The method drives ``SSL_accept`` to completion
-       in blocking mode (suitable for the existing ``serve``
-       entry shape; the reactor-side ``STATE_TLS_HANDSHAKE``
-       state machine that uses the same FFI but in a non-blocking
-       reactor loop is a focused follow-up).
+    1. The HTTPS server takes the context with ``into_ctx`` and
+       handshakes inside the reactor without blocking.
+    2. ``handshake_fd(fd)`` drives ``SSL_accept`` to completion in
+       blocking mode, for tests and simple tools.
 
     Cert reload:
 
@@ -461,8 +427,7 @@ struct TlsAcceptor(Movable):
         # Deadline is measured against a monotonic clock (not an
         # iteration count) so a slow/stalled client cannot hold the
         # worker past ``handshake_timeout_ms``, however long each
-        # SSL_accept call blocks. The reactor follow-up replaces this
-        # with poll-driven WANT_*-aware state transitions.
+        # SSL_accept call blocks.
         var timeout_ms = self.config.handshake_timeout_ms
         # Bound a blocking SSL_accept read/write so a stalled client
         # cannot pin the worker inside the syscall past the deadline.
@@ -490,10 +455,3 @@ struct TlsAcceptor(Movable):
         var info = TlsInfo(alpn_protocol=alpn, sni_host=sni)
         return (ssl_addr, info^)
 
-    def info_placeholder(self) -> TlsInfo:
-        """Return a default ``TlsInfo`` value with empty strings
-        in every field. Kept for API-surface compatibility;
-        production callers go through ``handshake_fd`` which
-        returns a live-populated TlsInfo.
-        """
-        return TlsInfo()

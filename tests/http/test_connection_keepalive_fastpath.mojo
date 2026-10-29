@@ -160,7 +160,7 @@ def test_compute_unusual_value_http11_keeps_open() raises:
     assert_true(_compute_close_after(h10, String("HTTP/1.0")))
 
 
-# ── Connection option lists (APP-03) ────────────────────────────────────
+# ── Connection option lists ────────────────────────────────────
 
 
 def _close_after(value: String, version: String) raises -> Bool:
@@ -170,7 +170,7 @@ def _close_after(value: String, version: String) raises -> Bool:
 
 
 def test_compute_close_after_close_inside_option_list() raises:
-    """APP-03: a ``close`` option inside a list closes the connection."""
+    """A ``close`` option inside a list closes the connection."""
     assert_true(_close_after("keep-alive, close", "HTTP/1.1"))
     assert_true(_close_after("TE, close", "HTTP/1.1"))
     assert_true(_close_after("upgrade,CLOSE", "HTTP/1.1"))
@@ -179,7 +179,7 @@ def test_compute_close_after_close_inside_option_list() raises:
 
 
 def test_compute_close_after_option_list_without_close() raises:
-    """APP-03: lists without ``close`` keep HTTP/1.1 open; HTTP/1.0 stays
+    """Lists without ``close`` keep HTTP/1.1 open; HTTP/1.0 stays
     open only with a ``keep-alive`` option."""
     assert_false(_close_after("TE, upgrade", "HTTP/1.1"))
     assert_false(_close_after("Keep-Alive, TE", "HTTP/1.1"))
@@ -190,7 +190,7 @@ def test_compute_close_after_option_list_without_close() raises:
 
 
 def test_wants_close_option_list() raises:
-    """APP-03: ``_wants_close`` reads the option list too."""
+    """``_wants_close`` reads the option list too."""
     assert_true(
         _wants_close_of(
             "GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n"
@@ -219,7 +219,7 @@ def _wants_close_of(raw: String) -> Bool:
 
 
 def test_wants_close_after_x_connection_header() raises:
-    """APP-02: ``X-Connection:`` must not hide a later real
+    """``X-Connection:`` must not hide a later real
     ``Connection: close`` line."""
     assert_true(
         _wants_close_of(
@@ -236,7 +236,7 @@ def test_wants_close_after_x_connection_header() raises:
 
 
 def test_wants_close_ignores_connection_inside_other_header_names() raises:
-    """APP-02: ``connection:`` is only a header when it starts a line, so
+    """``connection:`` is only a header when it starts a line, so
     ``X-Connection: close`` does not close an HTTP/1.1 connection."""
     assert_false(
         _wants_close_of(
@@ -251,7 +251,7 @@ def test_wants_close_ignores_connection_inside_other_header_names() raises:
 
 
 def test_wants_close_ors_every_connection_line() raises:
-    """APP-02: the verdicts of all ``Connection`` lines are combined, not
+    """The verdicts of all ``Connection`` lines are combined, not
     just the first one."""
     assert_true(
         _wants_close_of(

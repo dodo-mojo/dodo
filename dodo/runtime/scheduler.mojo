@@ -33,7 +33,7 @@ is also registered in a worker's ``epoll`` instance is kept alive by
 the kernel, so ``close()`` from another thread triggers no ``EPOLLHUP``
 and the workers stay blocked in ``epoll_wait`` until the 100 ms poll
 timeout fires; and closing it early let a worker that polled a batch
-before it saw the flag ``accept`` on a reused number (CONC-05). The
+before it saw the flag ``accept`` on a reused number. The
 heap flag is what breaks the loop.
 
 This module is :trait:`Frontend`-generic: every worker calls
@@ -155,7 +155,7 @@ def _scheduler_free_raw(raw: _OpaquePtr):
     libc ``malloc``/``free`` via FFI: ``external_call["free", ...]``
     conflicts with the stdlib's own ``free`` declaration at MLIR
     legalization time when this module is pulled into a fuzz-environment
-    compile (mozz harness), which previously blocked the
+    compile (mozz harness), which would stop the
     ``fuzz-scheduler-shutdown`` harness from importing
     ``dodo.runtime.scheduler`` at all.
     """
@@ -605,7 +605,7 @@ struct Scheduler[F: Frontend](Movable):
 
         # Per-worker listeners are bound serially on this thread before
         # any pthread spawns: N pthreads each calling bind_reuseport at
-        # once caused the multi-worker bufring crash on commit 88ea2f7.
+        # crashes the multi-worker bufring loop.
         # A failed bind raises rather than leaving a worker without a
         # listener.
         if prebind_per_worker:
@@ -699,7 +699,7 @@ struct Scheduler[F: Frontend](Movable):
                 s._balance_addr = 0
                 # The pre-bound per-worker listeners (default mode) were
                 # never freed here, so a failed start left every one of
-                # them open and bound (CONC-06). All workers joined.
+                # them open and bound. All workers joined.
                 s._free_per_worker_listeners()
                 # All workers joined, so no one is reading the
                 # shared listener anymore -- destroy + free it
@@ -748,7 +748,7 @@ struct Scheduler[F: Frontend](Movable):
         (or let a worker still starting up register a reused number).
         ``_free_resources`` closes it once, after every worker joined;
         the stop flag, polled at least every 100 ms, is what ends the
-        loops (CONC-05).
+        loops.
         """
         if self._stopping_addr != 0:
             store_stop_flag(self._stopping_addr, True)
@@ -980,7 +980,7 @@ struct Scheduler[F: Frontend](Movable):
             # gets freed. Primary i is entry i; worker i's extras follow
             # all the primaries, at n + i * n_extra + j. Clearing the
             # whole list leaked every joined worker's SO_REUSEPORT
-            # listener (CONC-04).
+            # listener.
             var n_lis = len(self._per_worker_listener_addrs)
             var n_extra = 0
             if n > 0 and n_lis > n:
@@ -996,7 +996,7 @@ struct Scheduler[F: Frontend](Movable):
             self._per_worker_listener_addrs = kept^
             # The shared listener (opt-out shape) is held by every worker
             # by its bare fd number, so it is leaked with the detached
-            # worker too rather than closed under it (CONC-05).
+            # worker too rather than closed under it.
             self._shared_listener_addr = 0
             self._shared_listener_fd = -1
             # The detached worker re-reads the shared stop flag on every

@@ -1,4 +1,4 @@
-"""The standalone WebSocket server checks the whole opening handshake (WS-05).
+"""The standalone WebSocket server checks the whole opening handshake.
 
 RFC 6455 sec 4.2.1: the request is a ``GET`` over HTTP/1.1 with an
 ``Upgrade`` field containing ``websocket``, a ``Connection`` field with the
@@ -9,7 +9,7 @@ version the server speaks. Only the Upgrade value and a non-empty key used
 to be checked, with ``Connection`` matched as a substring.
 
 The reactor applies the same rule through ``_ws_handshake_problem``
-(WS-07, tests/http/test_server_ws_upgrade.mojo).
+(tests/http/test_server_ws_upgrade.mojo).
 """
 
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
@@ -153,7 +153,7 @@ def test_version_must_be_13() raises:
 
 
 def test_shared_rule_is_a_pure_function_of_the_fields() raises:
-    """The reactor calls this with ``HeaderMap`` values (WS-07)."""
+    """The reactor calls this with ``HeaderMap`` values."""
     var up = List[String]()
     up.append("websocket")
     var cn = List[String]()

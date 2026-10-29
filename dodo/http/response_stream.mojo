@@ -1,4 +1,4 @@
-"""Streaming-response plumbing for the normal Handler path (K1).
+"""Streaming-response plumbing for the normal Handler path.
 
 The reactor serves a buffered ``Response`` by serialising its whole
 ``body`` up front. To stream an open-ended body (SSE, a log tail, a
@@ -7,20 +7,16 @@ large download, incremental gRPC) through the *same*
 type-erased chunk source that the reactor pulls in bounded batches per
 writable edge and frames as ``Transfer-Encoding: chunked``.
 
-This module is the source-side foundation, deliberately free of any
-reactor coupling so it can land and be tested on its own:
+This module is the source side, free of any reactor coupling so it
+can be tested on its own:
 
 - ``ChunkSourceBox``: a move-only, type-erased box over any
   :trait:`dodo.http.body.ChunkSource`. It heap-allocates the concrete
   source via ``Pool[S]`` and captures monomorphised ``next`` / destroy
-  thunks, so ``Response`` (and later the reactor's ``ConnHandle``) can
+  thunks, so ``Response`` and the reactor's ``ConnHandle`` can
   hold and drive a source without being generic over its type.
 - Chunked-framing helpers (``frame_chunk_into`` / ``frame_terminator_into``)
   that emit RFC 9112 sec 7.1 chunk framing into a reused buffer.
-
-The reactor adoption (a ``ChunkSourceBox`` field on ``Response`` +
-``ConnHandle``, and the per-writable-edge pull loop) lands as the
-follow-up; the box + framing here are what it builds on.
 
 **writev verdict: not adopted.** ``frame_chunk_into`` copies each
 payload into the connection's ``write_buf`` so one ``send(2)`` covers a

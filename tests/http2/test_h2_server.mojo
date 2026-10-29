@@ -425,7 +425,7 @@ def _small_table_server() raises -> Http2Connection:
 
 
 def test_reduced_table_size_applies_only_after_the_peers_size_update() raises:
-    """HPACK-03: we advertise SETTINGS_HEADER_TABLE_SIZE = 0, but the peer's
+    """We advertise SETTINGS_HEADER_TABLE_SIZE = 0, but the peer's
     encoder keeps its 4096-octet table until it has seen the SETTINGS and
     sent a size update (RFC 7541 sec 4.2). Shrinking our decoder at
     construction discarded the first insert, so the peer's next index was
@@ -493,7 +493,7 @@ def _first_frame_verdict(ty: FrameType, flags: UInt8, n: Int) raises -> Int:
 
 
 def test_first_frame_after_the_preface_must_be_settings() raises:
-    """H2-08: the client preface "MUST be followed by a SETTINGS frame"
+    """The client preface "MUST be followed by a SETTINGS frame"
     (RFC 9113 sec 3.4). Any other first frame, a PING, a SETTINGS ACK or a
     WINDOW_UPDATE, is GOAWAY(PROTOCOL_ERROR), and nothing is answered
     before it (no PING ACK)."""
@@ -518,7 +518,7 @@ def test_first_frame_after_the_preface_must_be_settings() raises:
 
 
 def test_settings_first_then_other_frames_are_served() raises:
-    """H2-08: an (empty) SETTINGS first, then PING, is fine; and so is a
+    """An (empty) SETTINGS first, then PING, is fine; and so is a
     SETTINGS with content."""
     var c = Http2Connection()
     c.feed(Span[UInt8, _](_raw_preface()))

@@ -193,7 +193,7 @@ struct Reactor(Movable):
     array ``poll`` fills each call. Grown once to fit ``max_events``
     and reused for the lifetime of the reactor so the hot poll path
     stops heap-allocating (and freeing) an event array on every
-    iteration (D10)."""
+    iteration."""
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -767,10 +767,10 @@ struct Reactor(Movable):
         if rc < c_int(0):
             raise _os_error("kevent install")
         # With EV_RECEIPT every change comes back as one EV_ERROR entry
-        # whose data is its errno. They used to be read without it, and
-        # the result was dropped even when a change failed: a failed
-        # EV_ADD left the fd registered in _registered but never
-        # reported by poll, so its connection stalled silently. ENOENT
+        # whose data is its errno, and every one is checked: a failed
+        # EV_ADD that went unnoticed would leave the fd in _registered
+        # but never reported by poll, so its connection would stall
+        # silently. ENOENT
         # on a DELETE only means that filter was not there.
         for i in range(Int(rc)):
             var entry = out.unsafe_offset((i * KEVENT_SIZE))

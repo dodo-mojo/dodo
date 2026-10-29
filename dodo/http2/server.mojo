@@ -215,7 +215,7 @@ struct Http2Connection(Defaultable, Movable):
         # (RFC 7541 sec 6.3). The decoder's *current* size stays at the
         # 4096 default: the peer's encoder keeps that table until it has
         # received our SETTINGS and sent a size update (sec 4.2), so
-        # shrinking now would drop entries it still indexes (HPACK-03).
+        # shrinking now would drop entries it still indexes.
         out.conn.hpack_decoder.settings_max_size = out.config.header_table_size
         out.conn.hpack_decoder.allow_huffman = out.config.allow_huffman_decode
         out.conn.hpack_encoder.allow_huffman = out.config.allow_huffman_encode

@@ -1,5 +1,5 @@
 """Sanitised error responses are logged with the full message and the
-request id (DOC-04; ``docs/security.md``, ``docs/features.md``).
+request id (``docs/security.md``, ``docs/features.md``).
 
 A handler that raises, or an extractor that fails, gets a fixed-reason
 response; the message goes to the log together with the inbound

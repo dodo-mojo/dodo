@@ -219,7 +219,7 @@ def test_writev_buf_all_zeroes_consumed_cells() raises:
 
 
 def test_writev_buf_all_raises_when_writev_makes_no_progress() raises:
-    """RT-02: ``writev`` returning 0 while bytes are still owed must not
+    """``writev`` returning 0 while bytes are still owed must not
     be reported as success. No kernel returns 0 for a non-empty iovec on a
     socket, but libc does return 0 when every cell has length 0, which
     reaches the same ``sent == 0`` branch deterministically: here the
@@ -248,7 +248,7 @@ def test_writev_buf_all_raises_when_writev_makes_no_progress() raises:
 
 
 def test_writev_buf_all_raises_when_total_exceeds_cells() raises:
-    """RT-02: ``total_bytes`` larger than the bytes in the cells makes the
+    """``total_bytes`` larger than the bytes in the cells makes the
     loop run out of data: after the real bytes are written, ``writev`` of
     the zeroed cells returns 0 and the call must raise, not claim the
     missing bytes were sent."""

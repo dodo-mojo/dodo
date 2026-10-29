@@ -5,9 +5,8 @@ syscall FFI + ``IoUringRing`` setup/teardown). This module adds
 the **submission queue entry** + **completion queue entry** byte-
 level codec, plus the small set of prep helpers (``prep_nop``,
 ``prep_accept``, ``prep_recv``, ``prep_send``, ``prep_writev``,
-``prep_close``, ``prep_async_cancel``) that the upcoming
-``UringReactor`` (next commit) will call to fill SQE slots before
-``io_uring_enter`` is invoked.
+``prep_close``, ``prep_async_cancel``) that ``UringReactor`` calls
+to fill SQE slots before ``io_uring_enter`` is invoked.
 
 What this module provides
 -------------------------
@@ -192,8 +191,8 @@ struct IoUringSqe(Movable):
 
     The wrapper owns its 64-byte buffer (allocated on heap on
     construction, freed on drop). The :meth:`as_bytes` accessor
-    exposes the raw pointer so the upcoming SQ-ring writer can
-    ``memcpy`` it into the kernel's mmapped SQ array slot.
+    exposes the raw pointer so an SQ-ring writer can ``memcpy`` it
+    into the kernel's mmapped SQ array slot.
 
     For SQEs constructed directly inside the kernel-mmapped SQ
     region (the steady-state hot path), see :func:`encode_sqe_at`,
@@ -676,11 +675,8 @@ def prep_poll_add(
     ``IORING_OP_ASYNC_CANCEL`` (matched on the same ``user_data``
     tag).
 
-    This is the substrate the upcoming B0 server-loop dispatch
-    swap uses to replace the per-poll ``epoll_wait`` syscall on
-    the io_uring backend: one SQE per fd at registration time,
-    one CQE per readiness change at runtime, no per-iteration
-    submission cost.
+    One SQE per fd at registration time, then one CQE per readiness
+    change at runtime, with no per-iteration submission cost.
 
     Args:
         buf: 64-byte SQE buffer.

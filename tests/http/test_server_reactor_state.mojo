@@ -507,7 +507,7 @@ def _ws_noop(mut c: WsConnection) raises -> None:
 
 
 def test_ws_426_closes_connection() raises:
-    """APP-01: the 426 for a bad Sec-WebSocket-Version says
+    """The 426 for a bad Sec-WebSocket-Version says
     ``Connection: close`` and then actually closes: ``should_close`` is set,
     the flush ends the connection, and a pipelined request behind it is
     never served."""
@@ -579,7 +579,7 @@ def test_pipelined_requests_flush_together_in_order() raises:
     client.close()
 
 
-# ── Error responses to HEAD carry no content (APP-05) ───────────────────────
+# ── Error responses to HEAD carry no content ───────────────────────
 
 
 def _queued_error(
@@ -612,7 +612,7 @@ def _assert_head_only(wire: String, status: String) raises:
 
 
 def test_handler_error_for_head_has_no_body() raises:
-    """APP-05: the 500 queued for a HEAD whose handler raised ends at the
+    """The 500 queued for a HEAD whose handler raised ends at the
     header terminator; the same error for GET still has its body."""
     var cfg = _default_config()
     _assert_head_only(
@@ -629,7 +629,7 @@ def test_handler_error_for_head_has_no_body() raises:
 
 
 def test_parse_errors_for_head_have_no_body() raises:
-    """APP-05: errors raised before the request is parsed (400, 413, 431)
+    """Errors raised before the request is parsed (400, 413, 431)
     also leave HEAD without content."""
     var cfg = _default_config()
     _assert_head_only(
@@ -670,7 +670,7 @@ def test_parse_errors_for_head_have_no_body() raises:
 
 
 def test_error_after_head_on_keepalive_conn_keeps_body() raises:
-    """APP-05: a HEAD served earlier on the connection must not make a later
+    """A HEAD served earlier on the connection must not make a later
     GET's error response bodyless."""
     var r = Reactor()
     var listener = TcpListener.bind(SocketAddr.localhost(0))
@@ -697,11 +697,11 @@ def test_error_after_head_on_keepalive_conn_keeps_body() raises:
     client.close()
 
 
-# ── Read-buffer cap with an unlimited body cap (APP-06) ──────────────────────
+# ── Read-buffer cap with an unlimited body cap ──────────────────────
 
 
 def test_unlimited_body_cap_serves_request() raises:
-    """APP-06: ``max_header_size + max_body_size`` used to wrap for
+    """``max_header_size + max_body_size`` used to wrap for
     ``max_body_size = Int.MAX`` and every request got 413."""
     var r = Reactor()
     var listener = TcpListener.bind(SocketAddr.localhost(0))
@@ -726,7 +726,7 @@ def test_unlimited_body_cap_serves_request() raises:
 
 
 def test_unlimited_body_cap_bufring_path() raises:
-    """APP-06: the io_uring buffer-ring ingest path has the same cap."""
+    """The io_uring buffer-ring ingest path has the same cap."""
     var listener = TcpListener.bind(SocketAddr.localhost(0))
     var port = listener.local_addr().port
     var client = TcpStream.connect(SocketAddr.localhost(port))
@@ -747,7 +747,7 @@ def test_unlimited_body_cap_bufring_path() raises:
 
 
 def test_body_cap_still_rejects_oversized_input() raises:
-    """APP-06: the subtraction form keeps rejecting a buffer larger than
+    """The subtraction form keeps rejecting a buffer larger than
     ``max_header_size + max_body_size`` (here 64 + 64 = 128 bytes)."""
     var cfg = _default_config()
     cfg.max_header_size = 64

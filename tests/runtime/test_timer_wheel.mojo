@@ -229,7 +229,7 @@ def test_next_fire_ms_overflow_only_returns_rotation() raises:
 
 
 def test_next_fire_ms_overflow_only_is_lower_bound_after_advance() raises:
-    """RT-01: overflow timers are promoted at the next slot-0 boundary, so
+    """Overflow timers are promoted at the next slot-0 boundary, so
     with an empty wheel and a non-empty overflow list the hint must not
     exceed that boundary. A timer due at 512, observed at now=500, used to
     be reported as due at 1012 (now + 512) although it fires at 512."""
@@ -251,7 +251,7 @@ def test_next_fire_ms_overflow_only_is_lower_bound_after_advance() raises:
 
 
 def test_next_fire_ms_wheel_hint_capped_at_promotion_boundary() raises:
-    """RT-01: a wheel timer further away than the next slot-0 boundary must
+    """A wheel timer further away than the next slot-0 boundary must
     not push the hint past it while the overflow list is non-empty (the
     overflow timer is promoted, and may fire, at the boundary)."""
     var tw = TimerWheel(now_ms=UInt64(0))
@@ -264,7 +264,7 @@ def test_next_fire_ms_wheel_hint_capped_at_promotion_boundary() raises:
 
 
 def test_next_fire_ms_overflow_hint_at_slot_zero() raises:
-    """RT-01: at slot 0 the boundary is a full rotation away, so the hint
+    """At slot 0 the boundary is a full rotation away, so the hint
     for an overflow-only wheel stays now + 512 (no regression)."""
     var tw = TimerWheel(now_ms=UInt64(0))
     _ = tw.schedule(5000, UInt64(1))

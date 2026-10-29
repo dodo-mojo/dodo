@@ -27,7 +27,6 @@ from std.testing import assert_equal, assert_true
 from dodo.utils import SIGKILL, exit, fork, kill, usleep, waitpid
 
 from dodo.http import HttpServer, Request, Response, WsUpgrade, ok
-from dodo.http.client_pool import _monotonic_ms
 from dodo.net import SocketAddr
 from dodo.net._libc import (
     AF_INET,
@@ -43,6 +42,7 @@ from dodo.net._libc import (
     get_errno,
 )
 from dodo.ws import WsClient, WsConnection, WsOpcode
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 comptime _WS_HOLD_MS = 2500
@@ -95,7 +95,7 @@ def _timed_http_get(port: UInt16, mut body: String) raises -> Int:
         "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     )
     var rb = req.as_bytes()
-    var started = _monotonic_ms()
+    var started = monotonic_now_ms()
     _ = _send(
         fd, rb.unsafe_ptr(), c_size_t(req.byte_length()), c_int(MSG_NOSIGNAL)
     )
@@ -108,7 +108,7 @@ def _timed_http_get(port: UInt16, mut body: String) raises -> Int:
             break
         for i in range(Int(n)):
             body += chr(Int(buf[unsafe_offset=i]))
-    var elapsed = _monotonic_ms() - started
+    var elapsed = monotonic_now_ms() - started
     _ = _close(fd)
     return elapsed
 
@@ -227,12 +227,12 @@ def test_two_offloaded_websockets_run_concurrently() raises:
         var b = WsClient.connect(url)
         # Both handlers are sitting in recv(); start their holds back to
         # back so the two sleeps overlap if anything lets them.
-        var started = _monotonic_ms()
+        var started = monotonic_now_ms()
         a.send_text("hold")
         b.send_text("hold")
         var ra = a.recv()
         var rb = b.recv()
-        elapsed = _monotonic_ms() - started
+        elapsed = monotonic_now_ms() - started
         if ra.opcode == WsOpcode.TEXT:
             first = ra.text_payload()
         if rb.opcode == WsOpcode.TEXT:

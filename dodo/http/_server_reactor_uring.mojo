@@ -47,7 +47,6 @@ from ._reactor import (
     STATE_PARKED,
     STATE_READING,
     STATE_WRITING,
-    _monotonic_ms,
 )
 from ._reactor.offload_loop import close_offload_port
 from ._server_uring_setup import _probe_bufring_setup_flags
@@ -55,6 +54,7 @@ from ._server_uring_setup import _probe_bufring_setup_flags
 # Shared connection-lifecycle helpers live in ``_server_reactor_epoll``
 # (the epoll loops own them); imported here for the io_uring teardown path.
 from ._server_reactor_epoll import _conn_free_addr, _conn_ptr_from_int
+from dodo.runtime._libc_time import monotonic_now_ms
 
 comptime URING_STOP_POLL_MS: Int = 100
 """Longest an io_uring worker blocks before it re-reads the stop flag (the
@@ -145,8 +145,9 @@ comptime _URING_BR_BUF_SIZE: Int = 8192
 comptime _URING_BR_NBUFS: Int = 256
 comptime _URING_BR_BGID: UInt16 = 1
 
-# Generation-stamped conn_id encoding -- the fix for the
-# 9cf97d0 SIGSEGV under concurrent connections.
+# Generation-stamped conn_id encoding, which keeps a stale completion
+# from reaching a new connection on a reused fd (a SIGSEGV under
+# concurrent connections).
 #
 # When connection A on fd=8 closes, the kernel may have a
 # trailing recv CQE in flight (the final-no-more-events CQE
@@ -526,7 +527,7 @@ struct _BrParked(Movable):
             return
         self.ids[fd] = conn_id
         if config.handler_timeout_ms > 0:
-            self.deadlines[fd] = _monotonic_ms() + config.handler_timeout_ms
+            self.deadlines[fd] = monotonic_now_ms() + config.handler_timeout_ms
         else:
             _ = self.deadlines.pop(fd, 0)
 
@@ -538,7 +539,7 @@ struct _BrParked(Movable):
         """How long the ring may block: until the earliest deadline, at
         most ``URING_STOP_POLL_MS``."""
         var wait = URING_STOP_POLL_MS
-        var now = _monotonic_ms()
+        var now = monotonic_now_ms()
         for kv in self.deadlines.items():
             var left = kv.value - now
             if left < wait:
@@ -633,7 +634,7 @@ def _br_expire_offloads[
     """Answer 503 on every parked connection whose handler deadline ran
     out, cancelling its job with ``TIMEOUT``. One mid-send is answered
     once its send completes."""
-    var now = _monotonic_ms()
+    var now = monotonic_now_ms()
     var expired = List[Int]()
     for kv in parked.deadlines.items():
         if kv.value <= now:
@@ -816,12 +817,12 @@ def run_uring_bufring_reactor_loop_shared[
         if settle_deadline == 0 and load_stop_flag(stopping_addr):
             if offload_outstanding(offload_port) == 0:
                 break
-            settle_deadline = _monotonic_ms() + max(
+            settle_deadline = monotonic_now_ms() + max(
                 config.shutdown_timeout_ms, 0
             )
             _br_begin_settle(offload_port, conns, ureactor)
         if settle_deadline != 0:
-            if _br_settled(conns) or _monotonic_ms() >= settle_deadline:
+            if _br_settled(conns) or monotonic_now_ms() >= settle_deadline:
                 break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         completions.clear()
@@ -896,7 +897,7 @@ def run_uring_bufring_reactor_loop_shared[
             # A completion carrying IORING_CQE_F_BUFFER has already taken
             # buffer ``bid`` out of the ring, whatever happens to it next.
             # Every path must follow ``decision.return_buf`` or the pool
-            # shrinks for good (issue #37; proved in Kernels/BufLedger).
+            # shrinks for good.
             var decision = classify_recv(conn_id in conns, comp.res, has_buf)
             if decision.action != RECV_STAGE:
                 if decision.return_buf:

@@ -325,7 +325,7 @@ def test_cookie_store_keeps_utf8_values() raises:
     assert_equal(s.value, String("名前=Zoë"))
 
 
-# ── Server-side expiry (DOC-06) ───────────────────────────────────────────
+# ── Server-side expiry ───────────────────────────────────────────
 
 
 def _cookie_req(name: String, value: String) raises -> Request:

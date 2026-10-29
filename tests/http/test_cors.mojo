@@ -131,7 +131,7 @@ def _acao_with_credentials(
 
 
 def test_credentials_allowlist_is_order_independent() raises:
-    """APP-21: with credentials a ``*`` entry authorises nothing but must not
+    """With credentials a ``*`` entry authorises nothing but must not
     hide a listed origin that comes after it."""
     var good = String("https://app.example.com")
     assert_equal(_acao_with_credentials(["*", good], good), good)
@@ -144,7 +144,7 @@ def test_credentials_allowlist_is_order_independent() raises:
 
 
 def test_wildcard_without_credentials_still_first_match() raises:
-    """APP-21: without credentials ``*`` still allows any origin, whatever
+    """Without credentials ``*`` still allows any origin, whatever
     the order."""
     var cfg = CorsConfig()
     cfg.allowed_origins.append("*")
@@ -175,7 +175,7 @@ def _allowlist_cors() raises -> CorsConfig:
 
 
 def test_vary_origin_on_response_without_origin() raises:
-    """APP-22: the ACAO value depends on ``Origin``, so the response to a
+    """The ACAO value depends on ``Origin``, so the response to a
     request with no ``Origin`` carries ``Vary: Origin`` too."""
     var mw = Cors(_Echo(), _allowlist_cors())
     var resp = mw.serve(Request(method=Method.GET, url="/api"))
@@ -185,7 +185,7 @@ def test_vary_origin_on_response_without_origin() raises:
 
 
 def test_vary_origin_on_rejected_origin_and_preflight() raises:
-    """APP-22: rejected simple requests and rejected preflights (403) carry
+    """Rejected simple requests and rejected preflights (403) carry
     ``Vary: Origin`` as well."""
     var mw = Cors(_Echo(), _allowlist_cors())
     var req = Request(method=Method.GET, url="/api")
@@ -203,7 +203,7 @@ def test_vary_origin_on_rejected_origin_and_preflight() raises:
 
 
 def test_vary_origin_single_on_allowed_and_not_duplicated() raises:
-    """APP-22: stamped responses still carry exactly one ``Vary: Origin``."""
+    """Stamped responses still carry exactly one ``Vary: Origin``."""
     var mw = Cors(_Echo(), _allowlist_cors())
     var req = Request(method=Method.GET, url="/api")
     req.headers.set("Origin", "https://a.example")
