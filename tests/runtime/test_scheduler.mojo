@@ -120,7 +120,9 @@ def test_scheduler_drain_returns_per_worker_reports() raises:
     var s = Scheduler[_NopFrontend].start(
         addr=addr, frontend=_NopFrontend(0), num_workers=3, pin_cores=False
     )
-    var reports = s.drain(timeout_ms=200)
+    # drain returns once every idle worker is done, so a generous deadline
+    # costs nothing here and keeps a slow CI runner from timing out.
+    var reports = s.drain(timeout_ms=5000)
     assert_equal(len(reports), 3)
     for i in range(len(reports)):
         assert_equal(reports[i].drained, 1)
@@ -573,7 +575,9 @@ def _drain_with_one_stuck(extras: List[SocketAddr]) raises:
         _ = libc_nanosleep_ms(1)
     var stuck_primary = Int(_ld(cells + 16))
     var group = s._balance_addr
-    var reports = s.drain(timeout_ms=300)
+    # The stuck worker holds drain to its deadline; the other worker must
+    # join inside it, which can take a while on a slow CI runner.
+    var reports = s.drain(timeout_ms=2000)
     # glibc hands a just-freed block back to the next same-size alloc.
     var probe = alloc(
         Layout[Int64](count=_HEADER_SLOTS + 2 * _W_STRIDE)

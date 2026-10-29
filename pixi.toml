@@ -33,19 +33,11 @@ sysroot_linux-64 = ">=2.34"
 [target.linux-aarch64.dependencies]
 gxx = ">=13"
 
-[feature.fuzz.dependencies]
-mozz = { git = "https://github.com/ehsanmok/mozz.git", tag = "v0.2.2" }
-
-[feature.fuzz.tasks]
-fuzz-build = "bash fuzz/run.sh"
-fuzz = "bash fuzz/run.sh"
-
 [feature.bench.target.linux-64.dependencies]
 wrk = ">=4.2.0"
 
 [environments]
 default = { solve-group = "default" }
-fuzz = { features = ["fuzz"], solve-group = "default" }
 bench = { features = ["bench"], solve-group = "default" }
 
 [tasks]
@@ -54,4 +46,7 @@ tests-gen = "python3 tests/tools/gen_test_aggregates.py"
 tls-certs = "bash tests/tools/make_tls_certs.sh"
 check-sans-io = "bash tests/tools/check_sans_io.sh"
 check-no-http-http2-cycle = "bash tests/tools/check_no_http_http2_cycle.sh"
+fuzz-build = "bash fuzz/run.sh"
+fuzz = "bash fuzz/run.sh"
+fuzz-selftest = "bash fuzz/run.sh selftest"
 format = "mojo format dodo tests fuzz"

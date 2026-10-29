@@ -17,7 +17,7 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 |---|---|
 | `dodo/` | The library. `http`, `http2`, `ws`, `tls`, `tcp`, `uds`, `dns`, `net`, `runtime`, `crypto`, `io`, `json` (vendored, see `THIRD_PARTY_NOTICES.md`), `testing`, `utils`. Native wrappers in `dodo/*/ffi/`. |
 | `tests/` | One dir per package. `tests/tools/run_tests.sh` builds one binary per dir from `tests/_agg/` (generated). |
-| `fuzz/` | mozz fuzzers, one per parser |
+| `fuzz/` | Fuzzers, one per parser, on the vendored harness in `fuzz/mozz/` |
 | `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`), naming, standards, ADRs |
 | `research/` | Throwaway spikes and audit harnesses (probe servers, fuzzers). Not shipped. |
 | `packaging/recipe.yaml` | Draft modular-community recipe for the `dodo` package |
