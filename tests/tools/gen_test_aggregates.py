@@ -34,6 +34,7 @@ TESTS = "tests"
 OUT_DIR = os.path.join(TESTS, "_agg")
 # The server and scripts the live checks run; no tests in it.
 LIVE_DIR = os.path.join(TESTS, "live")
+COMPILE_FAIL_DIR = os.path.join(TESTS, "compile_fail")
 
 # Tests that mutate process-global state; they must keep their own process.
 EXCLUDE = {
@@ -90,7 +91,8 @@ def discover() -> dict[str, list[tuple[str, list[str]]]]:
     areas: dict[str, list[tuple[str, list[str]]]] = {}
     missing: list[str] = []
     for path in sorted(glob.glob(f"{TESTS}/**/*.mojo", recursive=True)):
-        if path.startswith(OUT_DIR) or path.startswith(LIVE_DIR):
+        skipped_dirs = (OUT_DIR, LIVE_DIR, COMPILE_FAIL_DIR)
+        if path.startswith(skipped_dirs):
             continue
         if path in EXCLUDE:
             continue

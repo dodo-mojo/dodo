@@ -109,6 +109,11 @@ for t in "${STANDALONE[@]}"; do
   fi
 done
 
+echo "── checking compile errors ──"
+if ! bash tests/tools/check_compile_errors.sh; then
+  failed+=("compile errors")
+fi
+
 if [ "${#failed[@]}" -ne 0 ]; then
   echo
   echo "── ${#failed[@]} suite(s) failed ──"
