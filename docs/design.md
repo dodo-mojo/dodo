@@ -108,25 +108,31 @@ Model workers get CPU, RAM and GPU memory limits, each as a ratio or an amount o
 Syntax is illustrative and will be adjusted to what Mojo 1.2 allows.
 
 ```mojo
-from dodo import App, Request, Response, json
+from dodo import App, AppState, PathParams, Request, Response
 from dodo.ai import Model, sse
 
 @fieldwise_init
-struct Greeting(Json):
+struct Models(AppState):
+    var llm: Model
+
+@fieldwise_init
+struct GreetPath(PathParams):
+    var name: String
+
+@fieldwise_init
+struct Greeting(Movable):
     var message: String
 
-def hello(req: Request) raises -> Response:
-    var name = req.param("name")          # typed, validated extractor
-    return json(Greeting(String("hi ", name)))
+def hello(req: Request, path: GreetPath) raises -> Greeting:
+    return Greeting(String("hi ", path.name))    # a struct becomes 200 JSON
 
-def chat(req: Request, llm: Model) raises -> Response:
-    var prompt = req.json[ChatIn]().prompt
-    return sse(llm.generate_stream(prompt))   # tokens streamed as they're produced
+def chat(req: Request, body: ChatIn, models: Models) raises -> Response:
+    return sse(models.llm.generate_stream(body.prompt))   # tokens streamed as they're produced
 
 def main() raises:
-    var app = App()
-    app.get("/hello/{name}", hello)
-    app.post("/chat", chat, state=Model.load("meta-llama/Llama-3.2-1B"))  # loaded once, on GPU
+    var app = App(state=Models(Model.load("meta-llama/Llama-3.2-1B")))    # loaded once, on GPU
+    app.get["/hello/{name}"](hello)
+    app.post["/chat"](chat)
     app.serve(port=8000)
 ```
 
