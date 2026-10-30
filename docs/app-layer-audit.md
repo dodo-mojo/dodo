@@ -63,7 +63,7 @@ Probes: [research/app-api-probes](../research/app-api-probes) (each claim below 
 
 ### Fix
 
-Items 1 to 3 are fixed and tested: all three were confirmed by failing tests first. The router now decodes params, and literal segments stay undecoded. The rest were read from code, not yet run.
+Items 1 to 3 are fixed and tested: all three were confirmed by failing tests first. The router now decodes params, and literal segments stay undecoded. Item 5 is done too: both have tests, and they found no bugs. The rest were read from code, not yet run.
 
 1. The 404 body echoes `req.url`, query string included (`router.mojo:757`, `_server/responses.mojo:156`). Reflecting request input is a bad default; return a fixed body.
 2. Registering the same method and path twice is silently accepted, and the first wins (`router.mojo:503`). It should raise.

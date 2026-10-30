@@ -28,7 +28,7 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 
 - Two dev machines. **macOS (Apple Silicon):** native, repo at `~/anubhav/dodo`, kqueue backend, FFI wrappers built with clang++. **Windows:** Mojo has no Windows support, so build in **WSL Ubuntu-24.04** (`wsl -d Ubuntu-24.04 -- bash -l`), repo at `/mnt/e/dodo`. Linux-only code (epoll, accept balancing) is only tested on WSL. macOS has no `-z nodelete`, so each wrapper library pins itself (`dodo/utils/ffi/pin_self.h`); never overwrite an installed `.so` in place (macOS SIGKILLs the next process that loads it).
 - Mojo 1.2.0 and MAX/modular 26.7.0 via pixi (`~/.pixi/bin`). `.pixi/config.toml` keeps the env out of the repo (detached environments).
-- `pixi run tests` runs everything (about 2,590 tests). After adding a test file: `pixi run tests-gen`. One file: `pixi run mojo -I . tests/http/test_x.mojo`. Use `AGG_JOBS=2` on 16 GB machines.
+- `pixi run tests` runs everything (about 2,630 tests). After adding a test file: `pixi run tests-gen`. One file: `pixi run mojo -I . tests/http/test_x.mojo`. Use `AGG_JOBS=2` on 16 GB machines.
 - Mojo 1.x: `def` only (`fn` is removed), and `raises` must be explicit. GPU code is under `max.gpu`.
 - GPU work runs on the Windows machine's RTX 5070 (verified working). The Mac has no NVIDIA GPU.
 - Reference clones live in WSL under `~/src/`.
