@@ -4,10 +4,12 @@ A ``Router`` is a ``Handler`` that dispatches each request to a
 per-(method, path) inner handler. It supports:
 
 - **Literal segments**: ``"/users"`` matches exactly ``/users``.
-- **Parameter segments**: ``":id"`` matches one segment of any non-empty
-  value; the captured value lands in ``req.params[name]``.
-- **Wildcard tail**: a final segment ``"*"`` matches the rest of the
-  path (captured as ``req.param("*")``, including path separators).
+- **Parameter segments**: ``"{id}"`` matches one segment of any non-empty
+  value; the captured value lands in ``req.params[name]``. A param fills
+  the whole segment: ``"/a{id}"`` is an error.
+- **Catch-all tail**: a final segment ``"{*rest}"`` matches the rest of
+  the path (captured as ``req.param("rest")``, including path
+  separators). It needs at least one remaining segment.
 - **Method dispatch**: ``get`` / ``post`` / ``put`` / ``patch`` /
   ``delete`` / ``head`` register one handler per (method, path) pair.
 
@@ -39,7 +41,7 @@ def get_user(req: Request) raises -> Response:
 def main() raises:
     var r = Router()
     r.get("/", home)
-    r.get("/users/:id", get_user)
+    r.get("/users/{id}", get_user)
 
     # `r` is a Handler; pass it to HttpServer.serve.
 ```
@@ -60,51 +62,37 @@ from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method, _child_request
 from .response import Response, Status
 from .server import not_found
+from ._route_path import (
+    SEG_CATCH_ALL,
+    SEG_LITERAL,
+    _Segment,
+    parse_route_path,
+)
 
 
 # ── Internal path compilation ────────────────────────────────────────────────
 
 
-struct _Segment(Copyable):
-    """A single compiled path segment.
-
-    ``kind`` is 0 for literal, 1 for parameter (``":name"``), 2 for
-    wildcard tail (``"*"``). ``text`` is the literal text for
-    ``kind=0`` or the parameter name for ``kind=1``.
-    """
-
-    var kind: Int
-    var text: String
-
-    def __init__(out self, kind: Int, text: String):
-        self.kind = kind
-        self.text = text
-
-
 comptime _SLASH: UInt8 = 47
 comptime _QMARK: UInt8 = 63
-comptime _COLON: UInt8 = 58
-comptime _STAR: UInt8 = 42
 
 
 @always_inline
 def _segs_to_openapi_template(segs: List[_Segment]) -> String:
     """Render compiled segments as an OpenAPI path template.
 
-    Literal -> verbatim; ``:name`` -> ``{name}``; wildcard ``*`` ->
-    ``{path}``. The empty segment list (root) renders as ``/``.
+    Literal -> verbatim; ``{name}`` and ``{*name}`` -> ``{name}``. The
+    empty segment list (root) renders as ``/``.
     """
     if len(segs) == 0:
         return "/"
     var out = String("")
     for i in range(len(segs)):
         out += "/"
-        if segs[i].kind == 0:
+        if segs[i].kind == SEG_LITERAL:
             out += segs[i].text
-        elif segs[i].kind == 1:
-            out += "{" + segs[i].text + "}"
         else:
-            out += "{path}"
+            out += "{" + segs[i].text + "}"
     return out^
 
 
@@ -134,26 +122,13 @@ def _split_path(path: String) -> List[String]:
 
 
 def _compile_segments(path: String) raises -> List[_Segment]:
-    """Turn a route pattern like ``"/users/:id/posts"`` into a list of
+    """Turn a route pattern like ``"/users/{id}/posts"`` into a list of
     ``_Segment`` values the matcher can consume one at a time.
     """
-    var raw = _split_path(path)
-    var segs = List[_Segment]()
-    for i in range(len(raw)):
-        var s = raw[i]
-        var sn = s.byte_length()
-        if sn == 0:
-            continue
-        var sp = s.unsafe_ptr()
-        if sn == 1 and sp[unsafe_offset=0] == _STAR:
-            if i != len(raw) - 1:
-                raise Error("wildcard '*' must be the last segment in a route")
-            segs.append(_Segment(2, "*"))
-        elif sn >= 2 and sp[unsafe_offset=0] == _COLON:
-            segs.append(_Segment(1, ascii_unchecked_string(s.as_bytes()[1:sn])))
-        else:
-            segs.append(_Segment(0, s))
-    return segs^
+    var parsed = parse_route_path(path)
+    if len(parsed.error.as_bytes()) > 0:
+        raise Error(parsed.error)
+    return parsed.segs.copy()
 
 
 # ── Route entries ────────────────────────────────────────────────────────────
@@ -367,7 +342,7 @@ struct Router(Copyable, Defaultable, Handler):
         ```mojo
         var r = Router()
         r.get("/", home) # def(Request)
-        r.get("/users/:id", Extracted[GetUser]()) # Handler struct
+        r.get("/users/{id}", Extracted[GetUser]()) # Handler struct
         ```
     """
 
@@ -418,7 +393,7 @@ struct Router(Copyable, Defaultable, Handler):
         """Register ``handler`` for ``GET path``.
 
         Args:
-            path: Route pattern (e.g. ``"/users/:id"``).
+            path: Route pattern (e.g. ``"/users/{id}"``).
             handler: The function to call on a match.
         """
         self._add_fn(Method.GET, path, handler)
@@ -530,7 +505,7 @@ struct Router(Copyable, Defaultable, Handler):
         overload above continues to work unchanged.
 
         Args:
-            path: Route pattern (e.g. ``"/users/:id"``).
+            path: Route pattern (e.g. ``"/users/{id}"``).
             handler: A ``Handler & Copyable`` instance;
                      ownership transfers into the Router (the
                      Router owns the heap allocation and frees it
@@ -642,17 +617,14 @@ struct Router(Copyable, Defaultable, Handler):
         ownership model as struct handlers.
 
         Args:
-            prefix: A literal path prefix, e.g. ``"/api/v1"``. Parameter
-                    (``:id``) and wildcard (``*``) segments are rejected.
+            prefix: A literal path prefix, e.g. ``"/api/v1"``. Param
+                    (``{id}``) and catch-all (``{*rest}``) segments are
+                    rejected.
             sub:    The sub-router to mount; ownership transfers in.
         """
+        if "{" in prefix:
+            raise Error("mount prefix must be literal: no '{' allowed")
         var psegs = _compile_segments(prefix)
-        for i in range(len(psegs)):
-            if psegs[i].kind != 0:
-                raise Error(
-                    "mount prefix must be literal segments only (no ':param'"
-                    " or '*')"
-                )
         if len(psegs) == 0:
             raise Error("mount prefix must have at least one segment")
         var wrapper = _MountedRouter(sub^, len(psegs))
@@ -677,15 +649,15 @@ struct Router(Copyable, Defaultable, Handler):
         return self._routes[i].method
 
     def route_openapi_template(self, i: Int) -> String:
-        """Route ``i``'s path as an OpenAPI template: ``:id`` -> ``{id}``,
-        wildcard ``*`` -> ``{path}`` (``/`` for the empty root)."""
+        """Route ``i``'s path as an OpenAPI template: ``{id}`` stays
+        ``{id}`` and ``{*rest}`` becomes ``{rest}`` (``/`` for the empty root)."""
         return _segs_to_openapi_template(self._routes[i].segs)
 
     def route_path_params(self, i: Int) -> List[String]:
-        """Names of route ``i``'s path parameters (``:name`` segments)."""
+        """Names of route ``i``'s path parameters (``{name}`` and ``{*name}`` segments)."""
         var out = List[String]()
         for j in range(len(self._routes[i].segs)):
-            if self._routes[i].segs[j].kind == 1:
+            if self._routes[i].segs[j].kind != SEG_LITERAL:
                 out.append(self._routes[i].segs[j].text)
         return out^
 
@@ -858,8 +830,8 @@ def _match(
     var j = 0
     while j < len(pattern):
         var kind = pattern[j].kind
-        if kind == 2:
-            # Wildcard tail — must consume at least one segment.
+        if kind == SEG_CATCH_ALL:
+            # Catch-all tail: must consume at least one segment.
             if i >= len(url_segs):
                 return result^
             var tail = String("")
@@ -868,12 +840,12 @@ def _match(
                     tail += "/"
                 tail += url_segs[i]
                 i += 1
-            result.params["*"] = tail
+            result.params[pattern[j].text] = tail
             result.matched = True
             return result^
         if i >= len(url_segs):
             return result^
-        if kind == 0:
+        if kind == SEG_LITERAL:
             if url_segs[i] != pattern[j].text:
                 return result^
         else:

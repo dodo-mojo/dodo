@@ -11,7 +11,7 @@ known at compile time:
    compile time via ``comptime for`` over the comptime ``routes``
    list. Nothing allocates at module import time.
 2. **Monomorphised dispatch.** The serve loop unrolls per-route via
-   ``comptime for`` so each iteration's literal / param / wildcard
+   ``comptime for`` so each iteration's literal / param / catch-all
    decision is a compile-time constant and the compiler can inline
    the per-route work. No ``List[_Route]`` iteration at runtime.
 
@@ -30,7 +30,7 @@ def get_user(req: Request) raises -> Response:
 
 comptime ROUTES: List[ComptimeRoute] = [
     ComptimeRoute(Method.GET, "/", home),
-    ComptimeRoute(Method.GET, "/users/:id", get_user),
+    ComptimeRoute(Method.GET, "/users/{id}", get_user),
 ]
 
 def main() raises:
@@ -45,19 +45,22 @@ Response`` signature, the list is homogeneous and can live as a
 comptime constant — no separate ``set_handler`` step, no runtime
 handler-index book-keeping.
 
+A malformed pattern (see [`dodo.http._route_path`](./_route_path.mojo))
+is a compile error carrying the parser's message.
+
 Same status-code contract as ``Router``: unknown path → 404, known
 path wrong method → 405 with a synthesised ``Allow:`` header. Path
 parameters captured by a match land in ``req.params_mut()`` just
 like the runtime router.
 """
 
-from std.collections import Dict
-
 from .handler import Handler
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method, _child_request
 from .response import Response, Status
+from ._route_path import parse_route_path
+from .router import _match, _split_path
 
 
 # ── Public comptime route metadata ──────────────────────────────────────────
@@ -78,43 +81,10 @@ struct ComptimeRoute(Copyable):
     var handler: def(Request) raises thin -> Response
 
 
-# ── Segment classification (pure comptime) ──────────────────────────────────
+# ── Request path helper ─────────────────────────────────────────────────────
 
 
-comptime _SLASH: UInt8 = 47
 comptime _QMARK: UInt8 = 63
-comptime _COLON: UInt8 = 58
-comptime _STAR: UInt8 = 42
-
-
-@always_inline
-def _split_static(path: StaticString) -> List[String]:
-    """Split a ``StaticString`` path on ``/``, dropping empty segments.
-
-    Runs at compile time when ``path`` is a comptime value; the return
-    type is a ``List[String]`` (not ``List[StaticString]``) so the
-    dispatch code can compare against request bytes using the same
-    owned-``String`` ergonomics as the runtime router.
-    """
-    var s = String(path)
-    var out = List[String]()
-    var n = s.byte_length()
-    if n == 0:
-        return out^
-    var p = s.unsafe_ptr()
-    var start = 0
-    if p[unsafe_offset=0] == _SLASH:
-        start = 1
-    var i = start
-    while i < n:
-        if p[unsafe_offset=i] == _SLASH:
-            if i > start:
-                out.append(ascii_unchecked_string(s.as_bytes()[start:i]))
-            start = i + 1
-        i += 1
-    if start < n:
-        out.append(ascii_unchecked_string(s.as_bytes()[start:n]))
-    return out^
 
 
 @always_inline
@@ -126,52 +96,6 @@ def _path_only(url: String) -> String:
         if p[unsafe_offset=i] == _QMARK:
             return ascii_unchecked_string(url.as_bytes()[0:i])
     return url
-
-
-@always_inline
-def _split_path(path: String) -> List[String]:
-    """Split a runtime request path on ``/``, dropping empty segments."""
-    var out = List[String]()
-    var n = path.byte_length()
-    if n == 0:
-        return out^
-    var p = path.unsafe_ptr()
-    var start = 0
-    if p[unsafe_offset=0] == _SLASH:
-        start = 1
-    var i = start
-    while i < n:
-        if p[unsafe_offset=i] == _SLASH:
-            if i > start:
-                out.append(ascii_unchecked_string(path.as_bytes()[start:i]))
-            start = i + 1
-        i += 1
-    if start < n:
-        out.append(ascii_unchecked_string(path.as_bytes()[start:n]))
-    return out^
-
-
-# ── Per-segment match primitives ────────────────────────────────────────────
-
-
-@always_inline
-def _seg_is_param(seg: String) -> Bool:
-    """Return True if ``seg`` is a ``:name`` capture."""
-    return (
-        seg.byte_length() >= 2 and seg.unsafe_ptr()[unsafe_offset=0] == _COLON
-    )
-
-
-@always_inline
-def _seg_is_wildcard(seg: String) -> Bool:
-    """Return True if ``seg`` is a bare ``*`` wildcard tail."""
-    return seg.byte_length() == 1 and seg.unsafe_ptr()[unsafe_offset=0] == _STAR
-
-
-@always_inline
-def _param_name(seg: String) -> String:
-    """Strip the leading ``:`` from a param segment."""
-    return ascii_unchecked_string(seg.as_bytes()[1 : seg.byte_length()])
 
 
 # ── ComptimeRouter ──────────────────────────────────────────────────────────
@@ -213,16 +137,17 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
         comptime n_routes = len(Self.routes)
         comptime for i in range(n_routes):
             comptime r = Self.routes[i]
-            comptime pat_segs = _split_static(r.pattern)
-            var rt_pat = materialize[pat_segs]()
-            var params = Dict[String, String]()
-            if _match_one(seg_in, rt_pat, params):
+            comptime parsed = parse_route_path(String(r.pattern))
+            comptime assert len(parsed.error.as_bytes()) == 0, parsed.error
+            var rt_pat = materialize[parsed.segs]()
+            var matched = _match(seg_in, rt_pat)
+            if matched.matched:
                 if r.method == req.method:
-                    if len(params) == 0 and not req.has_params():
+                    if len(matched.params) == 0 and not req.has_params():
                         return r.handler(req)
                     var child = _child_request(req, req.url)
-                    if len(params) > 0:
-                        for kv in params.items():
+                    if len(matched.params) > 0:
+                        for kv in matched.params.items():
                             child.params_mut()[kv.key] = kv.value
                     return r.handler(child)
                 else:
@@ -233,53 +158,6 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
         if len(allowed) > 0:
             return _method_not_allowed(allowed)
         return _not_found(req.url)
-
-
-# ── Match primitive ─────────────────────────────────────────────────────────
-
-
-def _match_one(
-    url_segs: List[String],
-    pat_segs: List[String],
-    mut params: Dict[String, String],
-) raises -> Bool:
-    """Attempt to match one request against one comptime-compiled pattern.
-
-    Same semantics as the runtime Router's ``_match``: literal equality,
-    ``:name`` captures one segment, trailing ``*`` captures the rest. A
-    ``*`` that is not the last segment never matches.
-    """
-    var i = 0
-    var j = 0
-    while j < len(pat_segs):
-        var seg = pat_segs[j]
-        if _seg_is_wildcard(seg):
-            # ``*`` captures the rest of the path, so it is only valid as
-            # the final pattern segment (the runtime ``Router`` rejects
-            # anything else at registration). A pattern with a non-final
-            # ``*`` is invalid and matches nothing.
-            if j != len(pat_segs) - 1:
-                return False
-            if i >= len(url_segs):
-                return False
-            var tail = String("")
-            while i < len(url_segs):
-                if tail.byte_length() > 0:
-                    tail += "/"
-                tail += url_segs[i]
-                i += 1
-            params["*"] = tail
-            return True
-        if i >= len(url_segs):
-            return False
-        if _seg_is_param(seg):
-            params[_param_name(seg)] = url_segs[i]
-        else:
-            if url_segs[i] != seg:
-                return False
-        i += 1
-        j += 1
-    return i == len(url_segs)
 
 
 # ── Response helpers ────────────────────────────────────────────────────────

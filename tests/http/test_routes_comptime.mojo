@@ -3,7 +3,7 @@
 Covers the comptime-compiled dispatch path with feature-parity against
 the runtime ``Router`` in [`test_router.mojo`](./test_router.mojo):
 
-- Literal, parameter (``:name``), and wildcard-tail (``*``) segments.
+- Literal, parameter (``{name}``), and catch-all (``{*rest}``) segments.
 - Method dispatch (``GET`` / ``POST`` / ``PUT`` / ``DELETE``).
 - 404 on unknown paths.
 - 405 with synthesised ``Allow:`` header on wrong method.
@@ -25,6 +25,7 @@ from dodo.http import (
     Method,
     ok,
 )
+from dodo.http._route_path import parse_route_path
 
 
 def _home(req: Request) raises -> Response:
@@ -44,7 +45,7 @@ def _get_user(req: Request) raises -> Response:
 
 
 def _get_files(req: Request) raises -> Response:
-    return ok("files=" + req.param("*"))
+    return ok("files=" + req.param("rest"))
 
 
 def _delete_user(req: Request) raises -> Response:
@@ -55,9 +56,9 @@ comptime _BASE_ROUTES: List[ComptimeRoute] = [
     ComptimeRoute(Method.GET, "/", _home),
     ComptimeRoute(Method.GET, "/users", _list_users),
     ComptimeRoute(Method.POST, "/users", _create_user),
-    ComptimeRoute(Method.GET, "/users/:id", _get_user),
-    ComptimeRoute(Method.DELETE, "/users/:id", _delete_user),
-    ComptimeRoute(Method.GET, "/files/*", _get_files),
+    ComptimeRoute(Method.GET, "/users/{id}", _get_user),
+    ComptimeRoute(Method.DELETE, "/users/{id}", _delete_user),
+    ComptimeRoute(Method.GET, "/files/{*rest}", _get_files),
 ]
 
 
@@ -196,7 +197,7 @@ def test_partial_prefix_returns_404() raises:
 
 def test_deeper_path_returns_404() raises:
     var r = _router()
-    # ``/users/:id`` has exactly two segments; three segments are
+    # ``/users/{id}`` has exactly two segments; three segments are
     # handled only by ``/files/*``, not by the users namespace.
     var resp = r.serve(Request(method=Method.GET, url="/users/1/posts"))
     assert_equal(resp.status, Status.NOT_FOUND)
@@ -224,42 +225,54 @@ def test_comptime_matches_runtime_route_shape() raises:
     assert_equal(resp.text(), "home")
 
 
-# ── Non-final wildcard ─────────────────────────────────────────────
+# ── Catch-all and path errors are found at compile time ─────────────────────
 
 
-def _meta(req: Request) raises -> Response:
-    return ok("meta:" + req.param("*"))
+comptime _CATCH_ALL_NOT_LAST = parse_route_path("/files/{*rest}/meta")
+comptime _OLD_PARAM = parse_route_path("/users/:id")
+comptime _OLD_WILDCARD = parse_route_path("/files/*")
+comptime _PARTIAL_PARAM = parse_route_path("/a{b}")
+comptime _VALID = parse_route_path("/users/{id}/files/{*rest}")
+comptime _VALID_SEGMENT_COUNT = len(_VALID.segs)
 
 
-comptime _BAD_WILDCARD_ROUTES: List[ComptimeRoute] = [
-    ComptimeRoute(Method.GET, "/files/*/meta", _meta),
-    ComptimeRoute(Method.GET, "/*/x", _meta),
-    ComptimeRoute(Method.GET, "/ok/*", _get_files),
-]
+def test_comptime_parse_reports_catch_all_not_last() raises:
+    assert_equal(
+        _CATCH_ALL_NOT_LAST.error,
+        "catch-all '{*rest}' must be the last segment in a route",
+    )
 
 
-def test_non_final_wildcard_matches_nothing() raises:
-    """``*`` is only valid as the last segment (the runtime
-    ``Router`` rejects such a pattern); the comptime router must not treat a
-    middle ``*`` as a tail wildcard."""
-    var r = ComptimeRouter[_BAD_WILDCARD_ROUTES]()
-    for url in [
-        "/files/a",
-        "/files/a/meta",
-        "/files/a/b/c",
-        "/a/x",
-        "/a/b",
-    ]:
-        var resp = r.serve(Request(method=Method.GET, url=String(url)))
-        assert_equal(resp.status, Status.NOT_FOUND)
+def test_comptime_parse_reports_old_param_syntax() raises:
+    assert_equal(
+        _OLD_PARAM.error,
+        "route segment ':id' uses the old syntax; write '{id}'",
+    )
 
 
-def test_final_wildcard_still_captures_rest() raises:
-    """A table with an invalid route keeps routing its valid ones."""
-    var r = ComptimeRouter[_BAD_WILDCARD_ROUTES]()
-    var resp = r.serve(Request(method=Method.GET, url="/ok/a/b"))
-    assert_equal(resp.status, Status.OK)
-    assert_equal(resp.text(), "files=a/b")
+def test_comptime_parse_reports_old_wildcard_syntax() raises:
+    assert_equal(
+        _OLD_WILDCARD.error,
+        "route segment '*' uses the old syntax; write '{*rest}'",
+    )
+
+
+def test_comptime_parse_reports_partial_param() raises:
+    assert_equal(
+        _PARTIAL_PARAM.error,
+        "route segment 'a{b}' must be one whole '{name}' param",
+    )
+
+
+def test_comptime_parse_accepts_valid_path() raises:
+    assert_equal(_VALID.error, "")
+    assert_equal(_VALID_SEGMENT_COUNT, 4)
+
+
+def test_catch_all_capture_uses_its_name() raises:
+    var r = _router()
+    var resp = r.serve(Request(method=Method.GET, url="/files/a/b/c"))
+    assert_equal(resp.text(), "files=a/b/c")
 
 
 # ── Entry ──────────────────────────────────────────────────────────────────

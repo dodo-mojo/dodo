@@ -34,7 +34,7 @@ def root_home(req: Request) raises -> Response:
 def _v1() raises -> Router:
     var r = Router()
     r.get("/users", v1_users)
-    r.get("/users/:id", v1_user)
+    r.get("/users/{id}", v1_user)
     return r^
 
 
@@ -118,14 +118,34 @@ def test_mount_survives_router_copy() raises:
     assert_equal(resp.text(), "v2 users")
 
 
-def test_mount_rejects_param_prefix() raises:
+def _mount_error(prefix: String) -> String:
     var app = Router()
-    var threw = False
     try:
-        app.mount("/api/:ver", _v1())
-    except:
-        threw = True
-    assert_true(threw)
+        app.mount(prefix, _v1())
+    except e:
+        return String(e)
+    return String("no error")
+
+
+def test_mount_rejects_param_prefix() raises:
+    assert_equal(
+        _mount_error("/api/{ver}"),
+        "mount prefix must be literal: no '{' allowed",
+    )
+
+
+def test_mount_rejects_catch_all_prefix() raises:
+    assert_equal(
+        _mount_error("/api/{*rest}"),
+        "mount prefix must be literal: no '{' allowed",
+    )
+
+
+def test_mount_rejects_old_param_syntax() raises:
+    assert_equal(
+        _mount_error("/api/:ver"),
+        "route segment ':ver' uses the old syntax; write '{ver}'",
+    )
 
 
 def main() raises:

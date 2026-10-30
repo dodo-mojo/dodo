@@ -38,7 +38,7 @@ def _ok_user(req: Request) raises -> Response:
 
 
 def _ok_files(req: Request) raises -> Response:
-    return ok("files:" + req.param("*"))
+    return ok("files:" + req.param("rest"))
 
 
 def _build_router() raises -> Router:
@@ -46,8 +46,8 @@ def _build_router() raises -> Router:
     r.get("/", _ok_home)
     r.get("/users", _ok_list)
     r.post("/users", _ok_create)
-    r.get("/users/:id", _ok_user)
-    r.get("/files/*", _ok_files)
+    r.get("/users/{id}", _ok_user)
+    r.get("/files/{*rest}", _ok_files)
     return r^
 
 
@@ -142,7 +142,7 @@ def main() raises:
     seeds.append(_b("users/"))
     seeds.append(_b("//users"))
     seeds.append(_b("users//42"))
-    seeds.append(_b("users/:id"))
+    seeds.append(_b("users/{id}"))
     seeds.append(_b(":"))
     seeds.append(_b(":::"))
     seeds.append(_b("*"))

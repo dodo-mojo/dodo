@@ -50,7 +50,7 @@ struct GetUser(Copyable, Defaultable, Handler):
         return ok("user " + String(self.id.value))
 
 # Register with any Router / HttpServer that accepts a ``Handler``:
-# r.get("/users/:id", Extracted[GetUser]())
+# r.get("/users/{id}", Extracted[GetUser]())
 ```
 
 ``Extracted[H]`` is itself a ``Handler`` and reflects on ``H``'s field

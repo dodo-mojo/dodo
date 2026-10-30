@@ -89,7 +89,7 @@ def test_handler_extractor_registers_on_router_without_turbofish() raises:
     """``Router.get`` with ``Extracted[H]()`` runtime arg infers the
     parametric ``H`` type without an explicit turbofish."""
     var r = Router()
-    r.get("/users/:id", Extracted[EchoUser]())
+    r.get("/users/{id}", Extracted[EchoUser]())
 
     var req = Request.test_get("/users/42?trace=abc")
     var resp = r.serve(req)
@@ -115,7 +115,7 @@ def test_state_flows_through_prototype() raises:
     var proto = GreetUser()
     proto.greeting = State[String]("hello")
     var r = Router()
-    r.get("/users/:id", Extracted[GreetUser](proto^))
+    r.get("/users/{id}", Extracted[GreetUser](proto^))
     var req = Request.test_get("/users/7")
     var resp = r.serve(req)
     assert_equal(resp.status, 200)
@@ -126,7 +126,7 @@ def test_state_defaults_when_no_prototype() raises:
     """``Extracted[H]()`` default-constructs the prototype, so a
     ``State[T]`` field is its default value."""
     var r = Router()
-    r.get("/users/:id", Extracted[GreetUser]())
+    r.get("/users/{id}", Extracted[GreetUser]())
     var req = Request.test_get("/users/9")
     var resp = r.serve(req)
     assert_equal(resp.status, 200)
