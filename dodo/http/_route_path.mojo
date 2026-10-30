@@ -144,12 +144,14 @@ def _old_syntax_error(seg: String) -> String:
     if bytes[0] == _COLON:
         var name = ascii_unchecked_string(bytes[1:])
         return String(
-            "route segment '", seg, "' uses the old syntax; write '{", name, "}'"
+            "route segment '",
+            seg,
+            "' uses the old syntax; write '{",
+            name,
+            "}'",
         )
     if seg == "*":
-        return String(
-            "route segment '*' uses the old syntax; write '{*rest}'"
-        )
+        return String("route segment '*' uses the old syntax; write '{*rest}'")
     return String("")
 
 

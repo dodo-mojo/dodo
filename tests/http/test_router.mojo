@@ -320,16 +320,20 @@ def test_nameless_catch_all_rejected() raises:
 def test_name_starting_with_digit_rejected() raises:
     assert_equal(
         _registration_error("/users/{1id}"),
-        "invalid param name '1id' in route segment '{1id}'; use letters,"
-        " digits and '_', and do not start with a digit",
+        (
+            "invalid param name '1id' in route segment '{1id}'; use letters,"
+            " digits and '_', and do not start with a digit"
+        ),
     )
 
 
 def test_name_with_dash_rejected() raises:
     assert_equal(
         _registration_error("/users/{user-id}"),
-        "invalid param name 'user-id' in route segment '{user-id}'; use"
-        " letters, digits and '_', and do not start with a digit",
+        (
+            "invalid param name 'user-id' in route segment '{user-id}'; use"
+            " letters, digits and '_', and do not start with a digit"
+        ),
     )
 
 

@@ -676,11 +676,13 @@ struct Router(Copyable, Defaultable, Handler):
 
     def route_openapi_template(self, i: Int) -> String:
         """Route ``i``'s path as an OpenAPI template: ``{id}`` stays
-        ``{id}`` and ``{*rest}`` becomes ``{rest}`` (``/`` for the empty root)."""
+        ``{id}`` and ``{*rest}`` becomes ``{rest}`` (``/`` for the empty root).
+        """
         return _segs_to_openapi_template(self._routes[i].segs)
 
     def route_path_params(self, i: Int) -> List[String]:
-        """Names of route ``i``'s path parameters (``{name}`` and ``{*name}`` segments)."""
+        """Names of route ``i``'s path parameters (``{name}`` and ``{*name}`` segments).
+        """
         var out = List[String]()
         for j in range(len(self._routes[i].segs)):
             if self._routes[i].segs[j].kind != SEG_LITERAL:

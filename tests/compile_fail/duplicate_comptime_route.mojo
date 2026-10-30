@@ -1,5 +1,12 @@
 # expect: duplicate route: GET /items/{name}
-from dodo.http import ComptimeRoute, ComptimeRouter, Method, Request, Response, ok
+from dodo.http import (
+    ComptimeRoute,
+    ComptimeRouter,
+    Method,
+    Request,
+    Response,
+    ok,
+)
 
 
 def handler(req: Request) raises -> Response:
