@@ -153,11 +153,9 @@ def bad_request(msg: String = "Bad Request") -> Response:
     return resp^
 
 
-def not_found(path: String = "") -> Response:
-    """Create a 404 Not Found response."""
+def not_found() -> Response:
+    """Create a 404 Not Found response with a fixed body."""
     var msg = "Not Found"
-    if path.byte_length() > 0:
-        msg = "Not Found: " + path
     var resp = Response(
         status=Status.NOT_FOUND,
         reason="Not Found",

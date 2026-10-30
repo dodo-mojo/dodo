@@ -10,8 +10,13 @@ per-(method, path) inner handler. It supports:
 - **Catch-all tail**: a final segment ``"{*rest}"`` matches the rest of
   the path (captured as ``req.param("rest")``, including path
   separators). It needs at least one remaining segment.
+- **Decoded params**: captured values are percent-decoded once, and a bad
+  escape returns **400**. A decoded value can hold ``/``, ``..`` or a NUL
+  byte, so check it before using it as a file path. Literal segments are
+  compared undecoded: ``/%75sers`` does not match ``/users``.
 - **Method dispatch**: ``get`` / ``post`` / ``put`` / ``patch`` /
   ``delete`` / ``head`` register one handler per (method, path) pair.
+  Registering a pair twice raises, and so does mounting a prefix twice.
 
 Unknown paths return **404 Not Found**; known paths called with the
 wrong method return **405 Method Not Allowed** with a synthesised
@@ -61,12 +66,14 @@ from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method, _child_request
 from .response import Response, Status
-from .server import not_found
+from .server import bad_request, not_found
 from ._route_path import (
     SEG_CATCH_ALL,
     SEG_LITERAL,
     _Segment,
     parse_route_path,
+    percent_decode,
+    same_route_shape,
 )
 
 
@@ -475,6 +482,17 @@ struct Router(Copyable, Defaultable, Handler):
         """
         self._fallback = Optional[FnHandler](FnHandler(handler))
 
+    def _check_new_route(
+        self, method: String, path: String, segs: List[_Segment]
+    ) raises:
+        """Raise if ``method`` and ``segs`` are already registered, since
+        the second handler could never run."""
+        for i in range(len(self._routes)):
+            if self._routes[i].method != method:
+                continue
+            if same_route_shape(self._routes[i].segs, segs):
+                raise Error("duplicate route: ", method, " ", path)
+
     def _add_fn(
         mut self,
         method: String,
@@ -482,6 +500,7 @@ struct Router(Copyable, Defaultable, Handler):
         handler: def(Request) raises thin -> Response,
     ) raises:
         var segs = _compile_segments(path)
+        self._check_new_route(method, path, segs)
         self._handlers.append(FnHandler(handler))
         self._routes.append(
             _Route(method, segs^, _ROUTE_KIND_FN, len(self._handlers) - 1)
@@ -583,6 +602,7 @@ struct Router(Copyable, Defaultable, Handler):
         ``dodo/runtime/``.
         """
         var segs = _compile_segments(path)
+        self._check_new_route(method, path, segs)
         if handler.may_block():
             self._may_block = True
         var addr = Pool[H].alloc_move(handler^)
@@ -630,6 +650,9 @@ struct Router(Copyable, Defaultable, Handler):
         var psegs = _compile_segments(prefix)
         if len(psegs) == 0:
             raise Error("mount prefix must have at least one segment")
+        for i in range(len(self._mounts)):
+            if same_route_shape(self._mounts[i].segs, psegs):
+                raise Error("duplicate mount: ", prefix)
         var wrapper = _MountedRouter[H](sub^, len(psegs))
         if wrapper.may_block():
             self._may_block = True
@@ -653,11 +676,13 @@ struct Router(Copyable, Defaultable, Handler):
 
     def route_openapi_template(self, i: Int) -> String:
         """Route ``i``'s path as an OpenAPI template: ``{id}`` stays
-        ``{id}`` and ``{*rest}`` becomes ``{rest}`` (``/`` for the empty root)."""
+        ``{id}`` and ``{*rest}`` becomes ``{rest}`` (``/`` for the empty root).
+        """
         return _segs_to_openapi_template(self._routes[i].segs)
 
     def route_path_params(self, i: Int) -> List[String]:
-        """Names of route ``i``'s path parameters (``{name}`` and ``{*name}`` segments)."""
+        """Names of route ``i``'s path parameters (``{name}`` and ``{*name}`` segments).
+        """
         var out = List[String]()
         for j in range(len(self._routes[i].segs)):
             if self._routes[i].segs[j].kind != SEG_LITERAL:
@@ -701,8 +726,10 @@ struct Router(Copyable, Defaultable, Handler):
             # is always populated (even if empty), so guard on length to
             # avoid a pointless lazy-allocate for literal-only routes.
             if len(m_result.params) > 0:
-                for kv in m_result.params.items():
-                    child.params_mut()[kv.key] = kv.value
+                try:
+                    _set_decoded_params(child, m_result.params)
+                except:
+                    return _bad_percent_escape()
             return self._call_route(i, child)
 
         # No direct route handled the request. A mounted sub-router
@@ -729,7 +756,7 @@ struct Router(Copyable, Defaultable, Handler):
                 return self._fallback.value().serve(req)
             var child = _child_request(req, req.url)
             return self._fallback.value().serve(child)
-        return not_found(req.url)
+        return not_found()
 
     def may_block(self) -> Bool:
         """Whether some route or mount below this router is offloaded."""
@@ -858,6 +885,22 @@ def _match(
     if i == len(url_segs):
         result.matched = True
     return result^
+
+
+def _set_decoded_params(
+    mut child: Request, params: Dict[String, String]
+) raises:
+    """Store the captures of a match on ``child``, percent-decoded."""
+    for kv in params.items():
+        child.params_mut()[kv.key] = percent_decode(
+            kv.value, plus_is_space=False
+        )
+
+
+def _bad_percent_escape() -> Response:
+    """The 400 for a param that does not decode. The body is fixed, so
+    request input is never reflected."""
+    return bad_request("Bad percent escape in path")
 
 
 def _method_not_allowed(allowed: List[String]) raises -> Response:

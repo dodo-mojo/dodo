@@ -46,12 +46,14 @@ comptime constant — no separate ``set_handler`` step, no runtime
 handler-index book-keeping.
 
 A malformed pattern (see [`dodo.http._route_path`](./_route_path.mojo))
-is a compile error carrying the parser's message.
+is a compile error carrying the parser's message, and so is a method
+and path listed twice.
 
 Same status-code contract as ``Router``: unknown path → 404, known
 path wrong method → 405 with a synthesised ``Allow:`` header. Path
-parameters captured by a match land in ``req.params_mut()`` just
-like the runtime router.
+parameters captured by a match land in ``req.params_mut()``
+percent-decoded, and a bad escape returns 400, just like the runtime
+router.
 """
 
 from .handler import Handler
@@ -59,8 +61,14 @@ from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method, _child_request
 from .response import Response, Status
-from ._route_path import parse_route_path
-from .router import _match, _split_path
+from ._route_path import parse_route_path, same_route_shape
+from .router import (
+    _bad_percent_escape,
+    _match,
+    _set_decoded_params,
+    _split_path,
+)
+from .server import not_found
 
 
 # ── Public comptime route metadata ──────────────────────────────────────────
@@ -98,6 +106,27 @@ def _path_only(url: String) -> String:
     return url
 
 
+def _duplicate_route_error(routes: List[ComptimeRoute]) -> String:
+    """Describe the first route listed twice, or return an empty string.
+
+    Runs at compile time.
+    """
+    for i in range(len(routes)):
+        var parsed = parse_route_path(String(routes[i].pattern))
+        for j in range(i):
+            if routes[j].method != routes[i].method:
+                continue
+            var earlier = parse_route_path(String(routes[j].pattern))
+            if same_route_shape(earlier.segs, parsed.segs):
+                return String(
+                    "duplicate route: ",
+                    routes[i].method,
+                    " ",
+                    routes[i].pattern,
+                )
+    return String("")
+
+
 # ── ComptimeRouter ──────────────────────────────────────────────────────────
 
 
@@ -126,6 +155,9 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
         Same contract as ``Router.serve``: first matching route wins;
         404 on no match; 405 with ``Allow:`` header on method mismatch.
         """
+        comptime duplicate = _duplicate_route_error(Self.routes)
+        comptime assert len(duplicate.as_bytes()) == 0, duplicate
+
         var url_path = _path_only(req.url)
         var seg_in = _split_path(url_path)
 
@@ -147,8 +179,10 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
                         return r.handler(req)
                     var child = _child_request(req, req.url)
                     if len(matched.params) > 0:
-                        for kv in matched.params.items():
-                            child.params_mut()[kv.key] = kv.value
+                        try:
+                            _set_decoded_params(child, matched.params)
+                        except:
+                            return _bad_percent_escape()
                     return r.handler(child)
                 else:
                     var m = String(r.method)
@@ -157,22 +191,10 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
 
         if len(allowed) > 0:
             return _method_not_allowed(allowed)
-        return _not_found(req.url)
+        return not_found()
 
 
 # ── Response helpers ────────────────────────────────────────────────────────
-
-
-def _not_found(url: String) raises -> Response:
-    var msg = "Not Found"
-    if url.byte_length() > 0:
-        msg = "Not Found: " + url
-    var body = List[UInt8](capacity=msg.byte_length())
-    for b in msg.as_bytes():
-        body.append(b)
-    var resp = Response(status=Status.NOT_FOUND, reason="Not Found", body=body^)
-    resp.headers.set("Content-Type", "text/plain")
-    return resp^
 
 
 def _method_not_allowed(allowed: List[String]) raises -> Response:

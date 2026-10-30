@@ -416,11 +416,6 @@ def test_not_found_helper() raises:
     assert_equal(resp.status, 404)
 
 
-def test_not_found_with_path() raises:
-    var resp = not_found("/missing")
-    assert_equal(resp.status, 404)
-
-
 def test_internal_error_helper() raises:
     var resp = internal_error()
     assert_equal(resp.status, 500)
