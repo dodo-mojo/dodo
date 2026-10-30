@@ -602,8 +602,10 @@ struct Router(Copyable, Defaultable, Handler):
 
     # ── Sub-router mounting ─────────────────────────────────────────────────
 
-    def mount(mut self, prefix: String, var sub: Router) raises:
-        """Mount ``sub`` under the literal path ``prefix``.
+    def mount[
+        H: Handler & Copyable
+    ](mut self, prefix: String, var sub: H) raises:
+        """Mount the handler ``sub`` under the literal path ``prefix``.
 
         Every request whose path starts with ``prefix`` (and which no
         directly-registered route on this Router already handled) is
@@ -620,22 +622,23 @@ struct Router(Copyable, Defaultable, Handler):
             prefix: A literal path prefix, e.g. ``"/api/v1"``. Param
                     (``{id}``) and catch-all (``{*rest}``) segments are
                     rejected.
-            sub:    The sub-router to mount; ownership transfers in.
+            sub:    The handler to mount, usually a ``Router`` or an ``App``;
+                    ownership transfers in.
         """
         if "{" in prefix:
             raise Error("mount prefix must be literal: no '{' allowed")
         var psegs = _compile_segments(prefix)
         if len(psegs) == 0:
             raise Error("mount prefix must have at least one segment")
-        var wrapper = _MountedRouter(sub^, len(psegs))
+        var wrapper = _MountedRouter[H](sub^, len(psegs))
         if wrapper.may_block():
             self._may_block = True
-        var addr = Pool[_MountedRouter].alloc_move(wrapper^)
+        var addr = Pool[_MountedRouter[H]].alloc_move(wrapper^)
         ref reg = self._struct_registry[]
         reg.addrs.append(addr)
-        reg.serve_thunks.append(_struct_serve_thunk[_MountedRouter])
-        reg.destroy_thunks.append(_struct_destroy_thunk[_MountedRouter])
-        reg.blocking_thunks.append(_struct_blocking_thunk[_MountedRouter])
+        reg.serve_thunks.append(_struct_serve_thunk[_MountedRouter[H]])
+        reg.destroy_thunks.append(_struct_destroy_thunk[_MountedRouter[H]])
+        reg.blocking_thunks.append(_struct_blocking_thunk[_MountedRouter[H]])
         self._mounts.append(_Mount(psegs^, len(reg.addrs) - 1))
 
     # ── Route introspection (OpenAPI derivation) ───────────────────────────────
@@ -763,9 +766,9 @@ struct Router(Copyable, Defaultable, Handler):
 # ── Mounted sub-router wrapper ───────────────────────────────────────────────
 
 
-struct _MountedRouter(Copyable, Handler):
+struct _MountedRouter[H: Handler & Copyable](Copyable, Handler):
     """Boxed wrapper that strips a mount prefix and forwards to a
-    nested ``Router``.
+    nested handler.
 
     Stored in the parent Router's struct-handler registry; its
     ``serve`` rebuilds the request path with the first
@@ -774,10 +777,10 @@ struct _MountedRouter(Copyable, Handler):
     against paths relative to its mount point.
     """
 
-    var sub: Router
+    var sub: Self.H
     var prefix_segs: Int
 
-    def __init__(out self, var sub: Router, prefix_segs: Int):
+    def __init__(out self, var sub: Self.H, prefix_segs: Int):
         self.sub = sub^
         self.prefix_segs = prefix_segs
 
@@ -796,7 +799,7 @@ struct _MountedRouter(Copyable, Handler):
         return _child_request(req, rebuilt)
 
     def serve(self, req: Request) raises -> Response:
-        return self.sub.serve(self._child(req))
+        return self.sub.serve(self._child(req)).lower()
 
     def may_block(self) -> Bool:
         return self.sub.may_block()

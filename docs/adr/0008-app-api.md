@@ -13,7 +13,7 @@ Probes on Mojo 1.2.0 ([research/app-api-probes](../../research/app-api-probes)) 
 
 1. **One `App`.** It owns the router, the state, middleware and the server: `App(state=...)`, `app.get[path](handler)` and the other methods, `app.mount`, `app.serve(port=)`.
 2. **Route paths are compile-time parameters** with `{name}` params and a named `{*rest}` catch-all. A malformed path fails the build. The old `:name` and bare `*` are errors that show the new form.
-3. **Handlers are plain functions** taking `Request` plus typed arguments, each recognized at compile time by a marker trait on its type (`PathParams`, `QueryParams`, `JsonBody`, `State`) and filled through reflection: a path params struct, a query struct, a JSON body struct, and the app state. The path's `{name}` params are checked against the path struct's fields while compiling. Up to about five typed arguments.
+3. **Handlers are plain functions** taking `Request` plus typed arguments, each recognized at compile time by a marker trait on its type (`PathParams`, `QueryParams`, `JsonBody`, `AppState`) and filled through reflection: a path params struct, a query struct, a JSON body struct, and the app state. The path's `{name}` params are checked against the path struct's fields while compiling. Up to about five typed arguments.
 4. **A handler returns a `Response` or any serializable struct.** A struct becomes a 200 JSON response, and its type gives OpenAPI the response schema.
 5. **One app state.** A user-defined struct, given to `App` once and shared read-only by every worker, so a model is loaded once. Handlers take it as a typed argument. Anything inside it that changes does its own locking.
 6. **Errors are problem+json** (RFC 9457): a bad path, query or body is a 400 that names the field; an unhandled error is a 500 that hides its message unless dev mode is on.
@@ -29,7 +29,6 @@ Probes on Mojo 1.2.0 ([research/app-api-probes](../../research/app-api-probes)) 
 
 ## Open
 
-- Mounting a wrapped `App` and sharing state between a parent and a mounted `App` are not probed yet; test both while building `App`.
 - Whether `Router` and `ComptimeRouter` merge, and the lookup structure: settled with numbers in the performance pass.
 
 ## Alternatives considered

@@ -25,7 +25,8 @@
 - [ ] Keep-alive idle timeout defaults to 500 ms; `docs/design.md` says 5 s. Settle it in the performance pass (short is cheaper under load, long saves reconnects).
 - [ ] Model workers (ADR-0005): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`.
 - [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer.
-- [ ] App API (ADR-0008): `App`, compile-time `{name}` paths, typed-argument handlers, struct or `Response` returns, one shared app state, problem+json errors, a small `dodo` root API. Probe handlers with three to five typed arguments and how middleware attaches first.
+- [x] App API (ADR-0008): `App`, compile-time `{name}` paths, typed-argument handlers, struct or `Response` returns, one shared app state, problem+json errors.
+- [ ] Shrink the `dodo` root to what an app needs (ADR-0008 point 8); `App` is added, the old exports are still there.
 - [ ] Router fixes from `docs/app-layer-audit.md`: the 404 body echoes the URL and query, duplicate routes are accepted silently, path params may not be percent-decoded.
 - [ ] Deprecation warnings from `dodo/http/_offload_pool.mojo` (positional `__getitem__`) in every build.
 - [ ] Tests for `HttpFrontend` and the reflection serde (`serialize_json`, `deserialize_json`).
