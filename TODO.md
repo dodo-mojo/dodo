@@ -27,7 +27,7 @@
 - [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer.
 - [x] App API (ADR-0008): `App`, compile-time `{name}` paths, typed-argument handlers, struct or `Response` returns, one shared app state, problem+json errors.
 - [ ] Shrink the `dodo` root to what an app needs (ADR-0008 point 8); `App` is added, the old exports are still there.
-- [ ] Router fixes from `docs/app-layer-audit.md`: the 404 body echoes the URL and query, duplicate routes are accepted silently, path params may not be percent-decoded.
+- [x] Router fixes from `docs/app-layer-audit.md`: fixed 404 body, duplicate routes and mounts raise, path params are percent-decoded once by the router.
 - [ ] Deprecation warnings from `dodo/http/_offload_pool.mojo` (positional `__getitem__`) in every build.
 - [ ] Tests for `HttpFrontend` and the reflection serde (`serialize_json`, `deserialize_json`).
 - [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup.
