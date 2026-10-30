@@ -1,4 +1,4 @@
-from dodo import HttpServer, HttpClient, Router, Request, Response, ok
+from dodo.http import HttpServer, HttpClient, Router, Request, Response, ok
 from dodo.ws import WsClient
 from dodo.tls import TlsConfig
 
