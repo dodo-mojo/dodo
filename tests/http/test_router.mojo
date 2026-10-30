@@ -33,6 +33,12 @@ from dodo.http import (
 from dodo.http.handler import Handler
 
 
+@fieldwise_init
+struct _DupHandler(Copyable, Handler):
+    def serve(self, req: Request) raises -> Response:
+        return ok("dup")
+
+
 # ── Handler functions used across tests ─────────────────────────────────────
 
 
@@ -748,6 +754,132 @@ def test_router_default_404_without_fallback() raises:
     r.get("/", h_home)
     var resp = r.serve(Request(method=Method.GET, url="/nope"))
     assert_equal(resp.status, Status.NOT_FOUND)
+
+
+# ── Router audit fixes ──────────────────────────────────────────────────────
+
+
+def test_404_body_does_not_echo_the_url() raises:
+    var r = Router()
+    r.get("/", h_home)
+    var resp = r.serve(Request(method=Method.GET, url="/<script>?token=abc"))
+    assert_equal(resp.status, Status.NOT_FOUND)
+    assert_equal(resp.text(), "Not Found")
+
+
+def test_duplicate_route_raises() raises:
+    var r = Router()
+    r.get("/users", h_list_users)
+    with assert_raises(contains="duplicate route: GET /users"):
+        r.get("/users", h_home)
+
+
+def test_duplicate_route_ignores_trailing_slash() raises:
+    var r = Router()
+    r.get("/users", h_list_users)
+    with assert_raises(contains="duplicate route"):
+        r.get("/users/", h_home)
+
+
+def test_duplicate_route_ignores_param_name() raises:
+    var r = Router()
+    r.get("/users/{id}", h_get_user)
+    with assert_raises(contains="duplicate route: GET /users/{name}"):
+        r.get("/users/{name}", h_home)
+
+
+def test_duplicate_struct_route_raises() raises:
+    var r = Router()
+    r.get("/users", h_list_users)
+    with assert_raises(contains="duplicate route"):
+        r.get[_DupHandler]("/users", _DupHandler())
+
+
+def test_same_path_other_method_is_not_a_duplicate() raises:
+    var r = Router()
+    r.get("/users", h_list_users)
+    r.post("/users", h_create_user)
+    assert_equal(r.route_count(), 2)
+
+
+def test_param_and_catch_all_are_not_duplicates() raises:
+    var r = Router()
+    r.get("/files/{id}", h_get_user)
+    r.get("/files/{*rest}", h_files)
+    r.get("/files/latest", h_home)
+    assert_equal(r.route_count(), 3)
+
+
+def test_duplicate_mount_raises() raises:
+    var r = Router()
+    r.mount("/api", Router())
+    with assert_raises(contains="duplicate mount: /api"):
+        r.mount("/api/", Router())
+
+
+def test_param_is_percent_decoded() raises:
+    var r = Router()
+    r.get("/users/{id}", h_get_user)
+    var resp = r.serve(Request(method=Method.GET, url="/users/a%20b+c"))
+    assert_equal(resp.text(), "user:a b+c")
+
+
+def test_param_is_decoded_only_once() raises:
+    var r = Router()
+    r.get("/users/{id}", h_get_user)
+    var resp = r.serve(Request(method=Method.GET, url="/users/a%2541"))
+    assert_equal(resp.text(), "user:a%41")
+
+
+def test_param_keeps_an_encoded_slash_in_one_segment() raises:
+    var r = Router()
+    r.get("/users/{id}", h_get_user)
+    var resp = r.serve(Request(method=Method.GET, url="/users/a%2Fb"))
+    assert_equal(resp.text(), "user:a/b")
+
+
+def test_catch_all_is_percent_decoded() raises:
+    var r = Router()
+    r.get("/files/{*rest}", h_files)
+    var resp = r.serve(Request(method=Method.GET, url="/files/a%20b/c%21"))
+    assert_equal(resp.text(), "files:a b/c!")
+
+
+def test_literal_segment_is_matched_undecoded() raises:
+    var r = Router()
+    r.get("/users", h_list_users)
+    var resp = r.serve(Request(method=Method.GET, url="/%75sers"))
+    assert_equal(resp.status, Status.NOT_FOUND)
+
+
+def test_bad_escape_in_param_is_400() raises:
+    var r = Router()
+    r.get("/users/{id}", h_get_user)
+    var truncated = r.serve(Request(method=Method.GET, url="/users/a%2"))
+    assert_equal(truncated.status, Status.BAD_REQUEST)
+    var not_hex = r.serve(Request(method=Method.GET, url="/users/a%zz"))
+    assert_equal(not_hex.status, Status.BAD_REQUEST)
+
+
+def test_invalid_utf8_in_param_is_400() raises:
+    var r = Router()
+    r.get("/users/{id}", h_get_user)
+    var resp = r.serve(Request(method=Method.GET, url="/users/%ff"))
+    assert_equal(resp.status, Status.BAD_REQUEST)
+
+
+def test_400_body_does_not_echo_the_param() raises:
+    var r = Router()
+    r.get("/users/{id}", h_get_user)
+    var resp = r.serve(Request(method=Method.GET, url="/users/%zz<b>"))
+    assert_equal(resp.text(), "Bad percent escape in path")
+
+
+def test_bad_escape_on_wrong_method_is_405() raises:
+    var r = Router()
+    r.post("/users/{id}", h_create_user)
+    var resp = r.serve(Request(method=Method.GET, url="/users/%zz"))
+    assert_equal(resp.status, Status.METHOD_NOT_ALLOWED)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────

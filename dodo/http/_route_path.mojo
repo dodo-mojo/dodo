@@ -9,6 +9,9 @@ Route syntax:
 
 ``parse_route_path`` never raises, so it can run at compile time. It
 returns the first problem it finds as text in ``error``.
+
+``same_route_shape`` tells whether two routes match the same requests.
+``percent_decode`` turns a raw param or query value into its text.
 """
 
 from .proto.ascii import ascii_unchecked_string
@@ -212,3 +215,57 @@ def parse_route_path(path: String) -> ParsedRoutePath:
         names.append(inner)
         result.segs.append(_Segment(kind, inner))
     return result^
+
+
+def same_route_shape(a: List[_Segment], b: List[_Segment]) -> Bool:
+    """True when ``a`` and ``b`` match the same paths. Param names do not
+    count: ``/users/{id}`` and ``/users/{name}`` are the same shape."""
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        if a[i].kind != b[i].kind:
+            return False
+        if a[i].kind == SEG_LITERAL and a[i].text != b[i].text:
+            return False
+    return True
+
+
+def _hex_value(byte: UInt8) -> Int:
+    """The value of one hex digit, or -1."""
+    var c = Int(byte)
+    if c >= ord("0") and c <= ord("9"):
+        return c - ord("0")
+    if c >= ord("a") and c <= ord("f"):
+        return c - ord("a") + 10
+    if c >= ord("A") and c <= ord("F"):
+        return c - ord("A") + 10
+    return -1
+
+
+def percent_decode(text: String, plus_is_space: Bool) raises -> String:
+    """Decode ``%XX`` escapes, and ``+`` when ``plus_is_space`` is set.
+
+    Raises on a truncated or non-hex escape, and when the decoded bytes
+    are not valid UTF-8.
+    """
+    var bytes = text.as_bytes()
+    var decoded = List[UInt8](capacity=len(bytes))
+    var i = 0
+    while i < len(bytes):
+        var byte = bytes[i]
+        if byte == UInt8(ord("+")) and plus_is_space:
+            decoded.append(UInt8(ord(" ")))
+            i += 1
+        elif byte == UInt8(ord("%")):
+            if i + 2 >= len(bytes):
+                raise Error("bad percent escape in '", text, "'")
+            var high = _hex_value(bytes[i + 1])
+            var low = _hex_value(bytes[i + 2])
+            if high < 0 or low < 0:
+                raise Error("bad percent escape in '", text, "'")
+            decoded.append(UInt8(high * 16 + low))
+            i += 3
+        else:
+            decoded.append(byte)
+            i += 1
+    return String(from_utf8=decoded)

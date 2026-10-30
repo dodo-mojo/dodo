@@ -31,6 +31,10 @@ def root_home(req: Request) raises -> Response:
     return ok("root")
 
 
+def h_echo_name(req: Request) raises -> Response:
+    return ok(req.param("name"))
+
+
 def _v1() raises -> Router:
     var r = Router()
     r.get("/users", v1_users)
@@ -107,6 +111,15 @@ def test_unmounted_prefix_is_404() raises:
     var app = _mounted_app()
     var resp = app.serve(Request(method=Method.GET, url="/api/v3/users"))
     assert_equal(resp.status, 404)
+
+
+def test_mount_decodes_param_once() raises:
+    var r = Router()
+    var sub = Router()
+    sub.get("/{name}", h_echo_name)
+    r.mount("/api", sub^)
+    var resp = r.serve(Request(method=Method.GET, url="/api/a%2520b"))
+    assert_equal(resp.text(), "a%20b")
 
 
 def test_mount_survives_router_copy() raises:

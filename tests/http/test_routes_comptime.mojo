@@ -228,6 +228,34 @@ def test_comptime_matches_runtime_route_shape() raises:
 # ── Catch-all and path errors are found at compile time ─────────────────────
 
 
+def test_404_body_does_not_echo_the_url() raises:
+    var resp = _router().serve(Request(method=Method.GET, url="/<b>?token=abc"))
+    assert_equal(resp.status, Status.NOT_FOUND)
+    assert_equal(resp.text(), "Not Found")
+
+
+def h_echo_id(req: Request) raises -> Response:
+    return ok(req.param("id"))
+
+
+comptime _ECHO_ROUTES: List[ComptimeRoute] = [
+    ComptimeRoute(Method.GET, "/items/{id}", h_echo_id),
+]
+
+
+def test_param_is_percent_decoded() raises:
+    var r = ComptimeRouter[_ECHO_ROUTES]()
+    var resp = r.serve(Request(method=Method.GET, url="/items/a%20b"))
+    assert_equal(resp.text(), "a b")
+
+
+def test_bad_escape_in_param_is_400() raises:
+    var r = ComptimeRouter[_ECHO_ROUTES]()
+    var resp = r.serve(Request(method=Method.GET, url="/items/%zz"))
+    assert_equal(resp.status, Status.BAD_REQUEST)
+    assert_equal(resp.text(), "Bad percent escape in path")
+
+
 comptime _CATCH_ALL_NOT_LAST = parse_route_path("/files/{*rest}/meta")
 comptime _OLD_PARAM = parse_route_path("/users/:id")
 comptime _OLD_WILDCARD = parse_route_path("/files/*")

@@ -37,7 +37,7 @@ from ..json.reflection import deserialize_json
 from ..json.serialize import to_json_string
 from ..net import IpAddr, SocketAddr
 from ..runtime._thread import num_cpus
-from ._route_path import SEG_LITERAL, parse_route_path
+from ._route_path import SEG_LITERAL, parse_route_path, percent_decode
 from ._server.responses import ok_json_of
 from .handler import Handler
 from .request import Method, Request
@@ -115,42 +115,6 @@ def _handler_failed(req: Request, error: Error) -> Response:
 # Text to value
 
 
-def _hex_value(byte: UInt8) -> Int:
-    """The value of one hex digit, or -1."""
-    var c = Int(byte)
-    if c >= ord("0") and c <= ord("9"):
-        return c - ord("0")
-    if c >= ord("a") and c <= ord("f"):
-        return c - ord("a") + 10
-    if c >= ord("A") and c <= ord("F"):
-        return c - ord("A") + 10
-    return -1
-
-
-def _percent_decode(text: String, plus_is_space: Bool) raises -> String:
-    var bytes = text.as_bytes()
-    var decoded = List[UInt8](capacity=len(bytes))
-    var i = 0
-    while i < len(bytes):
-        var byte = bytes[i]
-        if byte == UInt8(ord("+")) and plus_is_space:
-            decoded.append(UInt8(ord(" ")))
-            i += 1
-        elif byte == UInt8(ord("%")):
-            if i + 2 >= len(bytes):
-                raise Error("bad percent escape in '", text, "'")
-            var high = _hex_value(bytes[i + 1])
-            var low = _hex_value(bytes[i + 2])
-            if high < 0 or low < 0:
-                raise Error("bad percent escape in '", text, "'")
-            decoded.append(UInt8(high * 16 + low))
-            i += 3
-        else:
-            decoded.append(byte)
-            i += 1
-    return String(from_utf8=decoded)
-
-
 def _parse_int(text: String, name: String) raises -> Int:
     try:
         return Int(text)
@@ -177,15 +141,12 @@ def _text_of[
     from_path: Bool
 ](req: Request, name: String) raises -> Optional[String]:
     comptime if from_path:
-        var value = req.param_opt(name)
-        if not value:
-            return None
-        return _percent_decode(value.value(), plus_is_space=False)
+        return req.param_opt(name)
     else:
         var value = req.query_param_opt(name)
         if not value:
             return None
-        return _percent_decode(value.value(), plus_is_space=True)
+        return percent_decode(value.value(), plus_is_space=True)
 
 
 def _write_field[

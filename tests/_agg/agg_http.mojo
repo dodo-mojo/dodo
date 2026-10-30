@@ -3438,6 +3438,57 @@ from test_router import (
 from test_router import (
     test_router_default_404_without_fallback as test_router__test_router_default_404_without_fallback,
 )
+from test_router import (
+    test_404_body_does_not_echo_the_url as test_router__test_404_body_does_not_echo_the_url,
+)
+from test_router import (
+    test_duplicate_route_raises as test_router__test_duplicate_route_raises,
+)
+from test_router import (
+    test_duplicate_route_ignores_trailing_slash as test_router__test_duplicate_route_ignores_trailing_slash,
+)
+from test_router import (
+    test_duplicate_route_ignores_param_name as test_router__test_duplicate_route_ignores_param_name,
+)
+from test_router import (
+    test_duplicate_struct_route_raises as test_router__test_duplicate_struct_route_raises,
+)
+from test_router import (
+    test_same_path_other_method_is_not_a_duplicate as test_router__test_same_path_other_method_is_not_a_duplicate,
+)
+from test_router import (
+    test_param_and_catch_all_are_not_duplicates as test_router__test_param_and_catch_all_are_not_duplicates,
+)
+from test_router import (
+    test_duplicate_mount_raises as test_router__test_duplicate_mount_raises,
+)
+from test_router import (
+    test_param_is_percent_decoded as test_router__test_param_is_percent_decoded,
+)
+from test_router import (
+    test_param_is_decoded_only_once as test_router__test_param_is_decoded_only_once,
+)
+from test_router import (
+    test_param_keeps_an_encoded_slash_in_one_segment as test_router__test_param_keeps_an_encoded_slash_in_one_segment,
+)
+from test_router import (
+    test_catch_all_is_percent_decoded as test_router__test_catch_all_is_percent_decoded,
+)
+from test_router import (
+    test_literal_segment_is_matched_undecoded as test_router__test_literal_segment_is_matched_undecoded,
+)
+from test_router import (
+    test_bad_escape_in_param_is_400 as test_router__test_bad_escape_in_param_is_400,
+)
+from test_router import (
+    test_invalid_utf8_in_param_is_400 as test_router__test_invalid_utf8_in_param_is_400,
+)
+from test_router import (
+    test_400_body_does_not_echo_the_param as test_router__test_400_body_does_not_echo_the_param,
+)
+from test_router import (
+    test_bad_escape_on_wrong_method_is_405 as test_router__test_bad_escape_on_wrong_method_is_405,
+)
 from test_router_copy import (
     test_empty_router_copies_without_allocating_shared_cell as test_router_copy__test_empty_router_copies_without_allocating_shared_cell,
 )
@@ -3491,6 +3542,9 @@ from test_router_mount import (
 )
 from test_router_mount import (
     test_unmounted_prefix_is_404 as test_router_mount__test_unmounted_prefix_is_404,
+)
+from test_router_mount import (
+    test_mount_decodes_param_once as test_router_mount__test_mount_decodes_param_once,
 )
 from test_router_mount import (
     test_mount_survives_router_copy as test_router_mount__test_mount_survives_router_copy,
@@ -3554,6 +3608,15 @@ from test_routes_comptime import (
 )
 from test_routes_comptime import (
     test_comptime_matches_runtime_route_shape as test_routes_comptime__test_comptime_matches_runtime_route_shape,
+)
+from test_routes_comptime import (
+    test_404_body_does_not_echo_the_url as test_routes_comptime__test_404_body_does_not_echo_the_url,
+)
+from test_routes_comptime import (
+    test_param_is_percent_decoded as test_routes_comptime__test_param_is_percent_decoded,
+)
+from test_routes_comptime import (
+    test_bad_escape_in_param_is_400 as test_routes_comptime__test_bad_escape_in_param_is_400,
 )
 from test_routes_comptime import (
     test_comptime_parse_reports_catch_all_not_last as test_routes_comptime__test_comptime_parse_reports_catch_all_not_last,
@@ -3680,9 +3743,6 @@ from test_server import (
 )
 from test_server import (
     test_not_found_helper as test_server__test_not_found_helper,
-)
-from test_server import (
-    test_not_found_with_path as test_server__test_not_found_with_path,
 )
 from test_server import (
     test_internal_error_helper as test_server__test_internal_error_helper,
@@ -6663,6 +6723,23 @@ def main() raises:
     suite.test[test_router__test_router_custom_fallback]()
     suite.test[test_router__test_router_fallback_not_used_on_405]()
     suite.test[test_router__test_router_default_404_without_fallback]()
+    suite.test[test_router__test_404_body_does_not_echo_the_url]()
+    suite.test[test_router__test_duplicate_route_raises]()
+    suite.test[test_router__test_duplicate_route_ignores_trailing_slash]()
+    suite.test[test_router__test_duplicate_route_ignores_param_name]()
+    suite.test[test_router__test_duplicate_struct_route_raises]()
+    suite.test[test_router__test_same_path_other_method_is_not_a_duplicate]()
+    suite.test[test_router__test_param_and_catch_all_are_not_duplicates]()
+    suite.test[test_router__test_duplicate_mount_raises]()
+    suite.test[test_router__test_param_is_percent_decoded]()
+    suite.test[test_router__test_param_is_decoded_only_once]()
+    suite.test[test_router__test_param_keeps_an_encoded_slash_in_one_segment]()
+    suite.test[test_router__test_catch_all_is_percent_decoded]()
+    suite.test[test_router__test_literal_segment_is_matched_undecoded]()
+    suite.test[test_router__test_bad_escape_in_param_is_400]()
+    suite.test[test_router__test_invalid_utf8_in_param_is_400]()
+    suite.test[test_router__test_400_body_does_not_echo_the_param]()
+    suite.test[test_router__test_bad_escape_on_wrong_method_is_405]()
     # tests/http/test_router_copy.mojo
     suite.test[
         test_router_copy__test_empty_router_copies_without_allocating_shared_cell
@@ -6694,6 +6771,7 @@ def main() raises:
     suite.test[test_router_mount__test_mount_sub_router_404]()
     suite.test[test_router_mount__test_mount_sub_router_405]()
     suite.test[test_router_mount__test_unmounted_prefix_is_404]()
+    suite.test[test_router_mount__test_mount_decodes_param_once]()
     suite.test[test_router_mount__test_mount_survives_router_copy]()
     suite.test[test_router_mount__test_mount_rejects_param_prefix]()
     suite.test[test_router_mount__test_mount_rejects_catch_all_prefix]()
@@ -6718,6 +6796,9 @@ def main() raises:
     suite.test[
         test_routes_comptime__test_comptime_matches_runtime_route_shape
     ]()
+    suite.test[test_routes_comptime__test_404_body_does_not_echo_the_url]()
+    suite.test[test_routes_comptime__test_param_is_percent_decoded]()
+    suite.test[test_routes_comptime__test_bad_escape_in_param_is_400]()
     suite.test[
         test_routes_comptime__test_comptime_parse_reports_catch_all_not_last
     ]()
@@ -6771,7 +6852,6 @@ def main() raises:
     suite.test[test_server__test_bad_request_helper]()
     suite.test[test_server__test_bad_request_custom_msg]()
     suite.test[test_server__test_not_found_helper]()
-    suite.test[test_server__test_not_found_with_path]()
     suite.test[test_server__test_internal_error_helper]()
     suite.test[test_server__test_redirect_default]()
     suite.test[test_server__test_redirect_301]()
