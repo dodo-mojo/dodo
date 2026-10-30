@@ -39,7 +39,7 @@ from std.memory import Layout, OptionalPointer, Pointer, alloc, stack_allocation
 from std.sys.info import CompilationTarget
 
 from dodo.errors import log_handler_error, map_handler_error
-from dodo.runtime._thread import ThreadHandle, _OpaquePtr, _null_ptr, num_cpus
+from dodo.runtime._thread import ThreadHandle, _OpaquePtr, num_cpus
 from dodo.runtime.pool import Pool
 
 from .cancel import CancelCell, CancelReason
@@ -105,9 +105,9 @@ def _wake(fd: Int):
     an eventfd on Linux (8 bytes) and a pipe on macOS (1 byte); ``poll``
     drains either."""
     var buf = stack_allocation[8, UInt8]()
-    buf[0] = UInt8(1)
+    buf[unsafe_offset=0] = UInt8(1)
     for i in range(1, 8):
-        buf[i] = UInt8(0)
+        buf[unsafe_offset=i] = UInt8(0)
     var n = 1
     comptime if CompilationTarget.is_linux():
         n = 8
@@ -380,7 +380,6 @@ def _pool_thread(arg: _OpaquePtr) -> _OpaquePtr:
         var jp = offload_job(job)
         jp[].run()
         _port_complete(jp[].port, job)
-    return _null_ptr()
 
 
 def _pool_start(threads: Int, depth: Int) raises -> Int:
