@@ -28,9 +28,10 @@
 - [x] App API (ADR-0008): `App`, compile-time `{name}` paths, typed-argument handlers, struct or `Response` returns, one shared app state, problem+json errors.
 - [x] Shrink the `dodo` root to what an app needs (ADR-0008 point 8).
 - [x] Router fixes from `docs/app-layer-audit.md`: fixed 404 body, duplicate routes and mounts raise, path params are percent-decoded once by the router.
-- [ ] Deprecation warnings from `dodo/http/_offload_pool.mojo` (positional `__getitem__`) in every build.
-- [ ] Tests for `HttpFrontend` and the reflection serde (`serialize_json`, `deserialize_json`).
-- [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup.
+- [x] Deprecation warnings from `dodo/http/_offload_pool.mojo` (positional `__getitem__`) in every build.
+- [x] Tests for `HttpFrontend` and the reflection serde (`serialize_json`, `deserialize_json`).
+- [ ] `HttpFrontend.run_worker` and `StreamFrontend.run_worker` swallow every error from the reactor loop with `except: pass`. Check whether a worker that fails this way goes unnoticed, and report it if so.
+- [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup. `Router._match` is about 3% of busy samples at 25 routes (`docs/app-layer-audit.md`); recheck with hundreds of routes.
 
 ## Developer experience and AI agents (Phase 2 and later)
 

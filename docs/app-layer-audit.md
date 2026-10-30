@@ -79,3 +79,24 @@ Items 1 to 3 are fixed and tested: all three were confirmed by failing tests fir
 3. **Return type:** a handler returns a `Response` or any serializable struct. A struct becomes a 200 JSON response, and its type gives OpenAPI the response schema.
 4. **State:** one user-defined state struct, given to `App` once and shared read-only by every worker. Handlers take it as a typed argument. Anything inside that changes (counters, caches) does its own locking.
 5. **Middleware:** wrap the whole app in the stock generic wrappers, with `App` holding its shared handle internally. Middleware for some routes goes on a mounted `App`.
+
+## End-to-end run and profile (2026-10-30)
+
+`research/app-bench/` holds the app, the checks (`e2e.py`) and the load script (`load.sh`). Measured on one Apple Silicon Mac with 10 cores, with wrk on the same machine (2 threads, 32 connections), 2 server workers and 5 s per endpoint. Debug symbols were on. These numbers compare endpoints with each other; they are not a benchmark result for the framework.
+
+| Endpoint | Requests/s | p50 | p99 |
+|---|---:|---:|---:|
+| Bare handler, no App | 227,819 | 111 us | 386 us |
+| App, first route | 239,157 | 113 us | 255 us |
+| App, literal route after 20 others | 224,950 | 119 us | 326 us |
+| One path param, state, JSON response | 197,764 | 135 us | 399 us |
+| Two path params | 197,733 | 139 us | 506 us |
+| Query params | 220,483 | 126 us | 275 us |
+| JSON body | 207,314 | 135 us | 298 us |
+| 404 | 225,892 | 119 us | 322 us |
+
+- **Bug found and fixed:** a client that pipelined two requests and then half-closed got only the first response. `_apply_keepalive_policy` closed on `peer_eof` even with a whole request still buffered.
+- **Profile:** `sample` over 8 s on the path, query and body endpoints puts 68 to 72% of busy samples in `sendto` and `recvfrom`. The largest dodo symbol is `Router._match` at about 3%.
+- **Decision:** no App-layer rewrite. A faster router lookup would gain about 3% at 25 routes, and the larger gain is in syscalls per request, which belongs to the performance pass on Linux.
+- **Memory:** RSS stayed flat across sustained load on each endpoint, including 10 s of 400 responses. This is a growth check over seconds, not a leak checker.
+- **Not covered:** Linux and epoll, TLS, HTTP/2 through App, and long soak runs.

@@ -4129,6 +4129,9 @@ from test_server_reactor_state import (
     test_pipelined_requests_flush_together_in_order as test_server_reactor_state__test_pipelined_requests_flush_together_in_order,
 )
 from test_server_reactor_state import (
+    test_half_close_after_pipelined_requests_answers_them_all as test_server_reactor_state__test_half_close_after_pipelined_requests_answers_them_all,
+)
+from test_server_reactor_state import (
     test_handler_error_for_head_has_no_body as test_server_reactor_state__test_handler_error_for_head_has_no_body,
 )
 from test_server_reactor_state import (
@@ -7082,6 +7085,9 @@ def main() raises:
     suite.test[test_server_reactor_state__test_ws_426_closes_connection]()
     suite.test[
         test_server_reactor_state__test_pipelined_requests_flush_together_in_order
+    ]()
+    suite.test[
+        test_server_reactor_state__test_half_close_after_pipelined_requests_answers_them_all
     ]()
     suite.test[
         test_server_reactor_state__test_handler_error_for_head_has_no_body
