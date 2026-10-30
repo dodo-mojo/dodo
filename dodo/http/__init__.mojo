@@ -148,9 +148,19 @@ from .handler import (
     WithCancel,
     FnHandler,
     FnHandlerCT,
+    HandlerInfallible,
+    WithRaises,
 )
 from .offload import Offload
-from .app import App, AppState, JsonBody, NoState, PathParams, QueryParams, serve
+from .app import (
+    App,
+    AppState,
+    JsonBody,
+    NoState,
+    PathParams,
+    QueryParams,
+    serve,
+)
 from .router import Router
 from .routes import ComptimeRoute, ComptimeRouter
 from .extract import (
@@ -288,6 +298,7 @@ from .template import (
     html_escape,
 )
 from .request_chunks import RequestChunkSource
+from .cache import Cache, InMemoryCacheStore
 from .cors import Cors, CorsConfig
 from .fs import ByteRange, FileServer, parse_range
 from .proxy_protocol import (

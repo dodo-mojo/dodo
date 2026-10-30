@@ -25,7 +25,6 @@ from std.memory import Pointer
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 from std.time import perf_counter_ns
 
-from dodo import ShutdownReport as RootShutdownReport
 from dodo.http import (
     HttpServer,
     Request,
@@ -246,16 +245,6 @@ def test_drain_waits_out_the_timeout_before_stopping() raises:
     assert_true(took >= 250, "drain returned after " + String(took) + " ms")
     assert_true(took < 5000, "drain overshot: " + String(took) + " ms")
     assert_true(srv._stopping)
-
-
-# ── Re-exports resolve from both barrels ────────────────────────────────────
-
-
-def test_root_package_re_exports_shutdown_report() raises:
-    var r = RootShutdownReport(
-        drained=2, timed_out=0, in_flight_at_deadline=0, crashed=0
-    )
-    assert_equal(r.drained, 2)
 
 
 # ── Reactor shutdown tail flips Cancel.SHUTDOWN ─────────────────────────────

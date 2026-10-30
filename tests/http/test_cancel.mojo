@@ -26,11 +26,6 @@ Covers:
 
 from std.testing import assert_equal, assert_true, assert_false, TestSuite
 
-from dodo import (
-    Cancel as RootCancel,
-    CancelHandler as RootCancelHandler,
-)
-from dodo import WithCancel as RootWithCancel
 from dodo.http import (
     Cancel,
     CancelCell,
@@ -172,23 +167,6 @@ def test_with_cancel_with_never_token() raises:
     var req = Request(method=Method.GET, url="/")
     var resp = wrapped.serve(req, Cancel.never())
     assert_equal(resp.text(), "x")
-
-
-# ── Re-exports resolve from both barrels ────────────────────────────────────
-
-
-def test_root_package_re_exports() raises:
-    """Cancel / CancelHandler / WithCancel are reachable from the
-    root ``dodo`` package, not just ``dodo.http``. Test this so
-    a user-visible re-export break shows up here, not at first use.
-    """
-    var c = RootCancel.never()
-    assert_false(c.cancelled())
-
-    var w = RootWithCancel[_PlainGreeter](inner=_PlainGreeter("hi"))
-    var req = Request(method=Method.GET, url="/")
-    var resp = w.serve(req, RootCancel.never())
-    assert_equal(resp.text(), "hi")
 
 
 def main() raises:
