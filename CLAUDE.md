@@ -2,7 +2,7 @@
 
 A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision and agent harnesses run in one process. Built for humans and AI agents. Apache-2.0. GitHub: `dodo-mojo/dodo` (public). Work and PRs go to `dev` (the default branch); `production` is for releases.
 
-**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done; F7 is `Offload(handler)`, a pool for blocking handlers on every server loop; the pool keeps its own copy of the handler, sharing one that is not `Copyable` through `SharedHandler` (ADR-0004). io_uring is removed; Linux uses epoll, macOS kqueue (ADR-0007). Accepted, not built yet: model workers in supervised child processes with per-worker limits (ADR-0005) and outgoing calls on the event loop (ADR-0006). Next: the performance pass.
+**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done; F7 is `Offload(handler)`, a pool for blocking handlers on every server loop; the pool keeps its own copy of the handler, sharing one that is not `Copyable` through `SharedHandler` (ADR-0004). io_uring is removed; Linux uses epoll, macOS kqueue (ADR-0007). Accepted, not built yet: model workers in supervised child processes with per-worker limits (ADR-0005) and outgoing calls on the event loop (ADR-0006). Accepted, not built yet: the App API (ADR-0008, decisions in `docs/app-layer-audit.md`). Next: Phase 2, then the performance pass.
 
 ## Read first
 
@@ -18,7 +18,7 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 | `dodo/` | The library. `http`, `http2`, `ws`, `tls`, `tcp`, `uds`, `dns`, `net`, `runtime`, `crypto`, `io`, `json` (vendored, see `THIRD_PARTY_NOTICES.md`), `testing`, `utils`. Native wrappers in `dodo/*/ffi/`. |
 | `tests/` | One dir per package. `tests/tools/run_tests.sh` builds one binary per dir from `tests/_agg/` (generated). |
 | `fuzz/` | Fuzzers, one per parser, on the vendored harness in `fuzz/mozz/` |
-| `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`), naming, standards, ADRs |
+| `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`, `app-layer-audit.md`), naming, standards, ADRs |
 | `research/` | Throwaway spikes and audit harnesses (probe servers, fuzzers). Not shipped. |
 | `packaging/recipe.yaml` | Draft modular-community recipe for the `dodo` package |
 | `.github/` | CI (`pixi run tests` on Ubuntu and macOS, on every PR; both jobs are required to merge into `dev`), issue and PR templates, Dependabot for actions |
