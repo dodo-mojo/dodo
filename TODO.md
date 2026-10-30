@@ -30,7 +30,7 @@
 - [x] Router fixes from `docs/app-layer-audit.md`: fixed 404 body, duplicate routes and mounts raise, path params are percent-decoded once by the router.
 - [ ] Deprecation warnings from `dodo/http/_offload_pool.mojo` (positional `__getitem__`) in every build.
 - [ ] Tests for `HttpFrontend` and the reflection serde (`serialize_json`, `deserialize_json`).
-- [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup.
+- [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup. `Router._match` is about 3% of busy samples at 25 routes (`docs/app-layer-audit.md`); recheck with hundreds of routes.
 
 ## Developer experience and AI agents (Phase 2 and later)
 
