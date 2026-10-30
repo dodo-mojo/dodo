@@ -78,3 +78,4 @@ These were read from code, not yet run; the fix PR adds the tests that confirm t
 2. **Handler model:** plain functions whose typed arguments (path params, query, JSON body, state) are found by type at compile time and filled through reflection. `Handler` and `Extracted` stay as the lower-level layer for middleware and special cases.
 3. **Return type:** a handler returns a `Response` or any serializable struct. A struct becomes a 200 JSON response, and its type gives OpenAPI the response schema.
 4. **State:** one user-defined state struct, given to `App` once and shared read-only by every worker. Handlers take it as a typed argument. Anything inside that changes (counters, caches) does its own locking.
+5. **Middleware:** wrap the whole app in the stock generic wrappers, with `App` holding its shared handle internally. Middleware for some routes goes on a mounted `App`.
