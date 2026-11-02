@@ -1517,3 +1517,38 @@ extern "C" int dodo_quic_aead_open(int cipher_id,
     EVP_CIPHER_CTX_free(ctx);
     return rc;
 }
+
+/* ── RSA-OAEP encryption (MySQL caching_sha2_password over plain TCP) ───── */
+
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+
+extern "C" int dodo_rsa_oaep_encrypt(const uint8_t* pem, size_t pem_len,
+                                      const uint8_t* in, size_t in_len,
+                                      uint8_t* out, size_t out_cap,
+                                      size_t* written) {
+    if (!pem || !in || !out || !written) { set_error("null argument"); return -1; }
+    *written = 0;
+    BIO* bio = BIO_new_mem_buf(pem, (int)pem_len);
+    if (!bio) { capture_openssl_errors(); return -1; }
+    EVP_PKEY* key = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!key) { capture_openssl_errors(); return -1; }
+    int rc = -1;
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(key, nullptr);
+    do {
+        if (!ctx) break;
+        if (EVP_PKEY_encrypt_init(ctx) != 1) break;
+        if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) != 1) break;
+        size_t len = 0;
+        if (EVP_PKEY_encrypt(ctx, nullptr, &len, in, in_len) != 1) break;
+        if (len > out_cap) { set_error("output buffer too small"); break; }
+        if (EVP_PKEY_encrypt(ctx, out, &len, in, in_len) != 1) break;
+        *written = len;
+        rc = 0;
+    } while (0);
+    if (rc != 0) capture_openssl_errors();
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(key);
+    return rc;
+}
