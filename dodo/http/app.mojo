@@ -470,14 +470,17 @@ def _to_response[R: _ArgType](var value: R) raises -> Response:
 struct _Route0[S: _ArgType, R: _ArgType](Copyable, Handler):
     var handler: def(Request) raises thin -> Self.R
     var state: ArcPointer[Self.S]
+    var offload: Bool
 
     def __init__(
         out self,
         handler: def(Request) raises thin -> Self.R,
         state: ArcPointer[Self.S],
+        offload: Bool,
     ):
         self.handler = handler
         self.state = state
+        self.offload = offload
 
     def serve(self, req: Request) raises -> Response:
         try:
@@ -485,18 +488,27 @@ struct _Route0[S: _ArgType, R: _ArgType](Copyable, Handler):
         except e:
             return _handler_failed(req, e)
 
+    def may_block(self) -> Bool:
+        return self.offload
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.offload
+
 
 struct _Route1[S: _ArgType, R: _ArgType, A0: _ArgType](Copyable, Handler):
     var handler: def(Request, Self.A0) raises thin -> Self.R
     var state: ArcPointer[Self.S]
+    var offload: Bool
 
     def __init__(
         out self,
         handler: def(Request, Self.A0) raises thin -> Self.R,
         state: ArcPointer[Self.S],
+        offload: Bool,
     ):
         self.handler = handler
         self.state = state
+        self.offload = offload
 
     def serve(self, req: Request) raises -> Response:
         var a0 = _Arg[Self.A0]()
@@ -509,20 +521,29 @@ struct _Route1[S: _ArgType, R: _ArgType, A0: _ArgType](Copyable, Handler):
         except e:
             return _handler_failed(req, e)
 
+    def may_block(self) -> Bool:
+        return self.offload
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.offload
+
 
 struct _Route2[S: _ArgType, R: _ArgType, A0: _ArgType, A1: _ArgType](
     Copyable, Handler
 ):
     var handler: def(Request, Self.A0, Self.A1) raises thin -> Self.R
     var state: ArcPointer[Self.S]
+    var offload: Bool
 
     def __init__(
         out self,
         handler: def(Request, Self.A0, Self.A1) raises thin -> Self.R,
         state: ArcPointer[Self.S],
+        offload: Bool,
     ):
         self.handler = handler
         self.state = state
+        self.offload = offload
 
     def serve(self, req: Request) raises -> Response:
         var a0 = _Arg[Self.A0]()
@@ -539,20 +560,29 @@ struct _Route2[S: _ArgType, R: _ArgType, A0: _ArgType, A1: _ArgType](
         except e:
             return _handler_failed(req, e)
 
+    def may_block(self) -> Bool:
+        return self.offload
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.offload
+
 
 struct _Route3[
     S: _ArgType, R: _ArgType, A0: _ArgType, A1: _ArgType, A2: _ArgType
 ](Copyable, Handler):
     var handler: def(Request, Self.A0, Self.A1, Self.A2) raises thin -> Self.R
     var state: ArcPointer[Self.S]
+    var offload: Bool
 
     def __init__(
         out self,
         handler: def(Request, Self.A0, Self.A1, Self.A2) raises thin -> Self.R,
         state: ArcPointer[Self.S],
+        offload: Bool,
     ):
         self.handler = handler
         self.state = state
+        self.offload = offload
 
     def serve(self, req: Request) raises -> Response:
         var a0 = _Arg[Self.A0]()
@@ -571,6 +601,12 @@ struct _Route3[
         except e:
             return _handler_failed(req, e)
 
+    def may_block(self) -> Bool:
+        return self.offload
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.offload
+
 
 struct _Route4[
     S: _ArgType,
@@ -584,6 +620,7 @@ struct _Route4[
         Request, Self.A0, Self.A1, Self.A2, Self.A3
     ) raises thin -> Self.R
     var state: ArcPointer[Self.S]
+    var offload: Bool
 
     def __init__(
         out self,
@@ -591,9 +628,11 @@ struct _Route4[
             Request, Self.A0, Self.A1, Self.A2, Self.A3
         ) raises thin -> Self.R,
         state: ArcPointer[Self.S],
+        offload: Bool,
     ):
         self.handler = handler
         self.state = state
+        self.offload = offload
 
     def serve(self, req: Request) raises -> Response:
         var a0 = _Arg[Self.A0]()
@@ -616,6 +655,12 @@ struct _Route4[
         except e:
             return _handler_failed(req, e)
 
+    def may_block(self) -> Bool:
+        return self.offload
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.offload
+
 
 struct _Route5[
     S: _ArgType,
@@ -630,6 +675,7 @@ struct _Route5[
         Request, Self.A0, Self.A1, Self.A2, Self.A3, Self.A4
     ) raises thin -> Self.R
     var state: ArcPointer[Self.S]
+    var offload: Bool
 
     def __init__(
         out self,
@@ -637,9 +683,11 @@ struct _Route5[
             Request, Self.A0, Self.A1, Self.A2, Self.A3, Self.A4
         ) raises thin -> Self.R,
         state: ArcPointer[Self.S],
+        offload: Bool,
     ):
         self.handler = handler
         self.state = state
+        self.offload = offload
 
     def serve(self, req: Request) raises -> Response:
         var a0 = _Arg[Self.A0]()
@@ -669,6 +717,12 @@ struct _Route5[
         except e:
             return _handler_failed(req, e)
 
+    def may_block(self) -> Bool:
+        return self.offload
+
+    def blocking(self, req: Request) raises -> Bool:
+        return self.offload
+
 
 struct App[S: AppState = NoState](Copyable, Handler):
     """Routes, one shared state and the server.
@@ -676,6 +730,13 @@ struct App[S: AppState = NoState](Copyable, Handler):
     Copies share the routes and the state, so an `App` is cheap to hand to
     each worker. It is a `Handler`, so stock middleware can wrap it:
     `serve(Logger(app^), port=8080)`.
+
+    Pass `blocking=True` for a route whose handler blocks its thread (a
+    database query, a model call): `app.get["/users/{id}"](get_user,
+    blocking=True)`. It then runs on the offload pool, as `Offload` does
+    for a handler struct (ADR-0004), so the worker's event loop keeps
+    serving other connections. Its state must be safe to read from
+    several threads at once.
     """
 
     var _router: Router
@@ -730,31 +791,42 @@ struct App[S: AppState = NoState](Copyable, Handler):
 
     def route[
         path: String, R: _ArgType
-    ](mut self, method: String, handler: def(Request) raises thin -> R) raises:
+    ](
+        mut self,
+        method: String,
+        handler: def(Request) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
         _check_path[path]()
         comptime roles = List[Int]()
         _check_roles[path, roles]()
         self._router._add_struct(
-            method, path, _Route0[Self.S, R](handler, self._state)
+            method, path, _Route0[Self.S, R](handler, self._state, blocking)
         )
 
     def route[
         path: String, R: _ArgType, A0: _ArgType
     ](
-        mut self, method: String, handler: def(Request, A0) raises thin -> R
+        mut self,
+        method: String,
+        handler: def(Request, A0) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
         _check_path[path]()
         _check_arg[path, Self.S, A0]()
         comptime roles: List[Int] = [_role_of[A0]()]
         _check_roles[path, roles]()
         self._router._add_struct(
-            method, path, _Route1[Self.S, R, A0](handler, self._state)
+            method, path, _Route1[Self.S, R, A0](handler, self._state, blocking)
         )
 
     def route[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType
     ](
-        mut self, method: String, handler: def(Request, A0, A1) raises thin -> R
+        mut self,
+        method: String,
+        handler: def(Request, A0, A1) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
         _check_path[path]()
         _check_arg[path, Self.S, A0]()
@@ -762,7 +834,9 @@ struct App[S: AppState = NoState](Copyable, Handler):
         comptime roles: List[Int] = [_role_of[A0](), _role_of[A1]()]
         _check_roles[path, roles]()
         self._router._add_struct(
-            method, path, _Route2[Self.S, R, A0, A1](handler, self._state)
+            method,
+            path,
+            _Route2[Self.S, R, A0, A1](handler, self._state, blocking),
         )
 
     def route[
@@ -771,6 +845,7 @@ struct App[S: AppState = NoState](Copyable, Handler):
         mut self,
         method: String,
         handler: def(Request, A0, A1, A2) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
         _check_path[path]()
         _check_arg[path, Self.S, A0]()
@@ -783,7 +858,9 @@ struct App[S: AppState = NoState](Copyable, Handler):
         ]
         _check_roles[path, roles]()
         self._router._add_struct(
-            method, path, _Route3[Self.S, R, A0, A1, A2](handler, self._state)
+            method,
+            path,
+            _Route3[Self.S, R, A0, A1, A2](handler, self._state, blocking),
         )
 
     def route[
@@ -797,6 +874,7 @@ struct App[S: AppState = NoState](Copyable, Handler):
         mut self,
         method: String,
         handler: def(Request, A0, A1, A2, A3) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
         _check_path[path]()
         _check_arg[path, Self.S, A0]()
@@ -813,7 +891,7 @@ struct App[S: AppState = NoState](Copyable, Handler):
         self._router._add_struct(
             method,
             path,
-            _Route4[Self.S, R, A0, A1, A2, A3](handler, self._state),
+            _Route4[Self.S, R, A0, A1, A2, A3](handler, self._state, blocking),
         )
 
     def route[
@@ -828,6 +906,7 @@ struct App[S: AppState = NoState](Copyable, Handler):
         mut self,
         method: String,
         handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
         _check_path[path]()
         _check_arg[path, Self.S, A0]()
@@ -846,28 +925,44 @@ struct App[S: AppState = NoState](Copyable, Handler):
         self._router._add_struct(
             method,
             path,
-            _Route5[Self.S, R, A0, A1, A2, A3, A4](handler, self._state),
+            _Route5[Self.S, R, A0, A1, A2, A3, A4](
+                handler, self._state, blocking
+            ),
         )
 
     def get[
         path: String, R: _ArgType
-    ](mut self, handler: def(Request) raises thin -> R) raises:
-        self.route[path](Method.GET, handler)
+    ](
+        mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
+    ) raises:
+        self.route[path](Method.GET, handler, blocking)
 
     def get[
         path: String, R: _ArgType, A0: _ArgType
-    ](mut self, handler: def(Request, A0) raises thin -> R) raises:
-        self.route[path](Method.GET, handler)
+    ](
+        mut self,
+        handler: def(Request, A0) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.GET, handler, blocking)
 
     def get[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType
-    ](mut self, handler: def(Request, A0, A1) raises thin -> R) raises:
-        self.route[path](Method.GET, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.GET, handler, blocking)
 
     def get[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType, A2: _ArgType
-    ](mut self, handler: def(Request, A0, A1, A2) raises thin -> R) raises:
-        self.route[path](Method.GET, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.GET, handler, blocking)
 
     def get[
         path: String,
@@ -876,8 +971,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A1: _ArgType,
         A2: _ArgType,
         A3: _ArgType,
-    ](mut self, handler: def(Request, A0, A1, A2, A3) raises thin -> R) raises:
-        self.route[path](Method.GET, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2, A3) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.GET, handler, blocking)
 
     def get[
         path: String,
@@ -888,29 +987,45 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A3: _ArgType,
         A4: _ArgType,
     ](
-        mut self, handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R
+        mut self,
+        handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
-        self.route[path](Method.GET, handler)
+        self.route[path](Method.GET, handler, blocking)
 
     def post[
         path: String, R: _ArgType
-    ](mut self, handler: def(Request) raises thin -> R) raises:
-        self.route[path](Method.POST, handler)
+    ](
+        mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
+    ) raises:
+        self.route[path](Method.POST, handler, blocking)
 
     def post[
         path: String, R: _ArgType, A0: _ArgType
-    ](mut self, handler: def(Request, A0) raises thin -> R) raises:
-        self.route[path](Method.POST, handler)
+    ](
+        mut self,
+        handler: def(Request, A0) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.POST, handler, blocking)
 
     def post[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType
-    ](mut self, handler: def(Request, A0, A1) raises thin -> R) raises:
-        self.route[path](Method.POST, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.POST, handler, blocking)
 
     def post[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType, A2: _ArgType
-    ](mut self, handler: def(Request, A0, A1, A2) raises thin -> R) raises:
-        self.route[path](Method.POST, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.POST, handler, blocking)
 
     def post[
         path: String,
@@ -919,8 +1034,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A1: _ArgType,
         A2: _ArgType,
         A3: _ArgType,
-    ](mut self, handler: def(Request, A0, A1, A2, A3) raises thin -> R) raises:
-        self.route[path](Method.POST, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2, A3) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.POST, handler, blocking)
 
     def post[
         path: String,
@@ -931,29 +1050,45 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A3: _ArgType,
         A4: _ArgType,
     ](
-        mut self, handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R
+        mut self,
+        handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
-        self.route[path](Method.POST, handler)
+        self.route[path](Method.POST, handler, blocking)
 
     def put[
         path: String, R: _ArgType
-    ](mut self, handler: def(Request) raises thin -> R) raises:
-        self.route[path](Method.PUT, handler)
+    ](
+        mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
+    ) raises:
+        self.route[path](Method.PUT, handler, blocking)
 
     def put[
         path: String, R: _ArgType, A0: _ArgType
-    ](mut self, handler: def(Request, A0) raises thin -> R) raises:
-        self.route[path](Method.PUT, handler)
+    ](
+        mut self,
+        handler: def(Request, A0) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PUT, handler, blocking)
 
     def put[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType
-    ](mut self, handler: def(Request, A0, A1) raises thin -> R) raises:
-        self.route[path](Method.PUT, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PUT, handler, blocking)
 
     def put[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType, A2: _ArgType
-    ](mut self, handler: def(Request, A0, A1, A2) raises thin -> R) raises:
-        self.route[path](Method.PUT, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PUT, handler, blocking)
 
     def put[
         path: String,
@@ -962,8 +1097,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A1: _ArgType,
         A2: _ArgType,
         A3: _ArgType,
-    ](mut self, handler: def(Request, A0, A1, A2, A3) raises thin -> R) raises:
-        self.route[path](Method.PUT, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2, A3) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PUT, handler, blocking)
 
     def put[
         path: String,
@@ -974,29 +1113,45 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A3: _ArgType,
         A4: _ArgType,
     ](
-        mut self, handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R
+        mut self,
+        handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
-        self.route[path](Method.PUT, handler)
+        self.route[path](Method.PUT, handler, blocking)
 
     def patch[
         path: String, R: _ArgType
-    ](mut self, handler: def(Request) raises thin -> R) raises:
-        self.route[path](Method.PATCH, handler)
+    ](
+        mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
+    ) raises:
+        self.route[path](Method.PATCH, handler, blocking)
 
     def patch[
         path: String, R: _ArgType, A0: _ArgType
-    ](mut self, handler: def(Request, A0) raises thin -> R) raises:
-        self.route[path](Method.PATCH, handler)
+    ](
+        mut self,
+        handler: def(Request, A0) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PATCH, handler, blocking)
 
     def patch[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType
-    ](mut self, handler: def(Request, A0, A1) raises thin -> R) raises:
-        self.route[path](Method.PATCH, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PATCH, handler, blocking)
 
     def patch[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType, A2: _ArgType
-    ](mut self, handler: def(Request, A0, A1, A2) raises thin -> R) raises:
-        self.route[path](Method.PATCH, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PATCH, handler, blocking)
 
     def patch[
         path: String,
@@ -1005,8 +1160,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A1: _ArgType,
         A2: _ArgType,
         A3: _ArgType,
-    ](mut self, handler: def(Request, A0, A1, A2, A3) raises thin -> R) raises:
-        self.route[path](Method.PATCH, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2, A3) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.PATCH, handler, blocking)
 
     def patch[
         path: String,
@@ -1017,29 +1176,45 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A3: _ArgType,
         A4: _ArgType,
     ](
-        mut self, handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R
+        mut self,
+        handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
-        self.route[path](Method.PATCH, handler)
+        self.route[path](Method.PATCH, handler, blocking)
 
     def delete[
         path: String, R: _ArgType
-    ](mut self, handler: def(Request) raises thin -> R) raises:
-        self.route[path](Method.DELETE, handler)
+    ](
+        mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
+    ) raises:
+        self.route[path](Method.DELETE, handler, blocking)
 
     def delete[
         path: String, R: _ArgType, A0: _ArgType
-    ](mut self, handler: def(Request, A0) raises thin -> R) raises:
-        self.route[path](Method.DELETE, handler)
+    ](
+        mut self,
+        handler: def(Request, A0) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.DELETE, handler, blocking)
 
     def delete[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType
-    ](mut self, handler: def(Request, A0, A1) raises thin -> R) raises:
-        self.route[path](Method.DELETE, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.DELETE, handler, blocking)
 
     def delete[
         path: String, R: _ArgType, A0: _ArgType, A1: _ArgType, A2: _ArgType
-    ](mut self, handler: def(Request, A0, A1, A2) raises thin -> R) raises:
-        self.route[path](Method.DELETE, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.DELETE, handler, blocking)
 
     def delete[
         path: String,
@@ -1048,8 +1223,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A1: _ArgType,
         A2: _ArgType,
         A3: _ArgType,
-    ](mut self, handler: def(Request, A0, A1, A2, A3) raises thin -> R) raises:
-        self.route[path](Method.DELETE, handler)
+    ](
+        mut self,
+        handler: def(Request, A0, A1, A2, A3) raises thin -> R,
+        blocking: Bool = False,
+    ) raises:
+        self.route[path](Method.DELETE, handler, blocking)
 
     def delete[
         path: String,
@@ -1060,9 +1239,11 @@ struct App[S: AppState = NoState](Copyable, Handler):
         A3: _ArgType,
         A4: _ArgType,
     ](
-        mut self, handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R
+        mut self,
+        handler: def(Request, A0, A1, A2, A3, A4) raises thin -> R,
+        blocking: Bool = False,
     ) raises:
-        self.route[path](Method.DELETE, handler)
+        self.route[path](Method.DELETE, handler, blocking)
 
 
 def _serve_on[
