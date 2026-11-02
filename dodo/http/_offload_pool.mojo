@@ -39,6 +39,12 @@ from std.memory import Layout, OptionalPointer, Pointer, alloc, stack_allocation
 from std.sys.info import CompilationTarget
 
 from dodo.errors import log_handler_error, map_handler_error
+from dodo.runtime._sync import cond_new as _cond_new
+from dodo.runtime._sync import lock as _lock
+from dodo.runtime._sync import mutex_new as _mutex_new
+from dodo.runtime._sync import signal as _signal
+from dodo.runtime._sync import unlock as _unlock
+from dodo.runtime._sync import wait as _wait
 from dodo.runtime._thread import ThreadHandle, _OpaquePtr, num_cpus
 from dodo.runtime.pool import Pool
 
@@ -46,58 +52,6 @@ from .cancel import CancelCell, CancelReason
 from .handler import CancelHandler, Handler
 from .request import Request
 from .response import Response
-
-
-# ── pthread mutex and condition variable ──────────────────────────────────
-
-
-comptime _SYNC_BYTES: Int = 64
-"""Room for a ``pthread_mutex_t`` or ``pthread_cond_t`` on glibc, musl
-and macOS (40 to 64 bytes)."""
-
-
-def _sync_alloc() -> Pointer[UInt8, MutUntrackedOrigin]:
-    var p = alloc(Layout[UInt8](count=_SYNC_BYTES)).unsafe_leak()
-    for i in range(_SYNC_BYTES):
-        p[unsafe_offset=i] = UInt8(0)
-    return p
-
-
-def _mutex_new() -> Pointer[UInt8, MutUntrackedOrigin]:
-    var mu = _sync_alloc()
-    _ = external_call["pthread_mutex_init", Int32](
-        mu.unsafe_bitcast[Int8](), Int(0)
-    )
-    return mu
-
-
-def _cond_new() -> Pointer[UInt8, MutUntrackedOrigin]:
-    var cv = _sync_alloc()
-    _ = external_call["pthread_cond_init", Int32](
-        cv.unsafe_bitcast[Int8](), Int(0)
-    )
-    return cv
-
-
-def _lock(mu: Pointer[UInt8, MutUntrackedOrigin]):
-    _ = external_call["pthread_mutex_lock", Int32](mu.unsafe_bitcast[Int8]())
-
-
-def _unlock(mu: Pointer[UInt8, MutUntrackedOrigin]):
-    _ = external_call["pthread_mutex_unlock", Int32](mu.unsafe_bitcast[Int8]())
-
-
-def _wait(
-    cv: Pointer[UInt8, MutUntrackedOrigin],
-    mu: Pointer[UInt8, MutUntrackedOrigin],
-):
-    _ = external_call["pthread_cond_wait", Int32](
-        cv.unsafe_bitcast[Int8](), mu.unsafe_bitcast[Int8]()
-    )
-
-
-def _signal(cv: Pointer[UInt8, MutUntrackedOrigin]):
-    _ = external_call["pthread_cond_signal", Int32](cv.unsafe_bitcast[Int8]())
 
 
 def _wake(fd: Int):
@@ -539,9 +493,7 @@ def _open_port(
 ) raises -> Int:
     var pool = _pool_start(threads, depth)
     return Pool[OffloadPort].alloc_move(
-        OffloadPort(
-            pool, handler_addr, serve, drop_handler, wake_fd
-        )
+        OffloadPort(pool, handler_addr, serve, drop_handler, wake_fd)
     )
 
 

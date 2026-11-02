@@ -118,7 +118,7 @@ struct RawSocket(Movable):
     Lifecycle:
     - ``__init__``: calls ``socket(2)``; raises on failure.
     - ``__deinit__``: calls ``close(2)`` when ``fd >= 0``.
-    - ``__moveinit__``: transfers ownership; source ``fd`` becomes ``INVALID_FD``.
+    - Move initializer: transfers ownership; source ``fd`` becomes ``INVALID_FD``.
     - ``close()``: explicit, idempotent close.
 
     Fields:

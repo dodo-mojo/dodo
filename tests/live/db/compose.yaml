@@ -1,0 +1,142 @@
+# Databases for the dodo.db driver tests.
+#
+#   docker compose -f tests/live/db/compose.yaml up -d --wait
+#   pixi run tests-db
+#   docker compose -f tests/live/db/compose.yaml down -v
+#
+# Ports are moved off the defaults so they don't clash with databases
+# already running on the machine, and kept below 49152, the range Windows
+# reserves for itself at random. Credentials are test-only.
+#
+# `certs` writes a self-signed certificate naming only localhost to
+# build/db-certs/ (git-ignored), so the tests can check every TLS mode,
+# verified ones included, against PostgreSQL and MySQL.
+
+name: dodo-db
+
+services:
+  certs:
+    image: alpine/openssl:3.5.4
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        test -s /certs/server.crt ||
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=localhost
+        -addext subjectAltName=DNS:localhost
+        -keyout /certs/server.key -out /certs/server.crt
+    volumes: ["../../../build/db-certs:/certs"]
+
+  postgres:
+    image: postgres:17-alpine
+    depends_on:
+      certs: { condition: service_completed_successfully }
+    # A bind mount from Windows can't be chown-ed or chmod-ed, and Postgres
+    # refuses a key other users can read, so copy it first (MySQL too).
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        cp /certs/server.crt /certs/server.key /tmp/ &&
+        chown postgres /tmp/server.crt /tmp/server.key && chmod 600 /tmp/server.key &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key
+    volumes: ["../../../build/db-certs:/certs:ro"]
+    environment:
+      POSTGRES_USER: dodo
+      POSTGRES_PASSWORD: dodo-test
+      POSTGRES_DB: dodo
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    ports: ["45432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dodo"]
+      interval: 2s
+      retries: 30
+
+  cockroach:
+    image: cockroachdb/cockroach:latest-v25.2
+    command: start-single-node --insecure --store=type=mem,size=1GiB
+    ports: ["46257:26257"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health?ready=1"]
+      interval: 2s
+      retries: 60
+
+  mysql:
+    image: mysql:8.4
+    depends_on:
+      certs: { condition: service_completed_successfully }
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        cp /certs/server.crt /certs/server.key /tmp/ &&
+        chown mysql /tmp/server.crt /tmp/server.key && chmod 600 /tmp/server.key &&
+        exec docker-entrypoint.sh mysqld --ssl-cert=/tmp/server.crt --ssl-key=/tmp/server.key
+    volumes: ["../../../build/db-certs:/certs:ro"]
+    environment:
+      MYSQL_ROOT_PASSWORD: dodo-root
+      MYSQL_USER: dodo
+      MYSQL_PASSWORD: dodo-test
+      MYSQL_DATABASE: dodo
+    ports: ["43306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-udodo", "-pdodo-test"]
+      interval: 2s
+      retries: 60
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD: dodo-root
+      MARIADB_USER: dodo
+      MARIADB_PASSWORD: dodo-test
+      MARIADB_DATABASE: dodo
+    ports: ["43307:3306"]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      retries: 60
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass dodo-test
+    ports: ["46379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "dodo-test", "ping"]
+      interval: 2s
+      retries: 30
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    command: valkey-server --requirepass dodo-test
+    ports: ["46380:6379"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "dodo-test", "ping"]
+      interval: 2s
+      retries: 30
+
+  mongo:
+    image: mongo:8
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: dodo
+      MONGO_INITDB_ROOT_PASSWORD: dodo-test
+    ports: ["47017:27017"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+      interval: 2s
+      retries: 60
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8-alpine
+    environment:
+      CLICKHOUSE_USER: dodo
+      CLICKHOUSE_PASSWORD: dodo-test
+      CLICKHOUSE_DB: dodo
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["48123:8123"]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      retries: 60

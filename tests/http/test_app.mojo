@@ -407,6 +407,25 @@ def test_mounted_group_shares_state_and_takes_middleware() raises:
     assert_equal(app.serve(_get("/admin/nope")).status, 404)
 
 
+def test_blocking_routes_are_offloaded() raises:
+    var app = App(state=Db("people"))
+    app.get["/fast"](h_plain)
+    assert_false(app.may_block())
+    app.get["/slow/{id}"](h_id, blocking=True)
+    app.post["/slow"](h_state, blocking=True)
+    assert_true(app.may_block())
+    assert_true(app.blocking(_get("/slow/7")))
+    assert_true(app.blocking(_post("/slow", "")))
+    assert_false(app.blocking(_get("/fast")))
+    assert_false(app.blocking(_get("/nope")))
+    assert_equal(app.serve(_get("/slow/7")).status, 200)
+
+    var sub = app.group()
+    sub.get["/q"](h_state, blocking=True)
+    app.mount("/sub", sub^)
+    assert_true(app.blocking(_get("/sub/q")))
+
+
 def test_group_starts_with_no_routes() raises:
     var app = App()
     app.get["/"](h_plain)

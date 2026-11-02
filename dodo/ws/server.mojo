@@ -1111,7 +1111,7 @@ def _handle_ws_connection(
 # lifetime. By this point the fd is already detached from the reactor and
 # back in blocking mode, so the connection's whole lifecycle -- every
 # ``recv`` / ``send_text`` / ``close``, and the final socket close in
-# ``WsConnection.__del__`` -- happens on that one thread. No fd is ever
+# ``WsConnection.__deinit__`` -- happens on that one thread. No fd is ever
 # touched from two threads, so nothing has to marshal writes across them.
 
 

@@ -2,7 +2,7 @@
 
 A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision and agent harnesses run in one process. Built for humans and AI agents. Apache-2.0. GitHub: `dodo-mojo/dodo` (public). Work and PRs go to `dev` (the default branch); `production` is for releases.
 
-**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done; F7 is `Offload(handler)`, a pool for blocking handlers on every server loop; the pool keeps its own copy of the handler, sharing one that is not `Copyable` through `SharedHandler` (ADR-0004). io_uring is removed; Linux uses epoll, macOS kqueue (ADR-0007). Accepted, not built yet: model workers in supervised child processes with per-worker limits (ADR-0005) and outgoing calls on the event loop (ADR-0006). The App API is built (`dodo/http/app.mojo`, ADR-0008); the `dodo` root exports only what an app needs, everything else is imported from its subpackage. Next: the rest of Phase 2, then the performance pass.
+**Status:** networking core imported (ADR-0003): HTTP/1.1, HTTP/2, TLS, WebSocket, client, reactor. It's our code now: dodo names, our conventions, no upstream history. The upstream name appears only in `THIRD_PARTY_NOTICES.md` (MIT requires it). Audit fixes F1–F10 done; F7 is `Offload(handler)`, a pool for blocking handlers on every server loop; the pool keeps its own copy of the handler, sharing one that is not `Copyable` through `SharedHandler` (ADR-0004). io_uring is removed; Linux uses epoll, macOS kqueue (ADR-0007). Accepted, not built yet: model workers in supervised child processes with per-worker limits (ADR-0005) and outgoing calls on the event loop (ADR-0006). The App API is built (`dodo/http/app.mojo`, ADR-0008); the `dodo` root exports only what an app needs, everything else is imported from its subpackage. Native database drivers are built (`dodo.db`, ADR-0009): PostgreSQL/CockroachDB, MySQL/MariaDB, SQLite, Redis/Valkey, MongoDB, ClickHouse. Next: the rest of Phase 2, then the performance pass.
 
 ## Read first
 
@@ -10,15 +10,17 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 - `docs/engineering-standards.md`: how we write code, tests, docs, commits. **Follow it.**
 - `docs/adr/`: major decisions only. Read before changing anything they cover.
 - `TODO.md`: open tasks, split into what the human does and what Claude does.
+- `.dodo/docs/`: the Mojo docs for the toolchain in use, plus dodo's guides and API (`pixi run docs-pull`; generated, gitignored). Check Mojo syntax and stdlib APIs there, not from memory.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `dodo/` | The library. `http`, `http2`, `ws`, `tls`, `tcp`, `uds`, `dns`, `net`, `runtime`, `crypto`, `io`, `json` (vendored, see `THIRD_PARTY_NOTICES.md`), `testing`, `utils`. Native wrappers in `dodo/*/ffi/`. |
-| `tests/` | One dir per package. `tests/compile_fail/` holds programs that must fail to build with the message in their first line. `tests/tools/run_tests.sh` builds one binary per dir from `tests/_agg/` (generated). |
+| `dodo/` | The library. `http`, `http2`, `ws`, `tls`, `tcp`, `uds`, `dns`, `net`, `runtime`, `crypto`, `io`, `json` (vendored, see `THIRD_PARTY_NOTICES.md`), `db` (one subpackage per database), `testing`, `utils`. Native wrappers in `dodo/*/ffi/`. |
+| `tests/` | One dir per package. `tests/compile_fail/` holds programs that must fail to build with the message in their first line. `tests/tools/run_tests.sh` builds one binary per dir from `tests/_agg/` (generated). `tests/live/` is not in it: h2spec, Autobahn, and `tests/live/db/` (database suites against Docker). |
 | `fuzz/` | Fuzzers, one per parser, on the vendored harness in `fuzz/mozz/` |
-| `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`, `app-layer-audit.md`), naming, standards, ADRs |
+| `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`, `app-layer-audit.md`), naming, standards, ADRs, the database guide (`databases.md`) |
+| `tools/` | Dev scripts run through pixi tasks (`docs_pull.py`) |
 | `research/` | Throwaway spikes and audit harnesses (probe servers, fuzzers). Not shipped. |
 | `packaging/recipe.yaml` | Draft modular-community recipe for the `dodo` package |
 | `.github/` | CI (`pixi run tests` on Ubuntu and macOS, on every PR; both jobs are required to merge into `dev`), issue and PR templates, Dependabot for actions |
@@ -28,7 +30,7 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 
 - Two dev machines. **macOS (Apple Silicon):** native, repo at `~/anubhav/dodo`, kqueue backend, FFI wrappers built with clang++. **Windows:** Mojo has no Windows support, so build in **WSL Ubuntu-24.04** (`wsl -d Ubuntu-24.04 -- bash -l`), repo at `/mnt/e/dodo`. Linux-only code (epoll, accept balancing) is only tested on WSL. macOS has no `-z nodelete`, so each wrapper library pins itself (`dodo/utils/ffi/pin_self.h`); never overwrite an installed `.so` in place (macOS SIGKILLs the next process that loads it).
 - Mojo 1.2.0 and MAX/modular 26.7.0 via pixi (`~/.pixi/bin`). `.pixi/config.toml` keeps the env out of the repo (detached environments).
-- `pixi run tests` runs everything (about 2,590 tests). After adding a test file: `pixi run tests-gen`. One file: `pixi run mojo -I . tests/http/test_x.mojo`. Use `AGG_JOBS=2` on 16 GB machines.
+- `pixi run tests` runs everything without Docker (about 2,630 tests). `pixi run tests-db` starts the databases in Docker (`tests/live/db/compose.yaml`) and runs the driver suites; `DODO_DB_NO_COMPOSE=1` when they are already up. After adding a test file: `pixi run tests-gen`. One file: `pixi run mojo -I . tests/http/test_x.mojo`. Use `AGG_JOBS=2` on 16 GB machines.
 - Mojo 1.x: `def` only (`fn` is removed), and `raises` must be explicit. GPU code is under `max.gpu`.
 - GPU work runs on the Windows machine's RTX 5070 (verified working). The Mac has no NVIDIA GPU.
 - Reference clones live in WSL under `~/src/`.

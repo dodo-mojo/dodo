@@ -480,6 +480,20 @@ int dodo_hmac_sha256_verify(const uint8_t* key, size_t key_len,
                               const uint8_t* msg, size_t msg_len,
                               const uint8_t* mac_32);
 
+/* ── RSA-OAEP (MySQL caching_sha2_password over plain TCP) ──────────────── */
+
+/**
+ * Encrypt ``in`` with the RSA public key in ``pem`` (SubjectPublicKeyInfo
+ * PEM), OAEP padding with SHA-1, as MySQL's full authentication expects.
+ *
+ * @return 0 on success with the ciphertext length in ``*written``, -1 on
+ *         error (``dodo_ssl_last_error`` says why).
+ */
+int dodo_rsa_oaep_encrypt(const uint8_t* pem, size_t pem_len,
+                          const uint8_t* in, size_t in_len,
+                          uint8_t* out, size_t out_cap,
+                          size_t* written);
+
 /* ── QUIC AEAD (RFC 9001 §5.3) ──────────────────────────────────────────── */
 
 /*

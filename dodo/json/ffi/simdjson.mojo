@@ -1,4 +1,4 @@
-"""simdjson parsing through ``libdodo_simdjson.so``.
+"""Bindings to simdjson through ``libdodo_simdjson.so``.
 
 The library (built by ``dodo/json/ffi/build.sh``) parses JSON with simdjson
 and lays the result out as a ``Document`` tape in its own buffers. This

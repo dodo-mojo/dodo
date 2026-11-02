@@ -118,6 +118,9 @@ from test_app import (
     test_mounted_group_shares_state_and_takes_middleware as test_app__test_mounted_group_shares_state_and_takes_middleware,
 )
 from test_app import (
+    test_blocking_routes_are_offloaded as test_app__test_blocking_routes_are_offloaded,
+)
+from test_app import (
     test_group_starts_with_no_routes as test_app__test_group_starts_with_no_routes,
 )
 from test_async_chunk_source import (
@@ -4927,6 +4930,7 @@ def main() raises:
     suite.test[test_app__test_all_methods_register]()
     suite.test[test_app__test_stock_middleware_wraps_the_app]()
     suite.test[test_app__test_mounted_group_shares_state_and_takes_middleware]()
+    suite.test[test_app__test_blocking_routes_are_offloaded]()
     suite.test[test_app__test_group_starts_with_no_routes]()
     # tests/http/test_async_chunk_source.mojo
     suite.test[test_async_chunk_source__test_chunk_poll_tristate]()
