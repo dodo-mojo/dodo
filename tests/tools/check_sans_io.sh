@@ -30,6 +30,18 @@ SANS_IO_FILES=(
     "dodo/http2/state.mojo"
     "dodo/http/proto/h2c_upgrade.mojo"
     "dodo/http/proto/ascii.mojo"
+    "dodo/db/error.mojo"
+    "dodo/db/param.mojo"
+    "dodo/db/rows.mojo"
+    "dodo/db/_bytes.mojo"
+    "dodo/db/_url.mojo"
+    "dodo/db/_scram.mojo"
+    "dodo/db/postgres/protocol.mojo"
+    "dodo/db/mysql/protocol.mojo"
+    "dodo/db/redis/protocol.mojo"
+    "dodo/db/mongo/bson.mojo"
+    "dodo/db/mongo/protocol.mojo"
+    "dodo/db/clickhouse/protocol.mojo"
 )
 
 FORBIDDEN_PREFIXES=(
@@ -51,7 +63,8 @@ for file in "${SANS_IO_FILES[@]}"; do
     fi
     for prefix in "${FORBIDDEN_PREFIXES[@]}"; do
         # Anchored on from/import so prose in docstrings never matches.
-        pattern="^(from|import)[[:space:]]+(${prefix//./\\.})\\b"
+        # The second form catches relative imports (`from ...tls import`).
+        pattern="^(from|import)[[:space:]]+((${prefix//./\\.})|\\.+${prefix#dodo.})\\b"
         if grep -nE "$pattern" "$file" >/dev/null 2>&1; then
             echo "check-sans-io: $file imports $prefix:" >&2
             grep -nE "$pattern" "$file" >&2
