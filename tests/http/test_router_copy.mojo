@@ -125,22 +125,17 @@ def test_drop_clone_first_keeps_original_alive() raises:
     assert_equal(resp.status, Status.OK)
 
 
-@__parameter
-def _compile_check_router_into_multiworker_serve():
-    """Compile-only contract: ``Router`` satisfies
-    ``Handler & Copyable`` so the multi-worker overload of
-    ``HttpServer.serve`` resolves. Body never runs (``False`` guard);
-    if Router lost ``Copyable`` we'd fail at type-check time before
-    the test even starts."""
-    pass
+def _accepts_copyable_handler[H: Handler & Copyable](handler: H) -> Bool:
+    """Compiles only for ``Handler & Copyable`` types."""
+    return True
 
 
 def test_router_compiles_for_multi_worker_serve_overload() raises:
     """Router is Copyable so ``srv.serve(router^,
     num_workers=N)`` resolves to the
-    ``serve[H: Handler & Copyable]`` overload. Compile success of
-    this file (and of the multicore example) is the assertion."""
-    _compile_check_router_into_multiworker_serve()
+    ``serve[H: Handler & Copyable]`` overload. If Router loses either
+    trait, this file fails to build."""
+    assert_true(_accepts_copyable_handler(Router()))
 
 
 def test_mixed_fn_and_struct_routes_copy_correctly() raises:
