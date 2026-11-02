@@ -44,6 +44,7 @@ bench = { features = ["bench"], solve-group = "default" }
 [tasks]
 tests = "bash tests/tools/run_tests.sh"
 tests-gen = "python3 tests/tools/gen_test_aggregates.py"
+docs-pull = "python3 tools/docs_pull.py"
 tests-db = "bash tests/tools/run_db_tests.sh"
 tls-certs = "bash tests/tools/make_tls_certs.sh"
 check-sans-io = "bash tests/tools/check_sans_io.sh"

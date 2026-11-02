@@ -20,3 +20,6 @@ fuzz/corpus/
 .idea/
 .vscode/
 *.swp
+
+# Generated docs for agents (`pixi run docs-pull`)
+.dodo/docs/
