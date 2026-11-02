@@ -269,7 +269,7 @@ struct Reactor(Movable):
                 _ = _close(kq)
                 raise e^
 
-    # No custom __moveinit__ needed: Mojo's default move for Movable
+    # No custom move initializer needed: Mojo's default move for Movable
     # transfers the bytes and declares the source dead, so __deinit__ is not
     # called on the moved-from Reactor. Double-close is impossible.
 

@@ -274,7 +274,7 @@ def _struct_destroy_thunk[H: Handler & Copyable](addr: Int) -> None:
 # its own deep-copy and read-side dispatch is allocation-free), the
 # heap-allocated boxed handlers are shared, and Mojo's auto-derived
 # ``Copyable`` does the right thing memberwise (``ArcPointer``'s
-# own ``__copyinit__`` bumps; ``List`` clones value-by-value).
+# own copy initializer bumps; ``List`` clones value-by-value).
 #
 # Lifetime invariant: at most one mutating "owner" exists at a
 # time (the call site that does the ``r.get(...)`` registration
