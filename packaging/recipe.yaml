@@ -98,7 +98,7 @@ about:
   license_file:
     - LICENSE
     - THIRD_PARTY_NOTICES.md
-  summary: Mojo web framework with in-process AI and GPU, built for humans and AI agents
+  summary: Mojo web framework with AI, GPU and computer vision natively supported, all in one language
   repository: https://github.com/dodo-mojo/dodo
 
 extra:
