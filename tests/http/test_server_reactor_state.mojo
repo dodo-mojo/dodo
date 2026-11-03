@@ -579,6 +579,33 @@ def test_pipelined_requests_flush_together_in_order() raises:
     client.close()
 
 
+def test_half_close_after_pipelined_requests_answers_them_all() raises:
+    """A FIN behind two pipelined requests ends the connection after the
+    second response, not the first. Only the last response says close."""
+    var r = Reactor()
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var port = listener.local_addr().port
+    var client = TcpStream.connect(SocketAddr.localhost(port))
+    var server = listener.accept()
+    server._socket.set_nonblocking(True)
+    listener.close()
+    var ch = ConnHandle(server^)
+    var cfg = _default_config()
+    var req = _bytes_of(
+        "GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n"
+    )
+    _ = client.write(Span[UInt8](req))
+    client.shutdown_write()
+    _ = _drive_readable(ch, r, _url_handler, cfg)
+    assert_equal(ch.state, STATE_WRITING)
+    var wire = String(unsafe_from_utf8=Span[UInt8](ch.write_buf))
+    assert_equal(wire.count("HTTP/1.1 200"), 2)
+    assert_true(wire.find("\r\n\r\n/a") < wire.find("\r\n\r\n/b"))
+    assert_equal(wire.lower().count("connection: close"), 1)
+    assert_true(ch.should_close)
+    client.close()
+
+
 # ── Error responses to HEAD carry no content ───────────────────────
 
 

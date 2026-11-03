@@ -10,6 +10,7 @@
   - Optional: `dodo-mojo.github.io` is free with the org.
 - [ ] **Claim social handles** (optional). Free on 2026-10-26: X `@dodo_mojo`, Bluesky `dodomojo.bsky.social`, YouTube `@dodo-mojo`. Taken: X `@dodomojo`, YouTube `@dodomojo`, Bluesky `dodo`.
 - [ ] **Trademark search** for "dodo" in software (class 9/42) in your country, before 1.0.
+- [ ] **Docker Desktop WSL integration** (optional): turn it on for Ubuntu-24.04 so `pixi run tests-db` can start the test databases from WSL. Until then, start them from Windows (`docker compose -f tests/live/db/compose.yaml up -d --wait`) and run with `DODO_DB_NO_COMPOSE=1`.
 
 ## Claude (after the items above are unblocked)
 
@@ -25,18 +26,25 @@
 - [ ] Keep-alive idle timeout defaults to 500 ms; `docs/design.md` says 5 s. Settle it in the performance pass (short is cheaper under load, long saves reconnects).
 - [ ] Model workers (ADR-0005): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`.
 - [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer.
+- [x] Database drivers (ADR-0009): PostgreSQL/CockroachDB, MySQL/MariaDB, SQLite, Redis/Valkey, MongoDB and ClickHouse in `dodo.db`, one shared pool, unit tests in `tests/db/`, Docker suites in `tests/live/db/` (`pixi run tests-db`).
+- [x] `blocking=True` on App routes (ADR-0004, ADR-0009), so a typed handler that queries a database runs on the offload pool. Usage guide: `docs/databases.md`.
+- [ ] CI job for `pixi run tests-db`: the compose services on the Ubuntu runner, `DODO_DB_NO_COMPOSE=1` if they come up as job services.
+- [ ] Fuzzers for the database parsers: PostgreSQL messages, MySQL packets and rows, RESP replies, BSON and OP_MSG, ClickHouse RowBinary.
+- [ ] Database follow-ups when someone needs them: prepared-statement caches (PostgreSQL, MySQL, SQLite), ClickHouse bulk insert in RowBinary, MongoDB replica sets and `mongodb+srv://`, Redis pub/sub on a dedicated connection, typed dates.
 - [x] App API (ADR-0008): `App`, compile-time `{name}` paths, typed-argument handlers, struct or `Response` returns, one shared app state, problem+json errors.
 - [x] Shrink the `dodo` root to what an app needs (ADR-0008 point 8).
 - [x] Router fixes from `docs/app-layer-audit.md`: fixed 404 body, duplicate routes and mounts raise, path params are percent-decoded once by the router.
-- [ ] Deprecation warnings from `dodo/http/_offload_pool.mojo` (positional `__getitem__`) in every build.
-- [ ] Tests for `HttpFrontend` and the reflection serde (`serialize_json`, `deserialize_json`).
-- [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup.
+- [x] Deprecation warnings from `dodo/http/_offload_pool.mojo` (positional `__getitem__`) in every build.
+- [x] Tests for `HttpFrontend` and the reflection serde (`serialize_json`, `deserialize_json`).
+- [ ] `HttpFrontend.run_worker` and `StreamFrontend.run_worker` swallow every error from the reactor loop with `except: pass`. Check whether a worker that fails this way goes unnoticed, and report it if so.
+- [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup. `Router._match` is about 3% of busy samples at 25 routes (`docs/app-layer-audit.md`); recheck with hundreds of routes.
 
 ## Developer experience and AI agents (Phase 2 and later)
 
 Agents know little Mojo, and it changes fast, so these come first:
 
-- [ ] `dodo docs`: pull agent-friendly Markdown docs for the exact versions in use into the project (`.dodo/docs/mojo-1.2/`, `.dodo/docs/dodo-0.1/`). `dodo docs pull` takes the versions from the project; `dodo docs pull mojo@1.2 dodo@0.1` asks for others. The generated AGENTS.md points agents there. `dodo docs search "<query>"` searches them, with `--json`.
+- [x] `pixi run docs-pull` (`tools/docs_pull.py`): pulls the Mojo docs for the toolchain in use (`.dodo/docs/mojo-1.2.0/`, from mojolang.org) and dodo's guides plus `mojo doc` API JSON (`.dodo/docs/dodo-0.0.1/`). It becomes `dodo docs pull` when the CLI exists.
+- [ ] `dodo docs`: the CLI form of the above, with versions from the project and `dodo docs pull mojo@1.2 dodo@0.1` for others. mojolang.org serves only the latest release, so pulling an older Mojo needs another source. The generated AGENTS.md points agents there. `dodo docs search "<query>"` searches them, with `--json`.
 - [ ] Mojo 1.x cheat sheet for agents in those docs: what changed (no `fn`, explicit `raises`, `comptime`, `std.` paths) with before and after examples.
 - [ ] `dodo fix`: rewrite outdated Mojo syntax automatically, like `cargo fix`.
 - [ ] Compiler error explainer: wrap `mojo build` and turn common errors into a plain cause and a fix, as text or JSON.

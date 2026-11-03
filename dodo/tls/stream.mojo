@@ -396,12 +396,11 @@ def _build_ssl_ctx(imm lib: OwnedDLHandle, config: TlsConfig) raises -> Int:
         _do_ssl_ctx_free(lib, ctx)
         raise TlsHandshakeError("Security policy error: " + err)
 
-    _ = _do_ssl_ctx_set_verify_peer(lib, ctx, c_int(config.verify))
+    var verify_peer = config.verify == TlsVerify.REQUIRED
+    _ = _do_ssl_ctx_set_verify_peer(lib, ctx, c_int(1 if verify_peer else 0))
 
-    # Skip CA bundle load in insecure mode — see the matching comment in
-    # dodo/tls/config.mojo's module docstring for the String-concat
-    # aliasing quirk that motivates the gate.
-    if config.verify != TlsVerify.NONE:
+    # Only a verifying context needs trust anchors.
+    if verify_peer:
         if _do_ssl_ctx_load_ca_bundle(lib, ctx, config.ca_bundle) != 0:
             var err = _c_err(lib)
             _do_ssl_ctx_free(lib, ctx)

@@ -31,6 +31,13 @@ struct TlsVerify:
     comptime REQUIRED: Int = 1
     """Verify peer certificate against the trusted CA bundle. Default."""
 
+    comptime ENCRYPT_ONLY: Int = 2
+    """Encrypt without checking the certificate, and print no warning.
+    This is what libpq's `sslmode=require` and MySQL's
+    `ssl_mode=REQUIRED` do: it stops passive snooping, not an active
+    man in the middle. Database drivers use it for their default modes;
+    use `REQUIRED` anywhere the peer must be authenticated."""
+
 
 struct TlsConfig(Copyable):
     """Configuration for a TLS connection.

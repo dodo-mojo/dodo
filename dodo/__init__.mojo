@@ -1,4 +1,4 @@
-"""dodo: a Mojo web framework.
+"""The dodo web framework for Mojo.
 
 HTTP/1.1 and HTTP/2 server and client, WebSocket (RFC 6455), TLS 1.2/1.3
 (OpenSSL with ALPN), TCP, Unix sockets and DNS, on one reactor per worker

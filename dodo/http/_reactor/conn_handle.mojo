@@ -882,10 +882,18 @@ struct ConnHandle(Movable):
             final = True
         if not config.keep_alive:
             final = True
-        if self.peer_eof:
+        if self.peer_eof and not self._another_request_follows():
             final = True
         self.should_close = final
         return final
+
+    def _another_request_follows(self) -> Bool:
+        """True when ``read_buf`` holds a whole head past the current request.
+        A half-closed peer is still reading, so it is owed that response too.
+        """
+        if self.body_total < 0 or self.body_total >= len(self.read_buf):
+            return False
+        return _find_crlfcrlf(self.read_buf, self.body_total) >= 0
 
     @always_inline
     def _finalise_response(

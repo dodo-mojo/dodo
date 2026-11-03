@@ -118,6 +118,9 @@ from test_app import (
     test_mounted_group_shares_state_and_takes_middleware as test_app__test_mounted_group_shares_state_and_takes_middleware,
 )
 from test_app import (
+    test_blocking_routes_are_offloaded as test_app__test_blocking_routes_are_offloaded,
+)
+from test_app import (
     test_group_starts_with_no_routes as test_app__test_group_starts_with_no_routes,
 )
 from test_async_chunk_source import (
@@ -4153,6 +4156,9 @@ from test_server_reactor_state import (
     test_pipelined_requests_flush_together_in_order as test_server_reactor_state__test_pipelined_requests_flush_together_in_order,
 )
 from test_server_reactor_state import (
+    test_half_close_after_pipelined_requests_answers_them_all as test_server_reactor_state__test_half_close_after_pipelined_requests_answers_them_all,
+)
+from test_server_reactor_state import (
     test_handler_error_for_head_has_no_body as test_server_reactor_state__test_handler_error_for_head_has_no_body,
 )
 from test_server_reactor_state import (
@@ -4948,6 +4954,7 @@ def main() raises:
     suite.test[test_app__test_all_methods_register]()
     suite.test[test_app__test_stock_middleware_wraps_the_app]()
     suite.test[test_app__test_mounted_group_shares_state_and_takes_middleware]()
+    suite.test[test_app__test_blocking_routes_are_offloaded]()
     suite.test[test_app__test_group_starts_with_no_routes]()
     # tests/http/test_async_chunk_source.mojo
     suite.test[test_async_chunk_source__test_chunk_poll_tristate]()
@@ -7117,6 +7124,9 @@ def main() raises:
     suite.test[test_server_reactor_state__test_ws_426_closes_connection]()
     suite.test[
         test_server_reactor_state__test_pipelined_requests_flush_together_in_order
+    ]()
+    suite.test[
+        test_server_reactor_state__test_half_close_after_pipelined_requests_answers_them_all
     ]()
     suite.test[
         test_server_reactor_state__test_handler_error_for_head_has_no_body
