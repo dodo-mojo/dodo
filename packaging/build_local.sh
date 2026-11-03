@@ -5,6 +5,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT="${1:-$REPO/build/conda}"
+mkdir -p "$OUTPUT"  # rattler-build won't create its parent directories
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
