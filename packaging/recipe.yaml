@@ -1,7 +1,8 @@
 # rattler-build recipe for the modular-community channel.
 # Submitted as recipes/dodo/ in github.com/modular/modular-community, with
 # packaging/tests/ copied next to it. Build it locally with
-# packaging/build_local.sh.
+# packaging/build_local.sh. `pixi run check-package` checks that the
+# requirements match pixi.toml.
 context:
   version: "0.0.1"
   mojo_version: "=1.2.0"
@@ -28,9 +29,7 @@ build:
         export CONDA_PREFIX="${PREFIX}"
         export DODO_CC="${CC}"
         export DODO_CXX="${CXX}"
-        source dodo/tls/ffi/build.sh
-        source dodo/http/ffi/build.sh
-        source dodo/json/ffi/build.sh
+        source tools/build_native.sh
 
         mojo precompile dodo -o "${PREFIX}/lib/mojo/dodo.mojoc"
 
@@ -51,7 +50,7 @@ requirements:
     - libsqlite >=3.45,<4
   run:
     - mojo-compiler ${{ mojo_version }}
-    - ca-certificates
+    - ca-certificates >=2025.1.31
     # dodo opens libsqlite3 by name at runtime, so nothing links it.
     - libsqlite >=3.45,<4
 
