@@ -359,13 +359,18 @@ struct Row[mut: Bool, //, origin: Origin[mut=mut]](Copyable):
 
     def get[T: Movable & Deinitable](self, name: String) raises DbError -> T:
         """The column as `T`: any type a struct field may have in `to[T]`."""
+        var column = self._col(name)
         var slot = MaybeUninit[T]()
-        _read_into[T](
-            self._rows[],
-            self.index,
-            self._col(name),
-            Pointer(to=slot.unsafe_assume_init()),
-        )
+        try:
+            _read_into[T](
+                self._rows[],
+                self.index,
+                column,
+                Pointer(to=slot.unsafe_assume_init()),
+            )
+        except e:
+            slot^.unsafe_forget()
+            raise e^
         return slot^.unsafe_assume_init()
 
 

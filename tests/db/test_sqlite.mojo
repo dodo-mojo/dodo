@@ -112,6 +112,26 @@ def test_round_trip() raises:
     assert_equal(db.query("select 1").affected, 0)
 
 
+def test_row_get() raises:
+    var db = Sqlite("sqlite://:memory:")
+    var rows = db.query("select 7 as n, 'ada' as name, null as note")
+    assert_equal(rows[0].get[Int]("n"), 7)
+    assert_equal(rows[0].get[String]("name"), "ada")
+    assert_false(Bool(rows[0].get[Optional[String]]("note")))
+    var null_failed = False
+    try:
+        _ = rows[0].get[Int]("note")
+    except:
+        null_failed = True
+    assert_true(null_failed, "NULL into Int should fail")
+    var missing_failed = False
+    try:
+        _ = rows[0].get[Int]("nope")
+    except:
+        missing_failed = True
+    assert_true(missing_failed, "a missing column should fail")
+
+
 def test_bytes_and_large() raises:
     var db = Sqlite("sqlite://:memory:")
     setup(db)
@@ -342,6 +362,7 @@ def test_cant_open() raises:
 
 def main() raises:
     test_round_trip()
+    test_row_get()
     test_bytes_and_large()
     test_errors()
     test_constraints()
@@ -351,4 +372,4 @@ def main() raises:
     test_pool()
     test_urls()
     test_cant_open()
-    print("test_sqlite: 10 passed")
+    print("test_sqlite: 11 passed")

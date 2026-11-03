@@ -40,6 +40,7 @@ from test_db_core import (
     test_byte_reader_bounds as test_db_core__test_byte_reader_bounds,
 )
 from test_sqlite import test_round_trip as test_sqlite__test_round_trip
+from test_sqlite import test_row_get as test_sqlite__test_row_get
 from test_sqlite import (
     test_bytes_and_large as test_sqlite__test_bytes_and_large,
 )
@@ -118,6 +119,7 @@ def main() raises:
     suite.test[test_db_core__test_byte_reader_bounds]()
     # tests/db/test_sqlite.mojo
     suite.test[test_sqlite__test_round_trip]()
+    suite.test[test_sqlite__test_row_get]()
     suite.test[test_sqlite__test_bytes_and_large]()
     suite.test[test_sqlite__test_errors]()
     suite.test[test_sqlite__test_constraints]()
