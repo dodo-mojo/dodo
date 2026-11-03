@@ -4,7 +4,7 @@ Status: draft v0.1, 2026-10-26. The first user is the author. This document is t
 
 ## 1. What dodo is
 
-A production web framework written in Mojo, where the HTTP server, AI model inference, GPU kernels, computer vision and agents run **in one process, in one language**. You get systems-level control with Python-like code, and it is built to be driven equally well by humans and AI coding agents.
+A production web framework written in Mojo, where the HTTP server, AI inference, GPU kernels, computer vision and agents are written **in one language** and run in one process by default (§3.4). You get systems-level control with Python-like code, and it is built to be driven equally well by humans and AI coding agents.
 
 ### Principles
 

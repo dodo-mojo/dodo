@@ -1,8 +1,8 @@
 # dodo
 
-A Mojo web framework where your HTTP server, AI models, GPU kernels, computer vision and agents run in one process, in one language.
+A Mojo web framework with AI, GPU kernels, computer vision and agents natively supported, all in one language.
 
-One process is the default, not a rule: a dodo app can also run models in supervised worker processes, call remote model servers, or be one service among many.
+They run in one process by default, with no glue services or serialization between them. When you need crash isolation or separate scaling, move AI or GPU work into a supervised worker process, call a hosted AI service, or run dodo as one service among many, without a rewrite.
 
 > **Status: pre-alpha.** The networking core works and is tested. The app API below is planned. Nothing is stable yet.
 
