@@ -18,11 +18,12 @@ if [ -z "$CONDA_PREFIX" ]; then
     return 0 2>/dev/null || true
 fi
 
+# DODO_CC overrides the compiler; the conda package build sets it.
 if [[ "$(uname)" == "Darwin" ]]; then
-    CC="clang"
+    CC="${DODO_CC:-clang}"
     NODELETE=""  # no such flag on macOS; pin_self.h does the same
 else
-    CC="gcc"
+    CC="${DODO_CC:-gcc}"
     NODELETE="-Wl,-z,nodelete"
 fi
 

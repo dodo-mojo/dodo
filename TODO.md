@@ -17,7 +17,7 @@
 - [ ] Performance pass: set up a bare-metal Linux benchmark box (cloud VM is fine); profile the HTTP/1.1 hot path (allocations, copies, syscalls per request); rewrite or remove what's slow; benchmark against other Mojo frameworks and the fastest Rust/Go servers.
 - [ ] Clean imported code as we touch it: remove Flare's changelog-style and personal comments, restyle to our standards.
 - [ ] Phase 0 spikes (see `docs/design.md` §9).
-- [ ] Publish `0.0.1` and open the modular-community PR using `packaging/recipe.yaml`. This claims the `dodo` package name and needs a minimal working server.
+- [ ] Publish `0.0.1`: tag `v0.0.1` on `production`, then open the modular-community PR with `packaging/recipe.yaml` and `packaging/tests/` as `recipes/dodo/`. The recipe builds and passes its tests on macOS arm64 and Linux aarch64 (`packaging/build_local.sh`); Linux x86-64 is checked only by the channel's CI.
 - [ ] Enable GitHub Pages for docs at `dodo-mojo.github.io/dodo`.
 - [ ] PyPI `dodo-mojo`: only if we ship a pip-installable CLI.
 - [ ] Review, after the offload pool lands: is it worth folding `serve_cancellable`'s `Cancel` support and the streaming loop into the unified loop, so the remaining separate loops can be deleted? Weigh the code removed against the risk and the performance-pass numbers.

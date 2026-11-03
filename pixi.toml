@@ -7,12 +7,8 @@ preview = ["pixi-build"]  # needed for the git source dependencies below
 
 [activation]
 # Build the C/C++ FFI wrappers on activation. Each script skips work when
-# its library is up to date.
-scripts = [
-    "dodo/tls/ffi/build.sh",
-    "dodo/http/ffi/build.sh",
-    "dodo/json/ffi/build.sh",
-]
+# its library is up to date. The conda recipe runs the same script.
+scripts = ["tools/build_native.sh"]
 
 [dependencies]
 mojo = ">=1.2.0,<2.0.0"
@@ -25,6 +21,8 @@ libbrotlidec = ">=1.2.1,<2"
 libbrotlienc = ">=1.2.1,<2"
 simdjson = ">=4.6.11,<5"         # JSON parsing
 libsqlite = ">=3.45,<4"          # dodo.db.sqlite
+# A new dependency here also goes into packaging/recipe.yaml;
+# `pixi run check-package` fails until it does.
 
 # The activation scripts compile the wrappers with g++ on Linux.
 [target.linux-64.dependencies]
@@ -49,6 +47,7 @@ tests-db = "bash tests/tools/run_db_tests.sh"
 tls-certs = "bash tests/tools/make_tls_certs.sh"
 check-sans-io = "bash tests/tools/check_sans_io.sh"
 check-no-http-http2-cycle = "bash tests/tools/check_no_http_http2_cycle.sh"
+check-package = "python3 tools/check_recipe.py && mojo precompile dodo -o build/dodo.mojoc"
 fuzz-build = "bash fuzz/run.sh"
 fuzz = "bash fuzz/run.sh"
 fuzz-selftest = "bash fuzz/run.sh selftest"
