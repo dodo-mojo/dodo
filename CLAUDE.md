@@ -22,8 +22,8 @@ A Mojo web framework where HTTP, AI models (MAX), GPU kernels, computer vision a
 | `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`, `app-layer-audit.md`), naming, standards, ADRs, the database guide (`databases.md`) |
 | `tools/` | Dev scripts run through pixi tasks (`docs_pull.py`) |
 | `research/` | Throwaway spikes and audit harnesses (probe servers, fuzzers). Not shipped. |
-| `packaging/recipe.yaml` | Draft modular-community recipe for the `dodo` package |
-| `.github/` | CI (`pixi run tests` on Ubuntu and macOS, on every PR; both jobs are required to merge into `dev`), issue and PR templates, Dependabot for actions |
+| `packaging/` | Conda recipe for the modular-community channel, its smoke tests, `build_local.sh` (builds and tests the package from this checkout) |
+| `.github/` | CI (`pixi run check-package` and `pixi run tests` on Ubuntu and macOS, on every PR; both jobs are required to merge into `dev`), issue and PR templates, Dependabot for actions |
 | `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md` | Community files. README stays short: the vision and roadmap, no walls of text. |
 
 ## Toolchain
