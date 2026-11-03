@@ -24,11 +24,12 @@ if [ ! -f "$CONDA_PREFIX/include/simdjson.h" ]; then
     return 0 2>/dev/null || true
 fi
 
+# DODO_CXX overrides the compiler; the conda package build sets it.
 if [[ "$(uname)" == "Darwin" ]]; then
-    CXX="clang++"
+    CXX="${DODO_CXX:-clang++}"
     NODELETE=""  # no such flag on macOS; pin_self.h does the same
 else
-    CXX="g++"
+    CXX="${DODO_CXX:-g++}"
     NODELETE="-Wl,-z,nodelete"
 fi
 

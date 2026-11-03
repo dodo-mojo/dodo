@@ -44,11 +44,12 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
+# DODO_CXX overrides the compiler; the conda package build sets it.
 if [[ "$(uname)" == "Darwin" ]]; then
-    CXX="clang++"
+    CXX="${DODO_CXX:-clang++}"
     NODELETE=""  # see pin_self.h
 else
-    CXX="g++"
+    CXX="${DODO_CXX:-g++}"
     NODELETE="-Wl,-z,nodelete"
 fi
 
