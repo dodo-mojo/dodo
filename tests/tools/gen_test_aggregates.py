@@ -50,6 +50,8 @@ EXCLUDE = {
     # Points DODO_LIB_DIR at an empty directory; the library lookup is
     # cached per process.
     "tests/json/test_loads_fallback.mojo",
+    # Installs process-wide signal handlers and signals itself.
+    "tests/utils/test_signals.mojo",
 }
 
 TEST_DEF = re.compile(r"^def (test_[A-Za-z0-9_]*)\s*\(", re.M)

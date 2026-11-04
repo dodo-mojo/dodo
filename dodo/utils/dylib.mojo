@@ -7,7 +7,7 @@ through :func:`find_dodo_lib`; the bundled shim's name (the ``X`` in
 Library naming convention
 -------------------------
 
-dodo bundles five FFI shims under ``$CONDA_PREFIX/lib/``:
+dodo bundles six FFI shims under ``$CONDA_PREFIX/lib/``:
 
 * ``libdodo_tls.so`` -- OpenSSL hooks (TLS handshake, AEAD,
   hkdf, hmac, sha1) plus the ``dodo_read`` / ``dodo_write``
@@ -24,6 +24,9 @@ dodo bundles five FFI shims under ``$CONDA_PREFIX/lib/``:
   :mod:`dodo.http.fs` (``FileServer`` static-file path).
 * ``libdodo_simdjson.so`` -- simdjson parsing into a ``Document``
   tape, consumed by :mod:`dodo.json` (``loads``).
+* ``libdodo_proc.so`` -- spawn, wait for and signal processes, and
+  record signals, consumed by :mod:`dodo.utils.process` and
+  :mod:`dodo.utils.signals`.
 
 Search order (used by every call site):
 1. ``$DODO_LIB_DIR/libdodo_<name>.so`` -- when ``DODO_LIB_DIR`` is
@@ -46,7 +49,7 @@ Public API
 ``find_dodo_lib(name: String) -> String``
     Resolves ``libdodo_<name>.so`` in the order above. ``name`` is
     the bare suffix (``"tls"``, ``"zlib"``, ``"brotli"``, ``"fs"``,
-    ``"simdjson"``).
+    ``"simdjson"``, ``"proc"``).
 
 ``dl_sym[FT](lib: OwnedDLHandle, name: String) raises -> FT``
     Resolve a C-ABI function symbol as a plain function pointer.

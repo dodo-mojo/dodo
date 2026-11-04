@@ -1,12 +1,13 @@
 """Cross-cutting utility helpers that don't fit any other layer.
 
-The first inhabitant is :mod:`dodo.utils.posix_proc` -- thin
-wrappers over POSIX ``fork`` / ``waitpid`` / ``kill`` / ``usleep``
-/ ``_exit`` / ``getpid`` that the Mojo stdlib doesn't expose yet.
-A handful of dodo tests, examples, and internal modules
-(``dodo.testing.fork_server``, ``dodo.runtime._libc_time``) all
-need the same five-line ``external_call`` thunks; this module is
-the one canonical home for them.
+- :mod:`dodo.utils.posix_proc`: thin wrappers over POSIX ``fork`` /
+  ``waitpid`` / ``kill`` / ``usleep`` / ``_exit`` / ``getpid``, for
+  tests and fork servers.
+- :mod:`dodo.utils.process`: start programs and get their exit status
+  (``spawn``, ``run``, ``exec_replace``), through ``libdodo_proc.so``.
+- :mod:`dodo.utils.signals`: record Ctrl-C, SIGTERM and SIGHUP instead
+  of dying, for loops that shut down cleanly.
+- :mod:`dodo.utils.dylib`: finds and loads dodo's wrapper libraries.
 
 Future inhabitants belong here when they're (a) low-level enough
 that they don't fit a protocol-shaped subpackage like

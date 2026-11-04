@@ -72,7 +72,7 @@ tests:
         - |
           set -euo pipefail
           test -f "${PREFIX}/lib/mojo/dodo.mojoc"
-          for name in tls zlib brotli fs simdjson; do
+          for name in tls zlib brotli fs simdjson proc; do
             test -f "${PREFIX}/lib/libdodo_${name}.so"
           done
 

@@ -13,7 +13,8 @@ _DODO_NATIVE_STATUS=0
 for _dodo_script in \
     dodo/tls/ffi/build.sh \
     dodo/http/ffi/build.sh \
-    dodo/json/ffi/build.sh; do
+    dodo/json/ffi/build.sh \
+    dodo/utils/ffi/build.sh; do
     if ! source "$_DODO_ROOT/$_dodo_script"; then
         _DODO_NATIVE_STATUS=1
     fi

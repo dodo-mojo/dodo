@@ -226,7 +226,7 @@ def _answer_offload[
 ):
     """Give the front the response to its offloaded request, then send
     what it queued and close the connection if it is done."""
-    var drop_it = False
+    var drop_it: Bool
     try:
         drop_it = _give_offload_response(conns, fd, job, resp^, handler, off)
     except:
