@@ -6,6 +6,7 @@
 2. Every libdodo_<name> library the Mojo code loads is in the list of
    libraries the recipe test checks for.
 3. pixi.toml, the recipe and `cli/version.mojo` name the same version.
+4. `dodo doctor` checks exactly the libraries the code loads.
 
 Run through `pixi run check-package`.
 """
@@ -81,6 +82,14 @@ def versions() -> dict[str, str]:
     return found
 
 
+def doctor_libraries() -> set[str]:
+    text = (ROOT / "cli" / "cmd_doctor.mojo").read_text()
+    block = re.search(r"comptime NATIVE_LIBS: List\[String\] = \[(.*?)\]", text, re.S)
+    if not block:
+        return set()
+    return set(re.findall(r'"([a-z0-9]+)"', block.group(1)))
+
+
 def loaded_libraries() -> set[str]:
     names = set()
     for path in (ROOT / "dodo").rglob("*.mojo"):
@@ -108,6 +117,14 @@ def main() -> int:
         problems.append(
             f"libdodo_{name}.so is loaded by dodo but the recipe test does"
             " not check for it"
+        )
+
+    doctor = doctor_libraries()
+    loaded = loaded_libraries()
+    if doctor != loaded:
+        problems.append(
+            "cli/cmd_doctor.mojo NATIVE_LIBS is "
+            f"{sorted(doctor)}, the code loads {sorted(loaded)}"
         )
 
     named = versions()

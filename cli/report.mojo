@@ -49,13 +49,13 @@ struct Report(Movable):
     def say(self, text: String):
         """A line for people. Left out of `--json` output."""
         if not self.json_mode:
-            print(text)
+            print(text, flush=True)
 
     def note(self, text: String):
         """Progress for people, such as "building...". Goes to stderr so it
         never mixes with output a script reads."""
         if not self.json_mode:
-            print(text, file=stderr)
+            print(text, file=stderr, flush=True)
 
     def set(mut self, key: String, var value: Value) raises:
         """A field of the JSON result."""
@@ -85,7 +85,7 @@ struct Report(Movable):
         """Print the error (text) or the whole result (JSON) and return
         `exit_code` unchanged."""
         if self.json_mode:
-            print(self.to_json(exit_code))
+            print(self.to_json(exit_code), flush=True)
             return exit_code
         if self.failed():
             var prefix = String("dodo")
@@ -117,5 +117,7 @@ struct Report(Movable):
             return String(
                 '{"ok":false,"command":"',
                 self.command,
-                '","error":{"kind":"internal","message":"cannot write JSON"}}',
+                '","exit_code":',
+                exit_code,
+                ',"error":{"kind":"internal","message":"cannot write JSON"}}',
             )

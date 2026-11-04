@@ -5,6 +5,9 @@ from std.sys import argv, exit
 from dodo.json import Value
 
 from cli.args import ParsedArgs, parse_args
+from cli.cmd_doctor import cmd_doctor
+from cli.cmd_routes import cmd_routes
+from cli.cmd_run import cmd_run
 from cli.commands import command_specs, find_spec
 from cli.help import command_help, overview
 from cli.report import EXIT_INTERNAL, EXIT_OK, EXIT_USAGE, Report
@@ -50,6 +53,12 @@ def run_cli(words: List[String]) -> Int:
 
 
 def _dispatch(parsed: ParsedArgs, mut report: Report) raises -> Int:
+    if parsed.command == "run":
+        return cmd_run(parsed, report)
+    if parsed.command == "routes":
+        return cmd_routes(parsed, report)
+    if parsed.command == "doctor":
+        return cmd_doctor(parsed, report)
     return report.fail("internal", "not built yet", EXIT_INTERNAL)
 
 

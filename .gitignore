@@ -21,5 +21,5 @@ fuzz/corpus/
 .vscode/
 *.swp
 
-# Generated docs for agents (`pixi run docs-pull`)
-.dodo/docs/
+# dodo's own folder: docs for agents (`dodo docs pull`) and app builds
+.dodo/

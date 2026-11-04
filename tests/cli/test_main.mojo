@@ -38,7 +38,7 @@ def test_usage_errors() raises:
 
 
 def test_unbuilt_command_is_internal() raises:
-    assert_equal(run_cli(["doctor"]), EXIT_INTERNAL)
+    assert_equal(run_cli(["new", "app"]), EXIT_INTERNAL)
 
 
 def main() raises:
