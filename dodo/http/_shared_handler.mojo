@@ -11,7 +11,7 @@ or the pool's, frees it.
 from std.memory import ArcPointer
 
 from .cancel import Cancel
-from .handler import CancelHandler, Handler
+from .handler import CancelHandler, Handler, RouteInfo
 from .request import Request
 from .response import Response, ResponseImpl
 
@@ -31,6 +31,9 @@ struct SharedHandler[H: Handler](Copyable, Handler):
 
     def may_block(self) -> Bool:
         return self.inner[].may_block()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner[].route_list()
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner[].blocking(req)

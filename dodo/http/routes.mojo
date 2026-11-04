@@ -56,7 +56,7 @@ percent-decoded, and a bad escape returns 400, just like the runtime
 router.
 """
 
-from .handler import Handler
+from .handler import Handler, RouteInfo
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method, _child_request
@@ -192,6 +192,16 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
         if len(allowed) > 0:
             return _method_not_allowed(allowed)
         return not_found()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        """Every route, in table order, for `dodo routes`."""
+        var out = List[RouteInfo]()
+        comptime for i in range(len(Self.routes)):
+            comptime r = Self.routes[i]
+            out.append(
+                RouteInfo(String(r.method), String(r.pattern), False, "route")
+            )
+        return out^
 
 
 # ── Response helpers ────────────────────────────────────────────────────────

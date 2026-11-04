@@ -39,7 +39,7 @@ loop, cleartext and TLS; ``serve_cancellable`` (wrap the stack in
 ``WithCancel``); and the HTTP/1.1-only multi-worker loop.
 """
 
-from .handler import Handler
+from .handler import Handler, RouteInfo
 from .request import Request
 from .response import ResponseImpl
 
@@ -62,6 +62,12 @@ struct Offload[Inner: Handler & Copyable](Copyable, Handler):
 
     def may_block(self) -> Bool:
         return True
+
+    def route_list(self) raises -> List[RouteInfo]:
+        var inner_routes = self.inner.route_list()
+        for i in range(len(inner_routes)):
+            inner_routes[i].blocking = True
+        return inner_routes^
 
     def blocking(self, req: Request) raises -> Bool:
         return True

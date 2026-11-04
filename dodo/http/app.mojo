@@ -32,14 +32,17 @@ and signature mistakes fail the build. See ADR-0008.
 
 from std.collections import Optional
 from std.memory import ArcPointer, MaybeUninit, Pointer
+from std.os import getenv
 
+from ..json import Value, dumps
 from ..json.reflection import deserialize_json
 from ..json.serialize import to_json_string
 from ..net import IpAddr, SocketAddr
 from ..runtime._thread import num_cpus
+from ..tcp import TcpListener
 from ._route_path import SEG_LITERAL, parse_route_path, percent_decode
 from ._server.responses import ok_json_of
-from .handler import Handler
+from .handler import Handler, RouteInfo
 from .request import Method, Request
 from .response import Response
 from .router import Router
@@ -776,6 +779,10 @@ struct App[S: AppState = NoState](Copyable, Handler):
     def may_block(self) -> Bool:
         return self._router.may_block()
 
+    def route_list(self) raises -> List[RouteInfo]:
+        """Every route, mounts included, for `dodo routes`."""
+        return self._router.route_list()
+
     def blocking(self, req: Request) raises -> Bool:
         return self._router.blocking(req)
 
@@ -786,7 +793,9 @@ struct App[S: AppState = NoState](Copyable, Handler):
         host: String = "127.0.0.1",
         num_workers: Int = 0,
     ) raises:
-        """Listen and serve until stopped. `num_workers=0` uses every core."""
+        """Listen and serve until SIGINT, SIGTERM or SIGHUP, then let
+        in-flight requests finish (`ServerConfig.shutdown_timeout_ms`) and
+        return. `num_workers=0` uses every core."""
         _serve_on(self.copy(), port, host, num_workers)
 
     def route[
@@ -1249,11 +1258,55 @@ struct App[S: AppState = NoState](Copyable, Handler):
 def _serve_on[
     H: Handler & Copyable
 ](var handler: H, port: UInt16, host: String, num_workers: Int) raises:
+    """Serve until a stop signal, with the hooks the `dodo` CLI uses.
+
+    - `DODO_ROUTES=json`: print the route list as one JSON line and
+      return without binding (`dodo routes`).
+    - `DODO_LISTEN_FD=<fd>`: serve on that inherited listening socket
+      instead of binding `host:port` (`dodo dev` keeps the port open
+      across restarts this way).
+    """
+    if getenv("DODO_ROUTES") == "json":
+        print(routes_json(handler.route_list()))
+        return
     var workers = num_workers
     if workers <= 0:
         workers = num_cpus()
+    var inherited = getenv("DODO_LISTEN_FD")
+    if inherited != "":
+        var listener = TcpListener.inherit(_parse_fd(inherited))
+        var server = HttpServer(listener^)
+        server.serve_until_signal(handler^, num_workers=workers)
+        return
     var server = HttpServer.bind(SocketAddr(IpAddr.parse(host), port))
-    server.serve(handler^, num_workers=workers)
+    server.serve_until_signal(handler^, num_workers=workers)
+
+
+def routes_json(routes: List[RouteInfo]) raises -> String:
+    """`{"dodo_routes": [{"method", "path", "blocking", "kind"}, ...]}` on one
+    line, so `dodo routes` can find it among whatever else `main` prints."""
+    var list = Value.array()
+    for route in routes:
+        var entry = Value.object()
+        entry["method"] = Value(route.method)
+        entry["path"] = Value(route.path)
+        entry["blocking"] = Value(route.blocking)
+        entry["kind"] = Value(route.kind)
+        list.append(entry^)
+    var out = Value.object()
+    out["dodo_routes"] = list^
+    return dumps(out)
+
+
+def _parse_fd(text: String) raises -> Int:
+    var fd: Int
+    try:
+        fd = Int(text)
+    except:
+        raise Error(
+            "DODO_LISTEN_FD must be a file descriptor number, got `", text, "`"
+        )
+    return fd
 
 
 def serve[

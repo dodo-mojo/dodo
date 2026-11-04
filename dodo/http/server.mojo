@@ -42,6 +42,7 @@ from ..ws.server_h2 import WsH2Handler, WsH2Hooks
 from ..errors import map_handler_error, log_handler_error
 from ..net import IpAddr, SocketAddr, NetworkError, BrokenPipe, Timeout
 from ..tcp import TcpListener, TcpStream
+from ..utils.signals import stop_watching_signals, take_signal, watch_signals
 from ..tls._server_ffi import ServerCtx
 from ..tls.acceptor import TlsAcceptor, TlsServerConfig, TlsSniCert
 
@@ -783,9 +784,51 @@ struct HttpServer(Movable):
         else:
             self._serve_multicore[H](handler^, num_workers, pin_cores)
 
+    def serve_until_signal[
+        H: Handler & Copyable
+    ](
+        mut self,
+        var handler: H,
+        num_workers: Int,
+        pin_cores: Bool = True,
+    ) raises:
+        """Serve like :meth:`serve` until SIGINT, SIGTERM or SIGHUP, then
+        drain: stop accepting, give in-flight requests up to
+        ``config.shutdown_timeout_ms`` to finish, and return.
+
+        This is what ``App.serve`` runs, so Ctrl-C, ``docker stop`` and
+        ``dodo dev`` restarts never cut a response off halfway. The
+        signal handlers are only installed for the call and the default
+        ones come back when it returns.
+
+        Args:
+            handler: The request handler (ownership transferred).
+            num_workers: Worker count, at least 1. One worker still runs on
+                its own thread, so this thread can wait for the signal.
+            pin_cores: On Linux, pin worker N to core ``N % num_cpus``.
+        """
+        var workers = num_workers
+        if workers < 1:
+            workers = 1
+        watch_signals()
+        try:
+            self._serve_multicore[H](
+                handler^, workers, pin_cores, stop_on_signal=True
+            )
+        except e:
+            stop_watching_signals()
+            raise e^
+        stop_watching_signals()
+
     def _serve_multicore[
         H: Handler & Copyable
-    ](mut self, var handler: H, num_workers: Int, pin_cores: Bool) raises:
+    ](
+        mut self,
+        var handler: H,
+        num_workers: Int,
+        pin_cores: Bool,
+        stop_on_signal: Bool = False,
+    ) raises:
         """Internal: run the multicore (N-worker) path.
 
         Extracted so both ``serve(def ...)`` and ``serve[H](H ...)``
@@ -826,6 +869,9 @@ struct HttpServer(Movable):
             # doesn't need to be responsive the way the worker reactor
             # is. Sleep for a short interval, then re-check.
             _ = libc_nanosleep_ms(50)
+            if stop_on_signal and take_signal() != 0:
+                _ = scheduler.drain(self.config.shutdown_timeout_ms)
+                break
 
         scheduler.shutdown()
         self._drop_ws_h2_hooks()

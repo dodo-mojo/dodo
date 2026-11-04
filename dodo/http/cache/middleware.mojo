@@ -51,7 +51,7 @@ from .control import (
 )
 from .key import CacheKey, derive_cache_key
 from .store import CacheEntry, CacheStore, InMemoryCacheStore
-from ..handler import Handler
+from ..handler import Handler, RouteInfo
 from ..headers import HeaderMap
 from ..request import Request
 from ..response import Response
@@ -500,6 +500,9 @@ struct Cache[
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner.route_list()
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)

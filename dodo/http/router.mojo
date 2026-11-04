@@ -61,7 +61,7 @@ from std.collections import Dict, Optional
 from std.memory import ArcPointer
 
 from ..runtime import Pool
-from .handler import Handler, FnHandler
+from .handler import Handler, FnHandler, RouteInfo, prefix_routes
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method, _child_request
@@ -98,6 +98,23 @@ def _segs_to_openapi_template(segs: List[_Segment]) -> String:
         out += "/"
         if segs[i].kind == SEG_LITERAL:
             out += segs[i].text
+        else:
+            out += "{" + segs[i].text + "}"
+    return out^
+
+
+def _segs_to_route_path(segs: List[_Segment]) -> String:
+    """Render compiled segments the way they were registered: `{name}`
+    and `{*name}` stay as written. The root renders as `/`."""
+    if len(segs) == 0:
+        return "/"
+    var out = String("")
+    for i in range(len(segs)):
+        out += "/"
+        if segs[i].kind == SEG_LITERAL:
+            out += segs[i].text
+        elif segs[i].kind == SEG_CATCH_ALL:
+            out += "{*" + segs[i].text + "}"
         else:
             out += "{" + segs[i].text + "}"
     return out^
@@ -164,6 +181,8 @@ struct _Route(Copyable):
     var handler_kind: Int
     """One of ``_ROUTE_KIND_FN`` / ``_ROUTE_KIND_STRUCT``."""
     var handler_idx: Int
+    var blocking: Bool
+    """Whether the handler runs on the offload pool, for the route list."""
 
     def __init__(
         out self,
@@ -171,11 +190,13 @@ struct _Route(Copyable):
         var segs: List[_Segment],
         handler_kind: Int,
         handler_idx: Int,
+        blocking: Bool = False,
     ):
         self.method = method
         self.segs = segs^
         self.handler_kind = handler_kind
         self.handler_idx = handler_idx
+        self.blocking = blocking
 
 
 struct _Mount(Copyable):
@@ -190,10 +211,18 @@ struct _Mount(Copyable):
 
     var segs: List[_Segment]
     var handler_idx: Int
+    var routes_thunk: def(Int) raises thin -> List[RouteInfo]
+    """Lists the mounted handler's routes, for the route list."""
 
-    def __init__(out self, var segs: List[_Segment], handler_idx: Int):
+    def __init__(
+        out self,
+        var segs: List[_Segment],
+        handler_idx: Int,
+        routes_thunk: def(Int) raises thin -> List[RouteInfo],
+    ):
         self.segs = segs^
         self.handler_idx = handler_idx
+        self.routes_thunk = routes_thunk
 
 
 # ── Struct-handler boxing ───────────────────────
@@ -238,6 +267,13 @@ def _struct_blocking_thunk[
 ](addr: Int, req: Request) raises -> Bool:
     """Thunk that asks the boxed ``H`` whether ``req`` blocks."""
     return Pool[H].get_ptr(addr)[].blocking(req)
+
+
+def _struct_routes_thunk[
+    H: Handler & Copyable
+](addr: Int) raises -> List[RouteInfo]:
+    """Thunk that asks the boxed ``H`` for its route list."""
+    return Pool[H].get_ptr(addr)[].route_list()
 
 
 def _struct_destroy_thunk[H: Handler & Copyable](addr: Int) -> None:
@@ -603,7 +639,8 @@ struct Router(Copyable, Defaultable, Handler):
         """
         var segs = _compile_segments(path)
         self._check_new_route(method, path, segs)
-        if handler.may_block():
+        var blocking = handler.may_block()
+        if blocking:
             self._may_block = True
         var addr = Pool[H].alloc_move(handler^)
         ref reg = self._struct_registry[]
@@ -617,6 +654,7 @@ struct Router(Copyable, Defaultable, Handler):
                 segs^,
                 _ROUTE_KIND_STRUCT,
                 len(reg.addrs) - 1,
+                blocking,
             )
         )
 
@@ -662,7 +700,13 @@ struct Router(Copyable, Defaultable, Handler):
         reg.serve_thunks.append(_struct_serve_thunk[_MountedRouter[H]])
         reg.destroy_thunks.append(_struct_destroy_thunk[_MountedRouter[H]])
         reg.blocking_thunks.append(_struct_blocking_thunk[_MountedRouter[H]])
-        self._mounts.append(_Mount(psegs^, len(reg.addrs) - 1))
+        self._mounts.append(
+            _Mount(
+                psegs^,
+                len(reg.addrs) - 1,
+                _struct_routes_thunk[_MountedRouter[H]],
+            )
+        )
 
     # ── Route introspection (OpenAPI derivation) ───────────────────────────────
 
@@ -679,6 +723,30 @@ struct Router(Copyable, Defaultable, Handler):
         ``{id}`` and ``{*rest}`` becomes ``{rest}`` (``/`` for the empty root).
         """
         return _segs_to_openapi_template(self._routes[i].segs)
+
+    def route_list(self) raises -> List[RouteInfo]:
+        """Every route, the routes of each mount under its prefix, then the
+        fallback, in the order :meth:`serve` tries them."""
+        var out = List[RouteInfo]()
+        for i in range(len(self._routes)):
+            out.append(
+                RouteInfo(
+                    self._routes[i].method,
+                    _segs_to_route_path(self._routes[i].segs),
+                    self._routes[i].blocking,
+                    "route",
+                )
+            )
+        ref reg = self._struct_registry[]
+        for i in range(len(self._mounts)):
+            var idx = self._mounts[i].handler_idx
+            var mounted = self._mounts[i].routes_thunk(reg.addrs[idx])
+            var prefix = _segs_to_route_path(self._mounts[i].segs)
+            for route in prefix_routes(mounted^, prefix):
+                out.append(route.copy())
+        if self._fallback:
+            out.append(RouteInfo("*", "/{*path}", False, "fallback"))
+        return out^
 
     def route_path_params(self, i: Int) -> List[String]:
         """Names of route ``i``'s path parameters (``{name}`` and ``{*name}`` segments).
@@ -830,6 +898,9 @@ struct _MountedRouter[H: Handler & Copyable](Copyable, Handler):
 
     def may_block(self) -> Bool:
         return self.sub.may_block()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.sub.route_list()
 
     def blocking(self, req: Request) raises -> Bool:
         if not self.sub.may_block():

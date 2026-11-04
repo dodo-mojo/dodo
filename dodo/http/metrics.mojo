@@ -75,7 +75,7 @@ from std.time import perf_counter_ns
 
 from dodo.runtime.pool import Pool
 
-from .handler import Handler
+from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
 
@@ -536,6 +536,9 @@ struct Metrics[Inner: Handler & Copyable](Copyable, Handler):
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner.route_list()
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)

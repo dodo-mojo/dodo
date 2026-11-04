@@ -30,7 +30,7 @@ from .encoding import (
     compress_brotli,
     compress_gzip,
 )
-from .handler import Handler
+from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
 from ..utils.dylib import pinned_dodo_lib
@@ -87,6 +87,9 @@ struct Logger[Inner: Handler & Copyable](Copyable, Handler):
     def may_block(self) -> Bool:
         return self.inner.may_block()
 
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner.route_list()
+
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
 
@@ -117,6 +120,9 @@ struct RequestId[Inner: Handler & Copyable](Copyable, Handler):
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner.route_list()
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
@@ -380,6 +386,9 @@ struct Compress[Inner: Handler & Copyable](Copyable, Handler):
     def may_block(self) -> Bool:
         return self.inner.may_block()
 
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner.route_list()
+
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
 
@@ -416,6 +425,9 @@ struct CatchPanic[Inner: Handler & Copyable](Copyable, Handler):
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner.route_list()
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
