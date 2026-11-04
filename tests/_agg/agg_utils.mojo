@@ -74,6 +74,12 @@ from test_process import (
     test_group_signal_reaches_grandchild as test_process__test_group_signal_reaches_grandchild,
 )
 from test_process import (
+    test_kill_group_after_the_child_ended as test_process__test_kill_group_after_the_child_ended,
+)
+from test_process import (
+    test_kill_group_needs_a_group as test_process__test_kill_group_needs_a_group,
+)
+from test_process import (
     test_many_children_in_a_row as test_process__test_many_children_in_a_row,
 )
 from test_process import (
@@ -113,6 +119,8 @@ def main() raises:
     suite.test[test_process__test_wait_twice_returns_same_status]()
     suite.test[test_process__test_signal_after_exit_is_ignored]()
     suite.test[test_process__test_group_signal_reaches_grandchild]()
+    suite.test[test_process__test_kill_group_after_the_child_ended]()
+    suite.test[test_process__test_kill_group_needs_a_group]()
     suite.test[test_process__test_many_children_in_a_row]()
     suite.test[test_process__test_set_inherited_on_bad_fd_raises]()
     suite.test[test_process__test_set_inherited_round_trip]()

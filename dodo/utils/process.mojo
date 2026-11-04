@@ -23,6 +23,9 @@ from std.time import sleep
 from .dylib import dl_sym, pinned_dodo_lib
 
 comptime _NEW_GROUP: c_int = 1
+comptime _SIGKILL = 9
+comptime _ESRCH = 3
+"""No such process (the same number on Linux and macOS)."""
 # `wait` checks often at first, so a short program is collected within
 # about 0.1 ms, then backs off to 10 ms for long ones.
 comptime _FIRST_WAIT_SECONDS: Float64 = 0.0001
@@ -111,6 +114,31 @@ struct Child(Movable):
                 "cannot signal process ", self.pid, ": ", error_text(failure)
             )
 
+    def kill_group(self) raises -> Bool:
+        """Kill (SIGKILL) everything still in the child's process group,
+        even after the child itself ended: programs it started and left
+        running. Returns whether anything was left to kill.
+
+        Raises:
+            Error: If the child was not started with `new_group=True`.
+        """
+        if not self.own_group:
+            raise Error("kill_group: process ", self.pid, " has no group")
+        var send = dl_sym[def(Int64, c_int, c_int) thin abi("C") -> c_int](
+            pinned_dodo_lib["proc"]()[], "dodo_proc_kill"
+        )
+        var failure = Int(send(Int64(self.pid), c_int(_SIGKILL), c_int(1)))
+        if failure == _ESRCH:
+            return False
+        if failure != 0:
+            raise Error(
+                "cannot kill process group ",
+                self.pid,
+                ": ",
+                error_text(failure),
+            )
+        return True
+
 
 def spawn(
     argv: List[String],
@@ -184,9 +212,7 @@ def run(
     return child.wait()
 
 
-def exec_replace(
-    argv: List[String], env: List[String] = List[String]()
-) raises:
+def exec_replace(argv: List[String], env: List[String] = List[String]()) raises:
     """Replace this process with a program. Returns only by raising.
 
     Args:

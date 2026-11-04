@@ -106,8 +106,8 @@ def test_stderr_to_its_own_file() raises:
 
 def test_unicode_arguments() raises:
     var path = _scratch("unicode.txt")
-    _ = run(["printf", "%s", "héllo 🦤 \"quoted\" $HOME"], stdout_path=path)
-    assert_equal(_read(path), "héllo 🦤 \"quoted\" $HOME")
+    _ = run(["printf", "%s", 'héllo 🦤 "quoted" $HOME'], stdout_path=path)
+    assert_equal(_read(path), 'héllo 🦤 "quoted" $HOME')
     remove(path)
 
 
@@ -215,6 +215,32 @@ def test_group_signal_reaches_grandchild() raises:
     var alive = run(["kill", "-0", String(grandchild)], stderr_path="/dev/null")
     assert_false(alive.succeeded())
     remove(pid_file)
+
+
+def test_kill_group_after_the_child_ended() raises:
+    var pid_file = _scratch("leftover.pid")
+    # The shell starts `sleep` in the background and exits at once.
+    var child = spawn(
+        _sh(String("sleep 30 & echo $! > ", pid_file)), new_group=True
+    )
+    assert_true(child.wait().succeeded())
+    var leftover = _read(pid_file).strip()
+    var alive = run(["kill", "-0", String(leftover)], stderr_path="/dev/null")
+    assert_true(alive.succeeded())
+
+    assert_true(child.kill_group())
+    sleep(0.05)
+    alive = run(["kill", "-0", String(leftover)], stderr_path="/dev/null")
+    assert_false(alive.succeeded())
+    assert_false(child.kill_group())
+    remove(pid_file)
+
+
+def test_kill_group_needs_a_group() raises:
+    var child = spawn(["true"])
+    _ = child.wait()
+    with assert_raises(contains="has no group"):
+        _ = child.kill_group()
 
 
 def test_many_children_in_a_row() raises:

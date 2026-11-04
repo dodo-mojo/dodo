@@ -7,7 +7,6 @@ ignored. A `main` that never reaches `serve` (it waits for a database,
 say) is stopped after `--timeout` seconds.
 """
 
-from std.os import remove
 from std.time import perf_counter_ns, sleep
 
 from dodo.json import Value, loads
@@ -15,6 +14,7 @@ from dodo.utils.process import spawn
 
 from .args import ParsedArgs
 from .build import build_for_command
+from .files import read_text, remove_if_there
 from .report import EXIT_FAILED, EXIT_OK, EXIT_USAGE, Report
 
 comptime _MARKER = '{"dodo_routes":'
@@ -60,10 +60,10 @@ def cmd_routes(parsed: ParsedArgs, mut report: Report) raises -> Int:
         status = child.poll()
 
     var exit = status.value()
-    var output = _read(out_path)
-    var errors = _read(err_path)
-    _remove(out_path)
-    _remove(err_path)
+    var output = read_text(out_path)
+    var errors = read_text(err_path)
+    remove_if_there(out_path)
+    remove_if_there(err_path)
     if not exit.succeeded():
         report.set("app_stderr", Value(errors))
         return report.fail(
@@ -144,18 +144,3 @@ def _last_line(text: String) -> String:
     if len(lines) == 0:
         return ""
     return String(lines[len(lines) - 1])
-
-
-def _read(path: String) -> String:
-    try:
-        with open(path, "r") as file:
-            return file.read()
-    except:
-        return ""
-
-
-def _remove(path: String):
-    try:
-        remove(path)
-    except:
-        pass

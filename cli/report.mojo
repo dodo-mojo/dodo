@@ -26,6 +26,20 @@ comptime EXIT_UNAVAILABLE = 69
 """Something outside dodo was missing: the network, `mojo`, `git`."""
 comptime EXIT_INTERNAL = 70
 """A bug in dodo or an error it did not expect."""
+comptime EXIT_INTERRUPTED = 130
+"""Stopped by Ctrl-C or SIGTERM (128 plus SIGINT, as shells report it)."""
+
+
+def format_seconds(seconds: Float64) -> String:
+    """`1.234` is "1.23 s"."""
+    var hundredths = Int(seconds * 100.0 + 0.5)
+    var whole = hundredths // 100
+    var part = hundredths % 100
+    var text = String(whole, ".")
+    if part < 10:
+        text += "0"
+    text += String(part, " s")
+    return text^
 
 
 struct Report(Movable):

@@ -1,7 +1,7 @@
 """Tests for the CLI's small helpers: files, project, build names, doctor
 parsing, routes formatting."""
 
-from std.os import getenv, makedirs, remove, rmdir, symlink
+from std.os import getenv, makedirs, remove, rmdir, setenv, symlink
 from std.os.path import exists, join, realpath
 from std.testing import (
     TestSuite,
@@ -10,10 +10,12 @@ from std.testing import (
     assert_raises,
     assert_true,
 )
+from std.time import sleep
 
 from dodo.json import loads
+from dodo.utils.process import ExitStatus
 
-from cli.build import binary_name, build_app
+from cli.build import BuildPlan, binary_name, build_app, finish_build
 from cli.cmd_doctor import (
     Check,
     format_checks,
@@ -165,6 +167,74 @@ def test_build_failure_then_stamp_logic() raises:
     var fifth = build_app(dir, entry, out_dir, report)
     assert_false(fifth.skipped)
     assert_true(exists(first.binary))
+
+
+def _built(plan: BuildPlan) raises:
+    """Pretend `plan` was built: a binary and its stamp are there."""
+    _touch(plan.binary, "binary")
+    _ = finish_build(plan, ExitStatus(code=0, signal=0), 0.0)
+
+
+def _rewrite(path: String, text: String) raises:
+    """Change `path`, a little later so its change time moves."""
+    sleep(0.01)
+    _touch(path, text)
+
+
+def test_failed_build_drops_the_old_stamp() raises:
+    # Otherwise a later run could trust the binary the failed build left.
+    var dir = _scratch("drop_stamp")
+    var entry = join(dir, "main.mojo")
+    _touch(entry, "def main():\n    pass\n")
+    var out_dir = join(dir, ".dodo", "build")
+    var plan = BuildPlan(dir, entry, out_dir)
+    _built(plan)
+    assert_true(BuildPlan(dir, entry, out_dir).up_to_date)
+
+    _ = finish_build(plan, ExitStatus(code=1, signal=0), 0.0)
+    assert_false(exists(plan.stamp_path))
+    assert_false(BuildPlan(dir, entry, out_dir).up_to_date)
+
+
+def test_stamp_follows_an_entry_outside_the_project() raises:
+    # `dodo test /elsewhere/test_x.mojo`: the walk of the project never
+    # sees the file, so the stamp must watch it on its own.
+    var dir = _scratch("near")
+    var elsewhere = _scratch("far")
+    var entry = join(elsewhere, "test_far.mojo")
+    _touch(entry, "def main():\n    pass\n")
+    var out_dir = join(dir, ".dodo", "build")
+    _built(BuildPlan(dir, entry, out_dir))
+    assert_true(BuildPlan(dir, entry, out_dir).up_to_date)
+
+    _rewrite(entry, "def main():\n    print(1)\n")
+    assert_false(BuildPlan(dir, entry, out_dir).up_to_date)
+
+
+def test_stamp_follows_the_toolchain() raises:
+    var dir = _scratch("toolchain")
+    var entry = join(dir, "main.mojo")
+    _touch(entry, "def main():\n    pass\n")
+    var prefix = _scratch("toolchain_prefix")
+    makedirs(join(prefix, "bin"), exist_ok=True)
+    makedirs(join(prefix, "lib", "mojo"), exist_ok=True)
+    var compiler = join(prefix, "bin", "mojo")
+    var package = join(prefix, "lib", "mojo", "dodo.mojoc")
+    _touch(compiler)
+    _touch(package)
+    var out_dir = join(dir, ".dodo", "build")
+
+    var saved = getenv("CONDA_PREFIX")
+    _ = setenv("CONDA_PREFIX", prefix)
+    var at_start = BuildPlan(dir, entry, out_dir).stamp
+    _rewrite(package, "a new dodo")
+    var new_package = BuildPlan(dir, entry, out_dir).stamp
+    _rewrite(compiler, "a new mojo")
+    var new_compiler = BuildPlan(dir, entry, out_dir).stamp
+    _ = setenv("CONDA_PREFIX", saved)
+
+    assert_true(at_start != new_package)
+    assert_true(new_package != new_compiler)
 
 
 # ── doctor ──

@@ -2,20 +2,29 @@
 
 Binaries go to `.dodo/build/` in the project. Next to each one a stamp
 file records what it was built from: the newest change time of the
-project's `.mojo` files (and how many there are) and of the toolchain (the `mojo` compiler and the
-installed `.mojoc` packages, such as dodo). The build is skipped when the
-stamp still matches, and redone when any of those change.
+project's `.mojo` files and how many there are (other test files are left
+out, see `build_inputs`), the entry file's own change time, and the
+toolchain's (the `mojo` compiler and the installed `.mojoc` packages,
+such as dodo). The build is skipped when the stamp still matches, and
+redone when any of those change.
 """
 
-from std.os import getenv, listdir, makedirs, remove
+from std.os import getenv, listdir, makedirs
 from std.os.path import isfile, join
 from std.sys import stderr
 from std.time import perf_counter_ns
 
 from dodo.json import Value
-from dodo.utils.process import run
+from dodo.utils.process import Child, ExitStatus, spawn
 
-from .files import mojo_files, newest_mtime_ns
+from .files import (
+    build_inputs,
+    mtime_ns,
+    newest_mtime_ns,
+    read_text,
+    remove_if_there,
+    tail_text,
+)
 from .project import drop_suffix, entry_file, find_root
 from .report import (
     EXIT_BUILD_FAILED,
@@ -66,61 +75,103 @@ def binary_name(root: String, entry: String) -> String:
     return drop_suffix(relative, ".mojo").replace("/", "__")
 
 
+struct BuildPlan(Copyable, Movable):
+    """Where one build goes and whether it is needed."""
+
+    var entry: String
+    var binary: String
+    var stamp_path: String
+    var log_path: String
+    var stamp: String
+    var up_to_date: Bool
+
+    def __init__(out self, root: String, entry: String, out_dir: String) raises:
+        makedirs(out_dir, exist_ok=True)
+        var name = binary_name(root, entry)
+        self.entry = entry
+        self.binary = join(out_dir, name)
+        self.stamp_path = join(out_dir, name + ".stamp")
+        self.log_path = join(out_dir, name + ".log")
+        self.stamp = _stamp(root, entry)
+        self.up_to_date = (
+            isfile(self.binary) and read_text(self.stamp_path) == self.stamp
+        )
+
+
+def start_build(
+    plan: BuildPlan, includes: List[String], new_group: Bool = False
+) raises -> Child:
+    """Start `mojo build` for `plan`, with `-I` for each of `includes`.
+
+    Raises:
+        Error: If `mojo` cannot be started.
+    """
+    var argv: List[String] = ["mojo", "build"]
+    for dir in includes:
+        argv.append("-I")
+        argv.append(dir)
+    argv.append(plan.entry)
+    argv.append("-o")
+    argv.append(plan.binary)
+    return spawn(
+        argv,
+        stdout_path=plan.log_path,
+        stderr_path="&1",
+        new_group=new_group,
+    )
+
+
+def finish_build(
+    plan: BuildPlan, status: ExitStatus, seconds: Float64
+) raises -> Build:
+    """Record how the build ended: write the stamp, or keep the log."""
+    var result = Build(plan.binary)
+    result.seconds = seconds
+    if not status.succeeded():
+        remove_if_there(plan.stamp_path)
+        result.exit_code = EXIT_BUILD_FAILED
+        result.message = String(
+            "mojo build failed on ", plan.entry, " (", status, ")"
+        )
+        result.log = tail_text(read_text(plan.log_path), _MAX_LOG_BYTES)
+        return result^
+    with open(plan.stamp_path, "w") as file:
+        file.write(plan.stamp)
+    return result^
+
+
 def build_app(
     root: String, entry: String, out_dir: String, report: Report
 ) raises -> Build:
     """Build `entry` into `out_dir`, unless the last build is still current.
     Says "building ..." on `report` only when it does build."""
-    makedirs(out_dir, exist_ok=True)
-    var name = binary_name(root, entry)
-    var result = Build(join(out_dir, name))
-    var stamp_path = join(out_dir, name + ".stamp")
-    var log_path = join(out_dir, name + ".log")
-
-    var stamp = _stamp(root, entry)
-    if isfile(result.binary) and _read_or_empty(stamp_path) == stamp:
-        result.skipped = True
-        return result^
+    var plan = BuildPlan(root, entry, out_dir)
+    if plan.up_to_date:
+        var skipped = Build(plan.binary)
+        skipped.skipped = True
+        return skipped^
 
     report.note(String("building ", entry, " ..."))
     var started = perf_counter_ns()
-    var argv: List[String] = [
-        "mojo",
-        "build",
-        "-I",
-        root,
-        entry,
-        "-o",
-        result.binary,
-    ]
-    var status: Int
+    var child: Child
     try:
-        status = run(argv, stdout_path=log_path, stderr_path="&1").shell_code()
+        child = start_build(plan, [root])
     except e:
-        result.exit_code = EXIT_UNAVAILABLE
-        result.message = String(e)
-        return result^
-    result.seconds = Float64(perf_counter_ns() - started) / 1e9
-
-    if status != 0:
-        _remove_if_there(stamp_path)
-        result.exit_code = EXIT_BUILD_FAILED
-        result.message = String(
-            "mojo build failed on ", entry, " (exit ", status, ")"
-        )
-        result.log = _tail(_read_or_empty(log_path), _MAX_LOG_BYTES)
-        return result^
-
-    with open(stamp_path, "w") as file:
-        file.write(stamp)
-    return result^
+        var missing = Build(plan.binary)
+        missing.exit_code = EXIT_UNAVAILABLE
+        missing.message = String(e)
+        return missing^
+    var status = child.wait()
+    var seconds = Float64(perf_counter_ns() - started) / 1e9
+    return finish_build(plan, status, seconds)
 
 
 def _stamp(root: String, entry: String) raises -> String:
-    var files = mojo_files(root)
+    var files = build_inputs(root, entry)
     var stamp = String(
         "sources ", newest_mtime_ns(files), " ", len(files), "\n"
     )
+    stamp += String("entry ", mtime_ns(entry), "\n")
     stamp += String("toolchain ", _toolchain_mtime_ns(), "\n")
     stamp += String(entry, "\n")
     return stamp^
@@ -141,32 +192,6 @@ def _toolchain_mtime_ns() raises -> Int:
     except:
         pass
     return newest_mtime_ns(paths)
-
-
-def _read_or_empty(path: String) -> String:
-    try:
-        with open(path, "r") as file:
-            return file.read()
-    except:
-        return ""
-
-
-def _remove_if_there(path: String):
-    try:
-        remove(path)
-    except:
-        pass
-
-
-def _tail(text: String, max_bytes: Int) -> String:
-    """The last `max_bytes` of `text`, cut at a line start."""
-    if text.byte_length() <= max_bytes:
-        return text
-    var start = text.byte_length() - max_bytes
-    var newline = text.find("\n", start)
-    if newline >= 0:
-        start = newline + 1
-    return String("[earlier output cut]\n", text[byte=start:])
 
 
 def build_for_command(given_file: String, mut report: Report) raises -> Build:

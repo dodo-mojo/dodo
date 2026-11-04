@@ -58,6 +58,11 @@ def command_specs() -> List[CommandSpec]:
                     "N",
                     "Build this many files at once (default: cores, at most 4)",
                 ),
+                FlagSpec(
+                    "timeout",
+                    "SECONDS",
+                    "Stop a test file that runs longer (default 600)",
+                ),
             ],
             max_positionals=-1,
             allows_passthrough=False,

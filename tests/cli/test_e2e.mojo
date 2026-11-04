@@ -9,15 +9,16 @@ repository root, as `tests/tools/run_tests.sh` does.
 from std.os import getenv, makedirs, remove
 from std.os.path import exists, join, realpath
 from std.testing import TestSuite, assert_equal, assert_false, assert_true
-from std.time import perf_counter_ns
+from std.time import perf_counter_ns, sleep
 
 from dodo.json import Value, loads
-from dodo.utils.process import run
+from dodo.utils.process import run, spawn
 
 from cli.build import build_app
 from cli.report import (
     EXIT_BUILD_FAILED,
     EXIT_FAILED,
+    EXIT_INTERRUPTED,
     EXIT_OK,
     EXIT_USAGE,
     Report,
@@ -26,6 +27,7 @@ from cli.version import DODO_VERSION
 
 comptime _APP = "tests/cli/fixtures/cli_app.mojo"
 comptime _BROKEN = "tests/cli/fixtures/broken_app.mojo"
+comptime _SUITES = "tests/cli/fixtures/suites"
 
 
 struct Ran(Movable):
@@ -340,6 +342,262 @@ def test_doctor_takes_no_arguments() raises:
     var ran = _dodo_run(["doctor", "now"])
     assert_equal(ran.code, EXIT_USAGE)
     assert_true("takes no arguments" in ran.err)
+
+
+# ── test ──
+
+
+def _suites_project() raises -> String:
+    """A project whose tests/ is a copy of the suites fixture. It is kept
+    between runs and copied with times kept (`cp -p`), so its builds stay
+    cached until a fixture changes."""
+    var dir = join(getenv("TMPDIR", "/tmp"), "dodo_e2e_suites")
+    makedirs(join(dir, "tests"), exist_ok=True)
+    var copied = run(["cp", "-Rp", _SUITES + "/.", join(dir, "tests")])
+    assert_true(copied.succeeded())
+    with open(join(dir, "pixi.toml"), "w") as file:
+        file.write("")
+    return realpath(dir)
+
+
+def _outcome_of(result: Value, path: String) raises -> String:
+    var files = result["files"].copy()
+    for i in range(len(files)):
+        if files[i]["path"].as_string() == path:
+            return files[i]["outcome"].as_string()
+    return "missing"
+
+
+def _is_running(pid: String) raises -> Bool:
+    return run(["kill", "-0", pid], stderr_path="/dev/null").succeeded()
+
+
+def test_test_every_outcome() raises:
+    # Every fixture but the hanging one, which has its own test: a short
+    # --timeout here could also stop a slow first launch of a new binary.
+    var dir = _suites_project()
+    var ran = _dodo_run(
+        [
+            "test",
+            "tests/passing",
+            "tests/failing",
+            "tests/crash",
+            "tests/broken",
+            "tests/no_report",
+            "tests/leftover",
+            "--json",
+        ],
+        cwd=dir,
+    )
+    assert_equal(ran.code, EXIT_BUILD_FAILED, ran.out)
+    var result = ran.json()
+    assert_equal(len(result["files"]), 7)
+    assert_equal(_outcome_of(result, "tests/passing/test_math.mojo"), "passed")
+    assert_equal(_outcome_of(result, "tests/passing/test_words.mojo"), "passed")
+    assert_equal(_outcome_of(result, "tests/failing/test_mixed.mojo"), "failed")
+    assert_equal(_outcome_of(result, "tests/crash/test_crash.mojo"), "crashed")
+    assert_equal(
+        _outcome_of(result, "tests/broken/test_broken.mojo"), "build_failed"
+    )
+    assert_equal(
+        _outcome_of(result, "tests/no_report/test_exit.mojo"), "no_report"
+    )
+    assert_equal(
+        _outcome_of(result, "tests/leftover/test_leftover.mojo"), "passed"
+    )
+    assert_equal(result["error"]["kind"].as_string(), "build")
+    assert_equal(Int(result["passed"].as_int()), 5)
+    assert_equal(Int(result["failed"].as_int()), 1)
+
+    # The test ran from the project root and its background program was
+    # killed once the test file ended.
+    var pid = String(_read(join(dir, "leftover.pid")).strip())
+    assert_true(pid != "")
+    assert_false(_is_running(pid))
+
+
+def test_test_timeout() raises:
+    var dir = _suites_project()
+    var ran = _dodo_run(
+        ["test", "tests/hang", "--timeout", "0.5", "--json"], cwd=dir
+    )
+    assert_equal(ran.code, EXIT_FAILED, ran.out)
+    var result = ran.json()
+    assert_equal(_outcome_of(result, "tests/hang/test_hang.mojo"), "timed_out")
+    assert_equal(
+        result["files"][0]["exit"].as_string(), "still running after 0.50 s"
+    )
+    var left = run(
+        ["pgrep", "-f", "tests__hang__test_hang"], stdout_path="/dev/null"
+    )
+    assert_false(left.succeeded())
+
+
+def test_test_text_report() raises:
+    var dir = _suites_project()
+    var ran = _dodo_run(["test", "tests/passing", "tests/failing"], cwd=dir)
+    assert_equal(ran.code, EXIT_FAILED)
+    var lines = ran.out.strip().splitlines()
+    assert_true(
+        String(lines[0]).startswith(
+            "FAIL    tests/failing/test_mixed.mojo  1 of 2 tests failed"
+        )
+    )
+    assert_equal(String(lines[1]), "        test_wrong")
+    assert_true(
+        String(lines[2]).endswith(
+            "AssertionError: `left == right` comparison failed:"
+        )
+    )
+    assert_true(
+        String(lines[len(lines) - 1]).startswith(
+            "4 passed, 1 failed, 0 skipped; 3 file(s)"
+        )
+    )
+    assert_true("dodo test: 1 test file(s) did not pass" in ran.err)
+
+
+def test_test_second_run_builds_nothing() raises:
+    var dir = _suites_project()
+    _ = _dodo_run(["test", "tests/passing"], cwd=dir)
+    var ran = _dodo_run(["test", "tests/passing", "--json"], cwd=dir)
+    assert_equal(ran.code, EXIT_OK)
+    var files = ran.json()["files"].copy()
+    assert_equal(len(files), 2)
+    for i in range(len(files)):
+        assert_false(files[i]["built"].as_bool())
+
+
+def test_test_only_one_test() raises:
+    var dir = _suites_project()
+    var ran = _dodo_run(["test", "--only", "test_double", "--json"], cwd=dir)
+    assert_equal(ran.code, EXIT_OK, ran.out)
+    var result = ran.json()
+    assert_equal(len(result["files"]), 1)
+    var tests = result["files"][0]["tests"].copy()
+    assert_equal(len(tests), 1)
+    assert_equal(tests[0]["name"].as_string(), "test_double")
+    assert_equal(Int(result["skipped"].as_int()), 0)
+
+
+def test_test_only_unknown_name() raises:
+    var dir = _suites_project()
+    var ran = _dodo_run(["test", "--only", "test_nothing"], cwd=dir)
+    assert_equal(ran.code, EXIT_FAILED)
+    assert_true("no test file defines `test_nothing`" in ran.err)
+
+
+def test_test_from_a_subfolder() raises:
+    var dir = _suites_project()
+    var ran = _dodo_run(
+        ["test", "--only", "test_add", "--json"],
+        cwd=join(dir, "tests", "passing"),
+    )
+    assert_equal(ran.code, EXIT_OK, ran.out)
+    var result = ran.json()
+    assert_equal(
+        result["files"][0]["path"].as_string(), "tests/passing/test_math.mojo"
+    )
+
+
+def test_test_bad_flags_and_paths() raises:
+    var dir = _suites_project()
+    # tests/passing keeps a wrongly accepted flag from running the slow files.
+    for flag in ["--jobs", "--timeout", "--only"]:
+        for bad in ["0", "x", ""]:
+            if String(flag) == "--only" and String(bad) != "":
+                continue
+            var ran = _dodo_run(
+                ["test", String(flag), String(bad), "tests/passing"], cwd=dir
+            )
+            assert_equal(ran.code, EXIT_USAGE, String(flag, " ", bad))
+    var missing = _dodo_run(["test", "tests/nope", "--json"], cwd=dir)
+    assert_equal(missing.code, EXIT_USAGE)
+    assert_equal(missing.json()["error"]["kind"].as_string(), "not_found")
+    var not_mojo = _dodo_run(["test", "tests/README.md"], cwd=dir)
+    assert_equal(not_mojo.code, EXIT_USAGE)
+
+
+def test_test_without_tests_folder() raises:
+    var dir = _scratch("empty_project")
+    with open(join(dir, "pixi.toml"), "w") as file:
+        file.write("")
+    var ran = _dodo_run(["test", "--json"], cwd=dir)
+    assert_equal(ran.code, EXIT_FAILED)
+    assert_equal(ran.json()["error"]["kind"].as_string(), "no_tests")
+
+
+def test_test_interrupted() raises:
+    var dir = _suites_project()
+    # Build the hanging test first, so the interrupt lands while it runs.
+    _ = _dodo_run(["test", "tests/hang", "--timeout", "0.5"], cwd=dir)
+    var out_path = join(dir, "interrupted.out")
+    var child = spawn(
+        [
+            "sh",
+            "-c",
+            'cd "$1" && shift && exec "$@"',
+            "sh",
+            dir,
+            _dodo(),
+            "test",
+            "tests/hang",
+        ],
+        stdout_path=out_path,
+        stderr_path="&1",
+    )
+    sleep(1.0)
+    child.send_signal(2)
+    var status = child.wait()
+    assert_equal(status.shell_code(), EXIT_INTERRUPTED)
+    var output = _read(out_path)
+    assert_true("STOPPED tests/hang/test_hang.mojo" in output, output)
+    var left = run(
+        ["pgrep", "-f", "tests__hang__test_hang"], stdout_path="/dev/null"
+    )
+    assert_false(left.succeeded())
+
+
+def test_test_interrupted_while_building() raises:
+    # A fresh project, so dodo has to build; the builds run in process
+    # groups of their own, so only dodo can stop them.
+    var dir = _scratch("interrupt_build")
+    makedirs(join(dir, "tests"), exist_ok=True)
+    _ = run(["cp", "-R", _SUITES + "/passing/.", join(dir, "tests")])
+    with open(join(dir, "pixi.toml"), "w") as file:
+        file.write("")
+    var builds = join(dir, ".dodo", "build", "tests")
+    var out_path = join(dir, "interrupted.out")
+    var child = spawn(
+        [
+            "sh",
+            "-c",
+            'cd "$1" && shift && exec "$@"',
+            "sh",
+            dir,
+            _dodo(),
+            "test",
+        ],
+        stdout_path=out_path,
+        stderr_path="&1",
+    )
+
+    var building = False
+    var tries = 0
+    while not building and tries < 3000:
+        sleep(0.01)
+        tries += 1
+        var found = run(["pgrep", "-f", builds], stdout_path="/dev/null")
+        building = found.succeeded()
+    assert_true(building, _read(out_path))
+
+    child.send_signal(2)
+    var status = child.wait()
+    assert_equal(status.shell_code(), EXIT_INTERRUPTED)
+    assert_true("stopped while building" in _read(out_path))
+    sleep(0.1)
+    var left = run(["pgrep", "-f", builds], stdout_path="/dev/null")
+    assert_false(left.succeeded())
 
 
 def main() raises:
