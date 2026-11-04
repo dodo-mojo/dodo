@@ -5,6 +5,7 @@
    the same version constraint.
 2. Every libdodo_<name> library the Mojo code loads is in the list of
    libraries the recipe test checks for.
+3. pixi.toml, the recipe and `cli/version.mojo` name the same version.
 
 Run through `pixi run check-package`.
 """
@@ -58,6 +59,28 @@ def recipe_tested_libraries(text: str) -> set[str]:
     return set(match.group(1).split())
 
 
+def versions() -> dict[str, str]:
+    """The dodo version each file names."""
+    with open(ROOT / "pixi.toml", "rb") as f:
+        pixi = tomllib.load(f)["workspace"]["version"]
+    recipe = re.search(r'^  version: "([^"]+)"', RECIPE.read_text(), re.M)
+    cli = re.search(
+        r'^comptime DODO_VERSION = "([^"]+)"',
+        (ROOT / "cli" / "version.mojo").read_text(),
+        re.M,
+    )
+    found = {"pixi.toml": pixi}
+    if recipe:
+        found["packaging/recipe.yaml"] = recipe.group(1)
+    else:
+        found["packaging/recipe.yaml"] = "(not found)"
+    if cli:
+        found["cli/version.mojo"] = cli.group(1)
+    else:
+        found["cli/version.mojo"] = "(not found)"
+    return found
+
+
 def loaded_libraries() -> set[str]:
     names = set()
     for path in (ROOT / "dodo").rglob("*.mojo"):
@@ -87,11 +110,19 @@ def main() -> int:
             " not check for it"
         )
 
+    named = versions()
+    if len(set(named.values())) > 1:
+        listed = ", ".join(f"{path} {v}" for path, v in named.items())
+        problems.append(f"the dodo version differs: {listed}")
+
     for problem in problems:
         print(f"packaging/recipe.yaml: {problem}", file=sys.stderr)
     if problems:
         return 1
-    print("packaging/recipe.yaml matches pixi.toml and the native libraries")
+    print(
+        "packaging/recipe.yaml matches pixi.toml, the native libraries"
+        " and the CLI version"
+    )
     return 0
 
 
