@@ -1,6 +1,14 @@
 """The SQLite pool most code uses, and transactions on it."""
 
 from ..error import DbError
+from ..migrate import (
+    MAX_RACES,
+    AppliedMigration,
+    Migrations,
+    failed,
+    lost_race,
+    plan,
+)
 from ..param import Param, params_of
 from ..pool import Pool, PoolOptions, Pooled
 from ..rows import Rows
@@ -64,6 +72,63 @@ struct Sqlite(Copyable):
         _ = conn.conn().execute_script("BEGIN IMMEDIATE")
         return SqliteTransaction(conn^)
 
+    def migrate(self, migrations: Migrations) raises DbError -> List[Int]:
+        """Run the migrations that haven't run yet, in version order, and
+        return their versions (ADR-0010).
+
+        Each migration runs in a transaction with its `dodo_migrations`
+        row, so one that fails leaves nothing behind. Safe when several
+        processes start at once: each migration still runs once.
+        """
+        self._create_migrations_table()
+        var ran = List[Int]()
+        var races = 0
+        while True:
+            var applied = self.query(
+                "select version, name, checksum from dodo_migrations"
+                " order by version"
+            ).to[AppliedMigration]()
+            var pending = plan(migrations, applied, "sqlite")
+            if len(pending) == 0:
+                return ran^
+            var next = pending[0].copy()
+            try:
+                var tx = self.transaction()
+                # BEGIN IMMEDIATE makes a second process wait here; once it
+                # gets in, this version is already recorded: a duplicate.
+                _ = tx.execute(
+                    (
+                        "insert into dodo_migrations (version, name, checksum)"
+                        " values (?, ?, ?)"
+                    ),
+                    next.version,
+                    next.name,
+                    next.checksum,
+                )
+                _ = tx.execute_script(next.sql)
+                tx.commit()
+            except e:
+                if lost_race(e) and races < MAX_RACES:
+                    races += 1
+                    continue
+                raise failed(next, e)
+            ran.append(next.version)
+
+    def _create_migrations_table(self) raises DbError:
+        # Two processes creating it at once can collide; one wins.
+        for attempt in range(3):
+            try:
+                _ = self.execute_script(
+                    "create table if not exists dodo_migrations (version"
+                    " integer primary key, name text not null, checksum text"
+                    " not null, applied_at text not null default"
+                    " current_timestamp)"
+                )
+                return
+            except e:
+                if not lost_race(e) or attempt == 2:
+                    raise e^
+
     def connection(self) raises DbError -> Pooled[SqliteConnection]:
         """A connection for several calls in a row."""
         return self._pool.acquire()
@@ -89,6 +154,11 @@ struct SqliteTransaction(Movable):
 
     def execute(mut self, sql: String, *params: Param) raises DbError -> Int:
         return self._conn.conn().execute(sql, params_of(params))
+
+    def execute_script(mut self, sql: String) raises DbError -> Int:
+        """Run `;`-separated statements without parameters, inside the
+        transaction."""
+        return self._conn.conn().execute_script(sql)
 
     def commit(mut self) raises DbError:
         _ = self._conn.conn().execute_script("COMMIT")
