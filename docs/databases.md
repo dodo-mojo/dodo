@@ -64,7 +64,7 @@ _ = db.execute_script("create table t (id int); create index on t (id);")
 
 - Placeholders are `$1, $2, ...` for PostgreSQL and `?` for MySQL and SQLite. Values travel apart from the SQL text, so they can't change the statement. Never build SQL by joining strings.
 - A parameter can be an `Int`, `Float64`, `Bool`, `String`, an `Optional` of those (empty is `NULL`), `Param.null()` or `Param.bytes(span)`.
-- `execute` returns the number of rows changed. `execute_script` runs several statements with no parameters, for migrations.
+- `execute` returns the number of rows changed. `execute_script` runs several statements with no parameters (schema setup; for schema changes over time, see [Migrations](#migrations)).
 
 `query` returns `Rows`. Read a cell by column name or index, or fill a struct whose fields match the column names:
 
@@ -91,6 +91,36 @@ tx.commit()
 A transaction holds one connection until `commit` or `rollback`. Dropping it without either rolls back, including when an error unwinds past it. SQLite starts it with `BEGIN IMMEDIATE`, so two writers wait on the busy timeout instead of failing halfway.
 
 To run several statements on one connection without a transaction (a session setting, a temporary table), check one out with `db.connection()`. It goes back to the pool when the guard is dropped.
+
+### Migrations
+
+Keep schema changes as SQL files named `<version>_<name>.sql` and apply them at startup, before serving:
+
+```
+migrations/
+  0001_create_users.sql
+  0002_add_email.sql
+```
+
+```mojo
+from dodo.db.migrate import Migrations
+
+def main() raises:
+    var pg = Postgres("postgres://app:secret@localhost:5432/app")
+    var applied = pg.migrate(Migrations.from_dir("migrations"))
+    print("applied migrations", applied)
+    var app = App(state=Db(pg))
+    ...
+```
+
+`migrate` exists on `Postgres`, `MySql` and `Sqlite`. It records each migration in a `dodo_migrations` table, runs only the new ones, and returns their versions. Several processes can start at once: each migration still runs once. `Migrations().add(1, "create users", sql)` builds the list in code instead of from files.
+
+- Migrations only go forward. To undo one, write a new one.
+- Never edit a migration that has run anywhere. `migrate` compares checksums and refuses to start if one changed, or if the database has a version the app doesn't know.
+- A new migration needs a version above every applied one. After merging two branches that both added `0005_...`, renumber yours.
+- PostgreSQL, CockroachDB and SQLite run each migration in a transaction: if it fails, none of it stays. MySQL and MariaDB commit each DDL statement as it runs, so a failed migration can leave its first statements applied. Keep one DDL statement per migration there.
+
+Why it works this way: [ADR-0010](adr/0010-database-migrations.md).
 
 ## Redis and Valkey
 
