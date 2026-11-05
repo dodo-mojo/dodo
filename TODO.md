@@ -29,6 +29,7 @@
 - [x] Database drivers (ADR-0009): PostgreSQL/CockroachDB, MySQL/MariaDB, SQLite, Redis/Valkey, MongoDB and ClickHouse in `dodo.db`, one shared pool, unit tests in `tests/db/`, Docker suites in `tests/live/db/` (`pixi run tests-db`).
 - [x] `blocking=True` on App routes (ADR-0004, ADR-0009), so a typed handler that queries a database runs on the offload pool. Usage guide: `docs/databases.md`.
 - [x] Database migrations (ADR-0010): `db.migrate(Migrations.from_dir("migrations"))` on `Postgres`, `MySql` and `Sqlite`; checksums, a `dodo_migrations` table, safe when several processes start at once. A `dodo migrate` CLI can wrap it later.
+- [ ] PostgreSQL `LISTEN/NOTIFY` and `COPY` (ADR-0011): `PgListener` with `listen`, `wait` and reconnecting by itself, `db.notify`, `copy_in`/`copy_out` and their streaming forms, text and CSV formats.
 - [ ] CI job for `pixi run tests-db`: the compose services on the Ubuntu runner, `DODO_DB_NO_COMPOSE=1` if they come up as job services.
 - [ ] Fuzzers for the database parsers: PostgreSQL messages, MySQL packets and rows, RESP replies, BSON and OP_MSG, ClickHouse RowBinary.
 - [ ] Database follow-ups when someone needs them: prepared-statement caches (PostgreSQL, MySQL, SQLite), ClickHouse bulk insert in RowBinary, MongoDB replica sets and `mongodb+srv://`, Redis pub/sub on a dedicated connection, typed dates.

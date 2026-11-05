@@ -1,6 +1,6 @@
 # ADR-0011: PostgreSQL LISTEN/NOTIFY and COPY
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-05
 
 ## Context
