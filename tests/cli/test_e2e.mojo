@@ -627,21 +627,27 @@ def main() raises:
 """
 
 
-def _dev_project() raises -> String:
-    """A project whose `main.mojo` imports dodo through a link to this
-    repository's package (the watcher does not follow links)."""
-    var dir = _scratch("dev")
+def _dev_project(name: String, main: String) raises -> String:
+    """A project whose `main.mojo` is `main` and imports dodo through a
+    link to this repository's package (the watcher does not follow
+    links)."""
+    var dir = _scratch(name)
     _ = run(["ln", "-s", realpath("dodo"), join(dir, "dodo")])
     with open(join(dir, "pixi.toml"), "w") as file:
         file.write("")
-    _save_version(dir, "v1")
+    _save_main(dir, main)
     return dir
 
 
-def _save_version(dir: String, version: String) raises:
+def _save_main(dir: String, text: String) raises:
+    """Save `main.mojo` a little later, so its change time moves."""
     sleep(0.01)
     with open(join(dir, "main.mojo"), "w") as file:
-        file.write(String(_DEV_APP).replace("VERSION", version))
+        file.write(text)
+
+
+def _save_version(dir: String, version: String) raises:
+    _save_main(dir, String(_DEV_APP).replace("VERSION", version))
 
 
 def _get(url: String) raises -> String:
@@ -732,7 +738,7 @@ def _stop_dev(mut dodo: Child) raises -> ExitStatus:
 
 
 def test_dev_session() raises:
-    var dir = _dev_project()
+    var dir = _dev_project("dev_session", String(_DEV_APP).replace("VERSION", "v1"))
     var dodo = _start_dev(dir, json=True)
     try:
         _dev_session_steps(dir, dodo)
@@ -807,7 +813,7 @@ def _dev_session_steps(dir: String, mut dodo: Child) raises:
 def test_dev_text_output() raises:
     # Without --json, events go to stderr as plain lines; stdout is the
     # app's.
-    var dir = _dev_project()
+    var dir = _dev_project("dev_text", String(_DEV_APP).replace("VERSION", "v1"))
     var err_path = join(dir, "dev.err")
     var dodo = _start_dev(dir, json=False)
     var tries = 0
@@ -848,6 +854,149 @@ def test_dev_bad_flags_and_files() raises:
     assert_equal(missing.json()["error"]["kind"].as_string(), "not_found")
     var too_many = _dodo_run(["dev", _APP, _APP])
     assert_equal(too_many.code, EXIT_USAGE)
+
+
+comptime _STUBBORN_APP = """from std.ffi import c_int, external_call
+from std.time import sleep
+
+
+def main() raises:
+    # Ignore SIGTERM (SIG_IGN is 1), as a hung app would.
+    _ = external_call["signal", Int](c_int(15), Int(1))
+    print("VERSION ignores SIGTERM", flush=True)
+    sleep(600.0)
+"""
+
+
+def _seconds_since(started_ns: Int) -> Float64:
+    return Float64(perf_counter_ns() - started_ns) / 1e9
+
+
+def _wait_for_exit(mut dodo: Child, seconds: Float64) raises -> ExitStatus:
+    """Wait up to `seconds` for dodo to exit; fail if it does not."""
+    var started = perf_counter_ns()
+    var status = dodo.poll()
+    while not status:
+        if _seconds_since(started) > seconds:
+            dodo.send_signal(9)
+            _ = dodo.wait()
+            raise Error("dodo still running after ", seconds, " s")
+        sleep(0.01)
+        status = dodo.poll()
+    return status.value()
+
+
+def test_dev_first_build_fails_then_a_fix_starts_it() raises:
+    var dir = _dev_project("dev_first_fails", "def main(:\n")
+    var dodo = _start_dev(dir, json=True)
+    try:
+        var out_path = join(dir, "dev.out")
+        _wait_for_event(out_path, "build_failed", 1)
+        assert_equal(len(_dev_events(out_path, "started")), 0)
+        var url = _dev_events(out_path, "listening")[0]["url"].as_string()
+        _save_version(dir, "v1")
+        _wait_for_event(out_path, "started", 1)
+        assert_false(_dev_events(out_path, "started")[0]["restart"].as_bool())
+        _wait_for_body(url, '"v1"', out_path)
+
+        # A new test file and a non-Mojo file change nothing the app is
+        # built from, so nothing is built or restarted.
+        makedirs(join(dir, "tests"), exist_ok=True)
+        with open(join(dir, "tests", "test_more.mojo"), "w") as file:
+            file.write("def main():\n    pass\n")
+        with open(join(dir, "notes.md"), "w") as file:
+            file.write("notes")
+        sleep(1.0)
+        assert_equal(len(_dev_events(out_path, "building")), 2)
+        assert_equal(len(_dev_events(out_path, "started")), 1)
+
+        # SIGTERM stops dodo the way Ctrl-C does.
+        dodo.send_signal(15)
+        var status = _wait_for_exit(dodo, 15.0)
+        assert_equal(status.shell_code(), EXIT_INTERRUPTED)
+        assert_equal(len(_dev_events(out_path, "stopped")), 1)
+    except e:
+        _ = _stop_dev(dodo)
+        raise e^
+
+
+def test_dev_ctrl_c_during_the_first_build() raises:
+    var dir = _dev_project(
+        "dev_ctrl_c_build", String(_DEV_APP).replace("VERSION", "v1")
+    )
+    var dodo = _start_dev(dir, json=True)
+    var out_path = join(dir, "dev.out")
+    _wait_for_event(out_path, "building", 1)
+    sleep(0.2)
+    var started = perf_counter_ns()
+    dodo.send_signal(2)
+    var status = _wait_for_exit(dodo, 5.0)
+    assert_true(_seconds_since(started) < 2.0, "the build was not stopped")
+    assert_equal(status.shell_code(), EXIT_INTERRUPTED)
+    assert_equal(len(_dev_events(out_path, "started")), 0)
+    assert_equal(len(_dev_events(out_path, "stopped")), 1)
+    var left = run(
+        ["pgrep", "-f", join(dir, "main.mojo")], stdout_path="/dev/null"
+    )
+    assert_false(left.succeeded(), "the build outlived dodo")
+
+
+def test_dev_kills_an_app_that_ignores_sigterm() raises:
+    var dir = _dev_project(
+        "dev_stubborn", String(_STUBBORN_APP).replace("VERSION", "v1")
+    )
+    var dodo = _start_dev(dir, json=True)
+    try:
+        _dev_stubborn_steps(dir, dodo)
+    except e:
+        _ = _stop_dev(dodo)
+        raise e^
+
+
+def _wait_for_text(path: String, text: String) raises:
+    """Wait up to 30 s until the file at `path` holds `text`."""
+    var tries = 0
+    while text not in _read(path):
+        assert_true(tries < 3000, String("no `", text, "`:\n", _read(path)))
+        sleep(0.01)
+        tries += 1
+
+
+def _dev_stubborn_steps(dir: String, mut dodo: Child) raises:
+    var out_path = join(dir, "dev.out")
+    _wait_for_event(out_path, "started", 1)
+    _wait_for_text(out_path, "v1 ignores SIGTERM")
+    var first_pid = _dev_events(out_path, "started")[0]["pid"].as_int()
+
+    # A restart waits 10 s for the old app to stop, then kills it.
+    _save_main(dir, String(_STUBBORN_APP).replace("VERSION", "v2"))
+    _wait_for_event(out_path, "building", 2)
+    _wait_for_event(out_path, "started", 2)
+    var restart = _dev_events(out_path, "started")[1].copy()
+    assert_true(restart["restart"].as_bool())
+    var seconds = restart["seconds"].as_float()
+    assert_true(seconds >= 10.0, String("killed after ", seconds, " s"))
+    assert_true(seconds < 60.0, String("killed after ", seconds, " s"))
+    assert_false(_is_running(String(first_pid)), "the old app still runs")
+
+    # Two signals 0.1 s apart are one Ctrl-C (pixi passes it on too), so
+    # dodo keeps waiting for the app to drain.
+    var second_pid = _dev_events(out_path, "started")[1]["pid"].as_int()
+    _wait_for_text(out_path, "v2 ignores SIGTERM")
+    dodo.send_signal(2)
+    sleep(0.1)
+    dodo.send_signal(2)
+    sleep(1.5)
+    assert_false(Bool(dodo.poll()), "one Ctrl-C did not wait for the app")
+    assert_true(_is_running(String(second_pid)))
+
+    # A second Ctrl-C kills the app at once.
+    var started = perf_counter_ns()
+    dodo.send_signal(2)
+    var status = _wait_for_exit(dodo, 5.0)
+    assert_true(_seconds_since(started) < 1.0, "the second Ctrl-C waited")
+    assert_equal(status.shell_code(), EXIT_INTERRUPTED)
+    assert_false(_is_running(String(second_pid)), "the app outlived dodo")
 
 
 def main() raises:

@@ -252,6 +252,42 @@ MISTAKES = [
         "            return _SIGNALLED",
     ),
     Mistake(
+        "dev takes one Ctrl-C delivered twice as a second press",
+        "cli/cmd_dev.mojo",
+        "        if signal != 0 and perf_counter_ns() > patient_until:",
+        "        if signal != 0:",
+    ),
+    Mistake(
+        "dev ignores a second Ctrl-C",
+        "cli/cmd_dev.mojo",
+        "        if signal != 0 and perf_counter_ns() > patient_until:",
+        "        if False:",
+    ),
+    Mistake(
+        "dev waits forever for an app that ignores SIGTERM",
+        "cli/cmd_dev.mojo",
+        "        if perf_counter_ns() > deadline:\n            break\n",
+        "",
+    ),
+    Mistake(
+        "dev restarts the app on a change the app is not built from",
+        "cli/cmd_dev.mojo",
+        "    if plan.up_to_date and session.app:",
+        "    if False:",
+    ),
+    Mistake(
+        "a plain handed-over listener gets per-worker siblings",
+        "dodo/runtime/scheduler.mojo",
+        "            prebind_per_worker = False\n",
+        "            pass\n",
+    ),
+    Mistake(
+        "allows_reuseport reads the flag backwards",
+        "dodo/runtime/reuseport.mojo",
+        "    return value.unsafe_load() != 0",
+        "    return value.unsafe_load() == 0",
+    ),
+    Mistake(
         "a draining connection is kept alive after its response",
         "dodo/http/_reactor/conn_handle.mojo",
         "        if self.draining:\n            final = True\n",
@@ -313,6 +349,8 @@ def tests_for(file: str) -> list[str]:
         return ["tests/utils/test_process.mojo"] + cli_tests
     if file.startswith("dodo/http/"):
         return ["tests/http/test_offload.mojo"]
+    if file.startswith("dodo/runtime/"):
+        return ["tests/runtime/test_scheduler.mojo", end_to_end]
     return cli_tests
 
 
