@@ -17,6 +17,7 @@ from std.memory import Pointer
 from dodo.net import RawSocket, SocketAddr
 from dodo.net._libc import AF_INET, MSG_NOSIGNAL, SOCK_STREAM, _recv, _send
 from dodo.runtime import INTEREST_READ, INTEREST_WRITE, Reactor, TimerWheel
+from dodo.runtime._libc_time import monotonic_now_ms
 from dodo.runtime.pool import Pool
 from dodo.tcp import TcpStream
 from dodo.ws.client import WsMessage
@@ -25,7 +26,11 @@ from dodo.ws.protocol import WS_EVENT_MESSAGE
 from dodo.ws.server_reactor import WsReactorHooks, WsSession
 
 from ._reactor.keepalive_scan import StepResult
-from ._reactor.lifecycle import _conn_free_addr, _conn_ptr_from_int
+from ._reactor.lifecycle import (
+    _arm_idle_timer,
+    _conn_free_addr,
+    _conn_ptr_from_int,
+)
 from ._reactor.tagged_dispatch import KIND_WS, _addr, _pack
 
 comptime _READ_CHUNK: Int = 16 * 1024
@@ -229,15 +234,14 @@ def _apply_step_ws(
         # the timeout after the last activity, at most that much
         # earlier, and a busy connection no longer cancels and
         # schedules a timer per message.
-        var now = wheel.now_ms()
+        var now = UInt64(monotonic_now_ms())
         var slack = UInt64(min(step.idle_timeout_ms // 8, 1000))
         var old = timers.get(fd)
         if old and now - h[].armed_at_ms <= slack:
             return
-        if old:
-            _ = wheel.cancel(old.value())
-        timers[fd] = wheel.schedule(step.idle_timeout_ms, UInt64(fd))
-        h[].armed_at_ms = now
+        h[].armed_at_ms = _arm_idle_timer(
+            fd, wheel, timers, step.idle_timeout_ms
+        )
 
 
 def _drive_ws(

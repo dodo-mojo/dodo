@@ -1992,6 +1992,18 @@ from test_idle_timer_reap import (
 from test_idle_timer_reap import (
     test_connection_without_a_timer_entry_is_reaped_if_untouched as test_idle_timer_reap__test_connection_without_a_timer_entry_is_reaped_if_untouched,
 )
+from test_idle_timer_reap import (
+    test_arming_counts_from_the_clock as test_idle_timer_reap__test_arming_counts_from_the_clock,
+)
+from test_idle_timer_reap import (
+    test_arming_again_replaces_the_old_timer as test_idle_timer_reap__test_arming_again_replaces_the_old_timer,
+)
+from test_idle_timer_reap import (
+    test_a_step_rearms_clears_or_leaves_the_timer as test_idle_timer_reap__test_a_step_rearms_clears_or_leaves_the_timer,
+)
+from test_idle_timer_reap import (
+    test_an_accepted_connection_counts_from_the_clock as test_idle_timer_reap__test_an_accepted_connection_counts_from_the_clock,
+)
 from test_inbound_body import (
     test_inbound_body as test_inbound_body__test_inbound_body,
 )
@@ -4051,6 +4063,12 @@ from test_server_lifecycle import (
     test_waiting_request_is_served_on_the_cancellable_loop as test_server_lifecycle__test_waiting_request_is_served_on_the_cancellable_loop,
 )
 from test_server_lifecycle import (
+    test_idle_timer_counts_from_the_answer_after_a_slow_handler as test_server_lifecycle__test_idle_timer_counts_from_the_answer_after_a_slow_handler,
+)
+from test_server_lifecycle import (
+    test_idle_timer_counts_from_the_answer_on_the_cancellable_loop as test_server_lifecycle__test_idle_timer_counts_from_the_answer_on_the_cancellable_loop,
+)
+from test_server_lifecycle import (
     test_idle_keepalive_connection_is_still_closed_after_the_timeout as test_server_lifecycle__test_idle_keepalive_connection_is_still_closed_after_the_timeout,
 )
 from test_server_lifecycle import (
@@ -6014,6 +6032,14 @@ def main() raises:
     suite.test[
         test_idle_timer_reap__test_connection_without_a_timer_entry_is_reaped_if_untouched
     ]()
+    suite.test[test_idle_timer_reap__test_arming_counts_from_the_clock]()
+    suite.test[test_idle_timer_reap__test_arming_again_replaces_the_old_timer]()
+    suite.test[
+        test_idle_timer_reap__test_a_step_rearms_clears_or_leaves_the_timer
+    ]()
+    suite.test[
+        test_idle_timer_reap__test_an_accepted_connection_counts_from_the_clock
+    ]()
     # tests/http/test_inbound_body.mojo
     suite.test[test_inbound_body__test_inbound_body]()
     # tests/http/test_intern.mojo
@@ -7047,6 +7073,12 @@ def main() raises:
     ]()
     suite.test[
         test_server_lifecycle__test_waiting_request_is_served_on_the_cancellable_loop
+    ]()
+    suite.test[
+        test_server_lifecycle__test_idle_timer_counts_from_the_answer_after_a_slow_handler
+    ]()
+    suite.test[
+        test_server_lifecycle__test_idle_timer_counts_from_the_answer_on_the_cancellable_loop
     ]()
     suite.test[
         test_server_lifecycle__test_idle_keepalive_connection_is_still_closed_after_the_timeout

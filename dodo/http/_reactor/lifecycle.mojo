@@ -61,8 +61,9 @@ def _collect_fired_timers(
     """Advance the wheel to ``now_ms`` and record which connections' timers
     fired, without closing anything yet.
 
-    The wheel is advanced right after ``poll`` so its clock is current for
-    every ``schedule`` made while the events are handled. Reaping is a
+    The wheel is advanced right after ``poll``; its clock then stands
+    still while the events are handled, so timers are armed from the real
+    clock (:func:`_arm_idle_timer`), not from the wheel's. Reaping is a
     separate step (:func:`_expired_idle_conns`) that runs *after* the
     events: a connection whose request was already waiting when its
     deadline passed (the loop was busy in another handler) gets that request
@@ -166,15 +167,44 @@ def _apply_step(
             conn_ptr[].last_interest = interest
         except:
             pass
-    if step.idle_timeout_ms == 0:
+    _set_idle_timer(fd, wheel, timers, step.idle_timeout_ms)
+
+
+def _set_idle_timer(
+    fd: Int,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+    idle_timeout_ms: Int,
+) raises:
+    """Do what a step's ``idle_timeout_ms`` asks: 0 clears the
+    connection's idle timer, above 0 arms it again, below 0 leaves it."""
+    if idle_timeout_ms == 0:
         if fd in timers:
             _ = wheel.cancel(timers[fd])
             _ = timers.pop(fd)
-    elif step.idle_timeout_ms > 0:
-        if fd in timers:
-            _ = wheel.cancel(timers[fd])
-        var tid = wheel.schedule(step.idle_timeout_ms, UInt64(fd))
-        timers[fd] = tid
+    elif idle_timeout_ms > 0:
+        _ = _arm_idle_timer(fd, wheel, timers, idle_timeout_ms)
+
+
+def _arm_idle_timer(
+    fd: Int,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+    idle_timeout_ms: Int,
+) raises -> UInt64:
+    """Arm ``fd``'s idle timer ``idle_timeout_ms`` from now, in place of
+    the one it had, and return the time it counted from.
+
+    Now is read from the clock here, not taken from the wheel: the wheel
+    moves only after each ``poll``, and a handler that ran since then
+    would come off the timer, closing a connection early.
+    """
+    var now = UInt64(monotonic_now_ms())
+    var old = timers.get(fd)
+    if old:
+        _ = wheel.cancel(old.value())
+    timers[fd] = wheel.schedule(idle_timeout_ms, UInt64(fd), now)
+    return now
 
 
 def _cleanup_conn(
@@ -247,7 +277,7 @@ def _arm_accept_timer(
     if idle_timeout_ms <= 0:
         return
     try:
-        timers[client_fd] = wheel.schedule(idle_timeout_ms, UInt64(client_fd))
+        _ = _arm_idle_timer(client_fd, wheel, timers, idle_timeout_ms)
     except:
         pass
 

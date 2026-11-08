@@ -106,9 +106,11 @@ from ._h2_conn_handle import (
 )
 from ._reactor.offload_loop import close_offload_port
 from ._reactor.lifecycle import (
+    _arm_idle_timer,
     _collect_fired_timers,
     _expired_idle_conns,
     _hand_off_stream,
+    _set_idle_timer,
     ListenerGate,
 )
 from ._server_reactor_impl import (
@@ -318,15 +320,7 @@ def _apply_step_h2(
             h2_ptr[].last_interest = interest
         except:
             pass
-    if step.idle_timeout_ms == 0:
-        if fd in timers:
-            _ = wheel.cancel(timers[fd])
-            _ = timers.pop(fd)
-    elif step.idle_timeout_ms > 0:
-        if fd in timers:
-            _ = wheel.cancel(timers[fd])
-        var tid = wheel.schedule(step.idle_timeout_ms, UInt64(fd))
-        timers[fd] = tid
+    _set_idle_timer(fd, wheel, timers, step.idle_timeout_ms)
 
 
 def _drive_h2[
@@ -1003,9 +997,7 @@ def _unified_handle_conn_event[
             # dribbles one record and goes quiet must not hold a slot
             # for the life of the process.
             if config.idle_timeout_ms > 0:
-                if fd in timers:
-                    _ = wheel.cancel(timers[fd])
-                timers[fd] = wheel.schedule(config.idle_timeout_ms, UInt64(fd))
+                _ = _arm_idle_timer(fd, wheel, timers, config.idle_timeout_ms)
             return
         # Handshake complete: ALPN decides the protocol handle.
         if not _migrate_tls(fd, h2_config, conns, ws_hooks.copy()):

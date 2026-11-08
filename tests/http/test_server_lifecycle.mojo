@@ -90,6 +90,10 @@ def _hello(req: Request) raises -> Response:
         # deadline passes.
         usleep(300000)
         return ok("slow")
+    if req.url == "/second":
+        # As long as the idle timeout the timer tests give the server.
+        usleep(1000000)
+        return ok("second")
     if req.url == "/big":
         # Big enough to overflow the socket send buffer, so the write
         # goes partial and completes on later writable edges.
@@ -188,10 +192,12 @@ def test_stale_idle_timer_does_not_kill_the_next_connection() raises:
 # ── The idle timer must not beat a request that is already waiting ─────────
 
 
-def _spawn_cancellable() raises -> Tuple[Int, UInt16]:
+def _spawn_cancellable(
+    var config: ServerConfig = ServerConfig(),
+) raises -> Tuple[Int, UInt16]:
     """Same as ``_spawn`` but on the HTTP/1.1-only ``serve_cancellable``
     loop, which has its own copy of the timer handling."""
-    var srv = HttpServer.bind(SocketAddr.localhost(0))
+    var srv = HttpServer.bind(SocketAddr.localhost(0), config^)
     var port = UInt16(srv.local_addr().port)
     var pid = fork()
     if pid == 0:
@@ -244,6 +250,45 @@ def test_waiting_request_is_served_even_if_its_idle_timer_expired_meanwhile() ra
 
 def test_waiting_request_is_served_on_the_cancellable_loop() raises:
     _check_waiting_request_is_served(_spawn_cancellable())
+
+
+def _check_idle_timer_counts_from_the_answer(srv: Tuple[Int, UInt16]) raises:
+    """The idle timer is armed again once a 1 s handler answers. It must
+    count from then: the loop last read the clock before the handler ran,
+    and a timer counted from that reading fires as the answer goes out.
+    The next request, 500 ms after the answer, is well inside the 1 s."""
+    var first = String("")
+    var second = String("")
+    try:
+        var c = _connect_loopback(srv[1])
+        _send_str(c, "GET /second HTTP/1.1\r\nHost: x\r\n\r\n")
+        first = _read_some(c)
+        usleep(500000)
+        _send_str(c, "GET /fast HTTP/1.1\r\nHost: x\r\n\r\n")
+        second = _read_some(c)
+        _ = _close(c)
+    except:
+        pass
+    _stop(srv[0])
+    assert_true(
+        "second" in first, "setup: the slow handler did not answer: " + first
+    )
+    assert_true(
+        "200 OK" in second,
+        "the idle timer counted from before the handler: [" + second + "]",
+    )
+
+
+def test_idle_timer_counts_from_the_answer_after_a_slow_handler() raises:
+    _check_idle_timer_counts_from_the_answer(
+        _spawn(ServerConfig(idle_timeout_ms=1000))
+    )
+
+
+def test_idle_timer_counts_from_the_answer_on_the_cancellable_loop() raises:
+    _check_idle_timer_counts_from_the_answer(
+        _spawn_cancellable(ServerConfig(idle_timeout_ms=1000))
+    )
 
 
 def test_idle_keepalive_connection_is_still_closed_after_the_timeout() raises:
