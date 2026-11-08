@@ -39,6 +39,12 @@ COMPILE_FAIL_DIR = os.path.join(TESTS, "compile_fail")
 FIXTURES = "/fixtures/"
 
 # Tests that mutate process-global state; they must keep their own process.
+HELPERS = {
+    # Builds and runs the real `dodo` binary for the CLI's end-to-end tests.
+    "tests/cli/dodo_cli.mojo",
+}
+"""Modules that tests import; they hold no tests of their own."""
+
 EXCLUDE = {
     "tests/runtime/test_block_in_pool.mojo",
     "tests/runtime/test_closure_send_contract.mojo",
@@ -98,7 +104,7 @@ def discover() -> dict[str, list[tuple[str, list[str]]]]:
         skipped_dirs = (OUT_DIR, LIVE_DIR, COMPILE_FAIL_DIR)
         if path.startswith(skipped_dirs):
             continue
-        if path in EXCLUDE:
+        if path in EXCLUDE or path in HELPERS:
             continue
         if FIXTURES in path:
             continue
