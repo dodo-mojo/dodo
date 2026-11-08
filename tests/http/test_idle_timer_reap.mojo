@@ -12,10 +12,14 @@ from std.collections import Dict
 from std.testing import assert_equal, assert_true, TestSuite
 
 from dodo.http._reactor.lifecycle import (
+    _arm_accept_timer,
+    _arm_idle_timer,
     _collect_fired_timers,
     _expired_idle_conns,
+    _set_idle_timer,
 )
 from dodo.runtime import TimerWheel
+from dodo.runtime._libc_time import monotonic_now_ms
 
 
 struct _Fixture(Movable):
@@ -33,12 +37,16 @@ struct _Fixture(Movable):
 
     def add(mut self, fd: Int, after_ms: Int) raises:
         self.conns[fd] = fd * 10
-        self.timers[fd] = self.wheel.schedule(after_ms, UInt64(fd))
+        self.timers[fd] = self.wheel.schedule(
+            after_ms, UInt64(fd), self.wheel.tick_ms()
+        )
 
     def rearm(mut self, fd: Int, after_ms: Int) raises:
         """What ``_apply_step`` does on a step that sets a new idle timeout."""
         _ = self.wheel.cancel(self.timers[fd])
-        self.timers[fd] = self.wheel.schedule(after_ms, UInt64(fd))
+        self.timers[fd] = self.wheel.schedule(
+            after_ms, UInt64(fd), self.wheel.tick_ms()
+        )
 
     def advance_to(
         mut self, now_ms: Int, mut fds: List[Int], mut ids: List[UInt64]
@@ -142,8 +150,63 @@ def test_connection_without_a_timer_entry_is_reaped_if_untouched() raises:
     var ids: List[UInt64] = [UInt64(0)]
     var out = f.expired(fds, ids)
     assert_equal(len(out), 1)
-    f.timers[9] = f.wheel.schedule(500, UInt64(9))
+    f.timers[9] = f.wheel.schedule(500, UInt64(9), f.wheel.tick_ms())
     assert_equal(len(f.expired(fds, ids)), 0)
+
+
+# ── Arming counts from the clock, not from the wheel's last tick ──
+
+
+struct _Stale(Movable):
+    """A wheel that last moved 800 ms ago, as after a long handler."""
+
+    var wheel: TimerWheel
+    var timers: Dict[Int, UInt64]
+    var now: UInt64
+
+    def __init__(out self):
+        self.now = UInt64(monotonic_now_ms())
+        self.wheel = TimerWheel(now_ms=self.now - 800)
+        self.timers = Dict[Int, UInt64]()
+
+    def fired_by(mut self, ms_from_now: Int) raises -> Int:
+        var fired = List[UInt64]()
+        self.wheel.advance(self.now + UInt64(ms_from_now), fired)
+        return len(fired)
+
+
+def test_arming_counts_from_the_clock() raises:
+    var s = _Stale()
+    var counted_from = _arm_idle_timer(7, s.wheel, s.timers, 1000)
+    assert_true(counted_from >= s.now, "counted from the wheel's tick")
+    assert_equal(s.fired_by(999), 0, "fired early")
+    assert_equal(s.fired_by(1100), 1)
+
+
+def test_arming_again_replaces_the_old_timer() raises:
+    var s = _Stale()
+    _ = _arm_idle_timer(7, s.wheel, s.timers, 100)
+    _ = _arm_idle_timer(7, s.wheel, s.timers, 1000)
+    assert_equal(s.wheel.active_count(), 1)
+    assert_equal(s.fired_by(999), 0, "the old 100 ms timer fired")
+
+
+def test_a_step_rearms_clears_or_leaves_the_timer() raises:
+    var s = _Stale()
+    _set_idle_timer(7, s.wheel, s.timers, 1000)
+    assert_equal(s.fired_by(999), 0, "fired early")
+    _set_idle_timer(7, s.wheel, s.timers, -1)
+    assert_true(7 in s.timers, "a negative timeout must leave the timer")
+    _set_idle_timer(7, s.wheel, s.timers, 0)
+    assert_true(7 not in s.timers)
+    assert_equal(s.wheel.active_count(), 0)
+
+
+def test_an_accepted_connection_counts_from_the_clock() raises:
+    var s = _Stale()
+    _arm_accept_timer(9, s.wheel, s.timers, 1000)
+    assert_equal(s.fired_by(999), 0, "fired early")
+    assert_equal(s.fired_by(1100), 1)
 
 
 def main() raises:

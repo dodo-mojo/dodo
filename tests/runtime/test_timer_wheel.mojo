@@ -17,9 +17,9 @@ from dodo.runtime import TimerWheel
 def test_schedule_returns_unique_ids() raises:
     """Each schedule call returns a different, monotonic ID."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    var id1 = tw.schedule(10, UInt64(1))
-    var id2 = tw.schedule(20, UInt64(2))
-    var id3 = tw.schedule(30, UInt64(3))
+    var id1 = tw.schedule(10, UInt64(1), tw.tick_ms())
+    var id2 = tw.schedule(20, UInt64(2), tw.tick_ms())
+    var id3 = tw.schedule(30, UInt64(3), tw.tick_ms())
     assert_true(id1 < id2)
     assert_true(id2 < id3)
     assert_not_equal(id1, UInt64(0))
@@ -34,12 +34,52 @@ def test_empty_wheel_active_count_zero() raises:
 def test_schedule_increments_active_count() raises:
     """Scheduling increases active_count; advance past fire resets it."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(5, UInt64(1))
-    _ = tw.schedule(10, UInt64(2))
+    _ = tw.schedule(5, UInt64(1), tw.tick_ms())
+    _ = tw.schedule(10, UInt64(2), tw.tick_ms())
     assert_equal(tw.active_count(), 2)
     var fired = List[UInt64]()
     tw.advance(UInt64(11), fired)
     assert_equal(tw.active_count(), 0)
+
+
+# ── Counting from the caller's clock ─────────────────────────────────────────
+
+
+def _fires_at(mut tw: TimerWheel, last_quiet: UInt64, due: UInt64) raises:
+    """Nothing fires up to `last_quiet`; the timer fires by `due`."""
+    var fired = List[UInt64]()
+    tw.advance(last_quiet, fired)
+    assert_equal(len(fired), 0, String("fired by ", last_quiet))
+    tw.advance(due, fired)
+    assert_equal(len(fired), 1, String("not fired by ", due))
+
+
+def test_a_timer_counts_from_now_not_from_the_last_tick() raises:
+    """The wheel last moved at 0; a handler ran until 300, then armed a
+    100 ms timer. It is due at 400, not 100."""
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(100, UInt64(7), UInt64(300))
+    _fires_at(tw, UInt64(399), UInt64(400))
+
+
+def test_a_long_timer_counts_from_now_too() raises:
+    """Over one rotation (512 ms) the timer waits in the overflow list."""
+    var tw = TimerWheel(now_ms=UInt64(0))
+    _ = tw.schedule(600, UInt64(7), UInt64(200))
+    _fires_at(tw, UInt64(799), UInt64(800))
+
+
+def test_now_close_to_a_rotation_ahead_of_the_tick() raises:
+    """A short delay from a `now` far past the tick still fires on time."""
+    var tw = TimerWheel(now_ms=UInt64(1000))
+    _ = tw.schedule(20, UInt64(7), UInt64(1500))
+    _fires_at(tw, UInt64(1519), UInt64(1520))
+
+
+def test_a_now_behind_the_tick_counts_from_the_tick() raises:
+    var tw = TimerWheel(now_ms=UInt64(500))
+    _ = tw.schedule(10, UInt64(7), UInt64(100))
+    _fires_at(tw, UInt64(509), UInt64(510))
 
 
 # ── Fire timing ───────────────────────────────────────────────────────────────
@@ -48,7 +88,7 @@ def test_schedule_increments_active_count() raises:
 def test_timer_fires_after_correct_delay() raises:
     """A 10ms timer fires on the tick at which now advances to 10+."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(10, UInt64(0xAA))
+    _ = tw.schedule(10, UInt64(0xAA), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(9), fired)
     assert_equal(len(fired), 0)
@@ -60,9 +100,9 @@ def test_timer_fires_after_correct_delay() raises:
 def test_multiple_timers_fire_in_order() raises:
     """Timers with different fire times fire in the correct order."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(30, UInt64(3))
-    _ = tw.schedule(10, UInt64(1))
-    _ = tw.schedule(20, UInt64(2))
+    _ = tw.schedule(30, UInt64(3), tw.tick_ms())
+    _ = tw.schedule(10, UInt64(1), tw.tick_ms())
+    _ = tw.schedule(20, UInt64(2), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(100), fired)
     assert_equal(len(fired), 3)
@@ -74,7 +114,7 @@ def test_multiple_timers_fire_in_order() raises:
 def test_immediate_timer_fires_next_advance() raises:
     """After_ms=0 fires on the next non-zero advance."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(0, UInt64(0x11))
+    _ = tw.schedule(0, UInt64(0x11), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(1), fired)
     assert_equal(len(fired), 1)
@@ -84,7 +124,7 @@ def test_immediate_timer_fires_next_advance() raises:
 def test_zero_advance_fires_nothing() raises:
     """Advancing to the same time fires no timers."""
     var tw = TimerWheel(now_ms=UInt64(100))
-    _ = tw.schedule(10, UInt64(0xBB))
+    _ = tw.schedule(10, UInt64(0xBB), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(100), fired)
     assert_equal(len(fired), 0)
@@ -97,7 +137,7 @@ def test_cancel_is_idempotent() raises:
     """First cancel() of an active timer returns True; the second
     cancel() of the same id returns False."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    var id = tw.schedule(100, UInt64(1))
+    var id = tw.schedule(100, UInt64(1), tw.tick_ms())
     assert_true(tw.cancel(id))
     assert_false(tw.cancel(id))
 
@@ -111,8 +151,8 @@ def test_cancel_unknown_id_returns_false() raises:
 def test_cancelled_timer_does_not_fire() raises:
     """A cancelled timer does not appear in fired list."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    var id1 = tw.schedule(5, UInt64(0x01))
-    var id2 = tw.schedule(10, UInt64(0x02))
+    var id1 = tw.schedule(5, UInt64(0x01), tw.tick_ms())
+    var id2 = tw.schedule(10, UInt64(0x02), tw.tick_ms())
     _ = tw.cancel(id1)
     var fired = List[UInt64]()
     tw.advance(UInt64(100), fired)
@@ -127,7 +167,7 @@ def test_cancelled_timer_does_not_fire() raises:
 def test_timer_past_one_rotation_fires_eventually() raises:
     """A timer scheduled beyond 512ms uses overflow and still fires."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(1000, UInt64(0xCAFE))
+    _ = tw.schedule(1000, UInt64(0xCAFE), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(999), fired)
     assert_equal(len(fired), 0, "not yet time")
@@ -139,7 +179,7 @@ def test_timer_past_one_rotation_fires_eventually() raises:
 def test_timer_at_exactly_512ms_fires() raises:
     """A timer at exactly the wheel size (promotes from overflow) fires."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(512, UInt64(0xDEAD))
+    _ = tw.schedule(512, UInt64(0xDEAD), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(512), fired)
     assert_equal(len(fired), 1)
@@ -149,9 +189,9 @@ def test_timer_at_exactly_512ms_fires() raises:
 def test_multiple_rotations_still_fire() raises:
     """Timers across >1 full wheel rotations all fire in order."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(100, UInt64(1))
-    _ = tw.schedule(600, UInt64(2))
-    _ = tw.schedule(1200, UInt64(3))
+    _ = tw.schedule(100, UInt64(1), tw.tick_ms())
+    _ = tw.schedule(600, UInt64(2), tw.tick_ms())
+    _ = tw.schedule(1200, UInt64(3), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(2000), fired)
     assert_equal(len(fired), 3)
@@ -168,7 +208,7 @@ def test_1000_short_timers_all_fire() raises:
     var tw = TimerWheel(now_ms=UInt64(0))
     for i in range(1000):
         var delay = (i % 500) + 1
-        _ = tw.schedule(delay, UInt64(1_000_000 + i))
+        _ = tw.schedule(delay, UInt64(1_000_000 + i), tw.tick_ms())
     var fired = List[UInt64]()
     tw.advance(UInt64(501), fired)
     assert_equal(len(fired), 1000)
@@ -179,7 +219,7 @@ def test_many_cancels_dont_leak() raises:
     var tw = TimerWheel(now_ms=UInt64(0))
     var ids = List[UInt64]()
     for i in range(500):
-        ids.append(tw.schedule(i + 1, UInt64(i)))
+        ids.append(tw.schedule(i + 1, UInt64(i), tw.tick_ms()))
     for i in range(500):
         _ = tw.cancel(ids[i])
     assert_equal(tw.active_count(), 0)
@@ -195,19 +235,19 @@ def test_many_cancels_dont_leak() raises:
 def test_now_ms_reflects_advance() raises:
     """Now_ms() tracks the wheel's current tick."""
     var tw = TimerWheel(now_ms=UInt64(100))
-    assert_equal(tw.now_ms(), UInt64(100))
+    assert_equal(tw.tick_ms(), UInt64(100))
     var fired = List[UInt64]()
     tw.advance(UInt64(150), fired)
-    assert_equal(tw.now_ms(), UInt64(150))
+    assert_equal(tw.tick_ms(), UInt64(150))
 
 
 def test_next_fire_ms_returns_earliest() raises:
     """Next_fire_ms() returns the absolute time of the earliest pending timer.
     """
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(500, UInt64(1))
-    _ = tw.schedule(200, UInt64(2))
-    _ = tw.schedule(800, UInt64(3))
+    _ = tw.schedule(500, UInt64(1), tw.tick_ms())
+    _ = tw.schedule(200, UInt64(2), tw.tick_ms())
+    _ = tw.schedule(800, UInt64(3), tw.tick_ms())
     assert_equal(tw.next_fire_ms(), UInt64(200))
 
 
@@ -222,7 +262,7 @@ def test_next_fire_ms_overflow_only_returns_rotation() raises:
     lower-bound hint, never a value in the past.
     """
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(5000, UInt64(9))
+    _ = tw.schedule(5000, UInt64(9), tw.tick_ms())
     var nf = tw.next_fire_ms()
     assert_true(nf > UInt64(0))
     assert_true(nf <= UInt64(5000))
@@ -234,7 +274,7 @@ def test_next_fire_ms_overflow_only_is_lower_bound_after_advance() raises:
     exceed that boundary. A timer due at 512, observed at now=500, used to
     be reported as due at 1012 (now + 512) although it fires at 512."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(512, UInt64(7))  # delay 512 -> overflow list
+    _ = tw.schedule(512, UInt64(7), tw.tick_ms())  # delay 512 -> overflow list
     var fired = List[UInt64]()
     tw.advance(UInt64(500), fired)
     var hint = tw.next_fire_ms()
@@ -255,10 +295,10 @@ def test_next_fire_ms_wheel_hint_capped_at_promotion_boundary() raises:
     not push the hint past it while the overflow list is non-empty (the
     overflow timer is promoted, and may fire, at the boundary)."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(700, UInt64(1))  # overflow, fires at 700
+    _ = tw.schedule(700, UInt64(1), tw.tick_ms())  # overflow, fires at 700
     var fired = List[UInt64]()
     tw.advance(UInt64(100), fired)
-    _ = tw.schedule(511, UInt64(2))  # wheel slot 99, fires at 611
+    _ = tw.schedule(511, UInt64(2), tw.tick_ms())  # wheel slot 99, fires at 611
     # Boundary at 512 (= now 100 + (512 - slot 100)); wheel timer at 611.
     assert_equal(tw.next_fire_ms(), UInt64(512))
 
@@ -267,7 +307,7 @@ def test_next_fire_ms_overflow_hint_at_slot_zero() raises:
     """At slot 0 the boundary is a full rotation away, so the hint
     for an overflow-only wheel stays now + 512 (no regression)."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(5000, UInt64(1))
+    _ = tw.schedule(5000, UInt64(1), tw.tick_ms())
     assert_equal(tw.next_fire_ms(), UInt64(512))
 
 
@@ -276,8 +316,8 @@ def test_next_fire_ms_recovers_after_advance() raises:
     (independent of active-timer count; bounded slot scan).
     """
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(50, UInt64(1))
-    _ = tw.schedule(300, UInt64(2))
+    _ = tw.schedule(50, UInt64(1), tw.tick_ms())
+    _ = tw.schedule(300, UInt64(2), tw.tick_ms())
     assert_equal(tw.next_fire_ms(), UInt64(50))
     var fired = List[UInt64]()
     tw.advance(UInt64(60), fired)
@@ -290,8 +330,8 @@ def test_next_fire_ms_cancel_is_lower_bound() raises:
     up once the wheel advances past the cancelled slot.
     """
     var tw = TimerWheel(now_ms=UInt64(0))
-    var id1 = tw.schedule(100, UInt64(1))
-    _ = tw.schedule(400, UInt64(2))
+    var id1 = tw.schedule(100, UInt64(1), tw.tick_ms())
+    _ = tw.schedule(400, UInt64(2), tw.tick_ms())
     _ = tw.cancel(id1)
     # Lower bound: <= the true next active fire (400).
     assert_true(tw.next_fire_ms() <= UInt64(400))
@@ -306,10 +346,10 @@ def test_a_long_gap_jumps_instead_of_walking() raises:
     every millisecond since boot. The jump fires what is due, keeps
     what is not, and leaves the wheel on the new tick."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(10, UInt64(1))
-    _ = tw.schedule(2_000, UInt64(2))
-    var keep = tw.schedule(2_000_000_000_000, UInt64(3))
-    var cancelled = tw.schedule(20, UInt64(4))
+    _ = tw.schedule(10, UInt64(1), tw.tick_ms())
+    _ = tw.schedule(2_000, UInt64(2), tw.tick_ms())
+    var keep = tw.schedule(2_000_000_000_000, UInt64(3), tw.tick_ms())
+    var cancelled = tw.schedule(20, UInt64(4), tw.tick_ms())
     _ = tw.cancel(cancelled)
     var fired = List[UInt64]()
     # About 31 years in ms. Walked a tick at a time this does not
@@ -319,10 +359,10 @@ def test_a_long_gap_jumps_instead_of_walking() raises:
     assert_equal(len(fired), 2)
     assert_equal(fired[0], UInt64(1))
     assert_equal(fired[1], UInt64(2))
-    assert_equal(tw.now_ms(), now)
+    assert_equal(tw.tick_ms(), now)
     assert_equal(tw.active_count(), 1)
     # A timer armed after the jump still fires on time.
-    _ = tw.schedule(5, UInt64(5))
+    _ = tw.schedule(5, UInt64(5), tw.tick_ms())
     fired.clear()
     tw.advance(now + UInt64(5), fired)
     assert_equal(len(fired), 1)
@@ -332,7 +372,7 @@ def test_a_long_gap_jumps_instead_of_walking() raises:
 
 def test_overflow_timer_fires_on_time_after_a_jump() raises:
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(700, UInt64(9))  # overflow at schedule time
+    _ = tw.schedule(700, UInt64(9), tw.tick_ms())  # overflow at schedule time
     var fired = List[UInt64]()
     tw.advance(UInt64(600), fired)  # jump: 600 > one rotation
     assert_equal(len(fired), 0)
@@ -347,7 +387,7 @@ def test_overflow_promoted_once_per_rotation_still_fires_on_time() raises:
     every tick. Stepped in under-a-rotation advances, a far timer still
     fires on its exact tick."""
     var tw = TimerWheel(now_ms=UInt64(0))
-    _ = tw.schedule(5_003, UInt64(7))
+    _ = tw.schedule(5_003, UInt64(7), tw.tick_ms())
     var fired = List[UInt64]()
     var t = UInt64(0)
     while t + UInt64(500) < UInt64(5_003):

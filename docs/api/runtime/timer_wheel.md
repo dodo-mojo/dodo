@@ -25,7 +25,7 @@ Usage::
 from dodo.runtime import TimerWheel
 var tw = TimerWheel(now_ms=monotonic_ms())
 
-var tid = tw.schedule(after_ms=500, token=UInt64(0x1234))
+var tid = tw.schedule(after_ms=500, token=UInt64(0x1234), now_ms=monotonic_ms())
 # ... later ...
 _ = tw.cancel(tid)
 
@@ -65,10 +65,15 @@ Args:
 #### `TimerWheel.schedule`
 
 ```mojo
-def schedule(mut self, after_ms: Int, token: UInt64) raises -> UInt64
+def schedule(mut self, after_ms: Int, token: UInt64, now_ms: UInt64) raises -> UInt64
 ```
 
-Schedule a timer to fire after ``after_ms`` milliseconds.
+Schedule a timer to fire ``after_ms`` milliseconds after ``now_ms``.
+
+``now_ms`` is the caller's own clock reading, not the wheel's last
+tick: the wheel moves only in ``advance``, and a handler that ran
+since then would otherwise come off the timer. A ``now_ms`` behind
+the last tick counts from the tick.
 
 ``after_ms <= 0`` is clamped to 1 — timers fire on the next
 ``advance``, not on the current tick (``advance`` processes each
@@ -77,8 +82,9 @@ current slot would only fire after a full rotation).
 
 Args:
 
-- `after_ms`: Delay in milliseconds relative to the current tick.
+- `after_ms`: Delay in milliseconds.
 - `token`: Arbitrary user value reported back via ``advance``.
+- `now_ms`: The current time, on the clock ``advance`` is given.
 
 Returns: A unique timer ID that can be passed to ``cancel``.
 
@@ -133,13 +139,13 @@ Args:
 - `now_ms`: Current absolute millisecond time (same clock as ``now_ms`` passed to ``__init__``).
 - `fired`: Output list; fired tokens are appended. The caller does not need to clear it first.
 
-#### `TimerWheel.now_ms`
+#### `TimerWheel.tick_ms`
 
 ```mojo
-def now_ms(self) -> UInt64
+def tick_ms(self) -> UInt64
 ```
 
-Return the current tick time tracked by the wheel.
+The time of the last ``advance``. It stands still between calls, so it is not the current time.
 
 #### `TimerWheel.active_count`
 
