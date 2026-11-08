@@ -4,8 +4,7 @@ Every higher-level type (``TcpStream``, ``UdpSocket``, etc.) is built on
 top of ``RawSocket``. No module above ``dodo.net`` calls libc directly.
 
 Safety contracts for this module:
-1. ``fd >= 0`` iff the socket is open. After ``close()`` or ``__deinit__``
-   sets ``fd = INVALID_FD``.
+1. ``fd >= 0`` iff the socket is open. ``close()`` sets ``fd = INVALID_FD``.
 2. Every libc call that returns -1 reads ``errno`` immediately (before any
    subsequent libc call) and maps it to a typed error.
 3. ``TCP_NODELAY`` is set by the caller, not here — ``RawSocket`` is
@@ -118,7 +117,8 @@ struct RawSocket(Movable):
     Lifecycle:
     - ``__init__``: calls ``socket(2)``; raises on failure.
     - ``__deinit__``: calls ``close(2)`` when ``fd >= 0``.
-    - Move initializer: transfers ownership; source ``fd`` becomes ``INVALID_FD``.
+    - Move: the synthesized move hands the fd over; the moved-from value
+      is dead, so its ``__deinit__`` never runs.
     - ``close()``: explicit, idempotent close.
 
     Fields:
@@ -199,8 +199,7 @@ struct RawSocket(Movable):
     def __deinit__(deinit self):
         """Close the file descriptor if it is open.
 
-        Safety: safe to call even after a move because ``fd`` is set to
-        ``INVALID_FD`` by the move constructor.
+        A moved-from socket is never destroyed, so each fd closes once.
         """
         if self.fd >= 0:
             _ = _close(self.fd)
