@@ -30,6 +30,7 @@ Useful commands:
 
 | Command | What it does |
 |---|---|
+| `pixi run ci` | Run the checks and every test, and the package build when the branch changes it |
 | `pixi run tests` | Build and run every test |
 | `pixi run tests-gen` | Regenerate `tests/_agg/` after adding or removing a test file |
 | `pixi run mojo -I . tests/http/test_x.mojo` | Run one test file |
@@ -44,7 +45,7 @@ Useful commands:
 1. Branch from `dev`, named `type/short-name` (for example `feat/vision-decoders`). `dev` is the default branch; `production` is for releases only. Branches are kept after merge, so the history of each feature stays visible.
 2. Keep the change small and about one thing.
 3. Add tests. Every bug fix comes with a test that fails without the fix.
-4. Run `pixi run tests` and `pixi run format`.
+4. Run `pixi run ci` and `pixi run format`. There is no CI on GitHub, so this is the check.
 5. If you changed the layout, a command, or a decision, update `CLAUDE.md` (the short map of the repo) and the matching page in `docs/`.
 6. Open a PR against `dev` and fill in the template.
 
@@ -79,7 +80,7 @@ You may use AI coding agents; dodo is built to work well with them (`CLAUDE.md` 
 
 ## Platforms
 
-Some code only runs on Linux (epoll, io_uring, accept balancing) and some only on macOS (kqueue). CI runs both. If you can only test on one, say so in the PR.
+Some code only runs on Linux (epoll, accept balancing) and some only on macOS (kqueue). Maintainers run `pixi run ci` on both before merging. If you can only test on one, say so in the PR.
 
 ## License
 

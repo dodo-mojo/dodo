@@ -2,7 +2,7 @@
 
 ## How it was tested
 
-- [ ] `pixi run tests` passes
+- [ ] `pixi run ci` passes
 - [ ] `pixi run format` run
 - [ ] Bug fix has a test that fails without it
 - [ ] Hot-path change shows before and after numbers
