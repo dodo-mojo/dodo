@@ -59,13 +59,13 @@ def target(data: List[UInt8]) raises:
             var delay = (arg * 4) + 1
             var token = next_token
             next_token += 1
-            var tid = tw.schedule(delay, token)
-            expected_fire[token] = tw.now_ms() + UInt64(delay)
+            var tid = tw.schedule(delay, token, tw.tick_ms())
+            expected_fire[token] = tw.tick_ms() + UInt64(delay)
             token_to_id[token] = tid
         elif op == 1:
             # advance
             var step = arg + 1
-            var new_now = tw.now_ms() + UInt64(step)
+            var new_now = tw.tick_ms() + UInt64(step)
             var fired_here = List[UInt64]()
             tw.advance(new_now, fired_here)
             for j in range(len(fired_here)):

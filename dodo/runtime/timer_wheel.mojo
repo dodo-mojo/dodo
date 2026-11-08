@@ -22,7 +22,7 @@ Usage::
     from dodo.runtime import TimerWheel
     var tw = TimerWheel(now_ms=monotonic_ms())
 
-    var tid = tw.schedule(after_ms=500, token=UInt64(0x1234))
+    var tid = tw.schedule(after_ms=500, token=UInt64(0x1234), now_ms=monotonic_ms())
     # ... later ...
     _ = tw.cancel(tid)
 
@@ -116,8 +116,16 @@ struct TimerWheel(Movable):
         self._current_tick_ms = now_ms
         self._next_id = 0
 
-    def schedule(mut self, after_ms: Int, token: UInt64) raises -> UInt64:
-        """Schedule a timer to fire after ``after_ms`` milliseconds.
+    def schedule(
+        mut self, after_ms: Int, token: UInt64, now_ms: UInt64
+    ) raises -> UInt64:
+        """Schedule a timer to fire ``after_ms`` milliseconds after
+        ``now_ms``.
+
+        ``now_ms`` is the caller's own clock reading, not the wheel's last
+        tick: the wheel moves only in ``advance``, and a handler that ran
+        since then would otherwise come off the timer. A ``now_ms`` behind
+        the last tick counts from the tick.
 
         ``after_ms <= 0`` is clamped to 1 — timers fire on the next
         ``advance``, not on the current tick (``advance`` processes each
@@ -125,19 +133,22 @@ struct TimerWheel(Movable):
         current slot would only fire after a full rotation).
 
         Args:
-            after_ms: Delay in milliseconds relative to the current tick.
+            after_ms: Delay in milliseconds.
             token: Arbitrary user value reported back via ``advance``.
+            now_ms: The current time, on the clock ``advance`` is given.
 
         Returns:
             A unique timer ID that can be passed to ``cancel``.
         """
         self._next_id += 1
         var id = self._next_id
-        var delay = after_ms if after_ms >= 1 else 1
-        var fire_at = self._current_tick_ms + UInt64(delay)
+        var delay = max(after_ms, 1)
+        var start = max(now_ms, self._current_tick_ms)
+        var fire_at = start + UInt64(delay)
         self._entries[id] = _TimerEntry(id, fire_at, token, True)
-        if delay < _WHEEL_SLOTS:
-            var slot = (self._current_slot + delay) & _WHEEL_MASK
+        var ahead = fire_at - self._current_tick_ms
+        if ahead < UInt64(_WHEEL_SLOTS):
+            var slot = (self._current_slot + Int(ahead)) & _WHEEL_MASK
             self._wheel[slot].append(id)
         else:
             self._overflow.append(id)
@@ -292,8 +303,9 @@ struct TimerWheel(Movable):
             else:
                 self._overflow.append(eid)
 
-    def now_ms(self) -> UInt64:
-        """Return the current tick time tracked by the wheel."""
+    def tick_ms(self) -> UInt64:
+        """The time of the last ``advance``. It stands still between
+        calls, so it is not the current time."""
         return self._current_tick_ms
 
     def active_count(self) raises -> Int:

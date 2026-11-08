@@ -617,6 +617,18 @@ from test_timer_wheel import (
     test_schedule_increments_active_count as test_timer_wheel__test_schedule_increments_active_count,
 )
 from test_timer_wheel import (
+    test_a_timer_counts_from_now_not_from_the_last_tick as test_timer_wheel__test_a_timer_counts_from_now_not_from_the_last_tick,
+)
+from test_timer_wheel import (
+    test_a_long_timer_counts_from_now_too as test_timer_wheel__test_a_long_timer_counts_from_now_too,
+)
+from test_timer_wheel import (
+    test_now_close_to_a_rotation_ahead_of_the_tick as test_timer_wheel__test_now_close_to_a_rotation_ahead_of_the_tick,
+)
+from test_timer_wheel import (
+    test_a_now_behind_the_tick_counts_from_the_tick as test_timer_wheel__test_a_now_behind_the_tick_counts_from_the_tick,
+)
+from test_timer_wheel import (
     test_timer_fires_after_correct_delay as test_timer_wheel__test_timer_fires_after_correct_delay,
 )
 from test_timer_wheel import (
@@ -1018,6 +1030,16 @@ def main() raises:
     suite.test[test_timer_wheel__test_schedule_returns_unique_ids]()
     suite.test[test_timer_wheel__test_empty_wheel_active_count_zero]()
     suite.test[test_timer_wheel__test_schedule_increments_active_count]()
+    suite.test[
+        test_timer_wheel__test_a_timer_counts_from_now_not_from_the_last_tick
+    ]()
+    suite.test[test_timer_wheel__test_a_long_timer_counts_from_now_too]()
+    suite.test[
+        test_timer_wheel__test_now_close_to_a_rotation_ahead_of_the_tick
+    ]()
+    suite.test[
+        test_timer_wheel__test_a_now_behind_the_tick_counts_from_the_tick
+    ]()
     suite.test[test_timer_wheel__test_timer_fires_after_correct_delay]()
     suite.test[test_timer_wheel__test_multiple_timers_fire_in_order]()
     suite.test[test_timer_wheel__test_immediate_timer_fires_next_advance]()
