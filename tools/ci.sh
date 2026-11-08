@@ -23,13 +23,15 @@ fail() {
   exit 1
 }
 
-# The import and layering checks, and the package precompiles.
+# The import and layering checks, the package precompiles, and the docs
+# tools and generated docs.
 step_checks() {
   say "checks"
   pixi run check-sans-io
   pixi run check-no-http-http2-cycle
   pixi run check-package
   python3 tools/test_docs_tools.py
+  python3 tools/save_docs.py dodo --check
 }
 
 step_package() {

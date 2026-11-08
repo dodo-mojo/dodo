@@ -6,6 +6,8 @@
     python3 tools/save_docs.py dodo           dodo's API pages (docs/api/)
                                               and docs/index.md
     python3 tools/save_docs.py dodo --check   exit 1 when those are stale
+    python3 tools/save_docs.py dodo --release copy docs/ for this release
+                                              into dodo-docs/<version>/
 
 **Mojo.** Built from Modular's `mojo/v<version>` tag: the manual, the
 language reference, the tools guides and the 1.x release notes turned from
@@ -19,7 +21,9 @@ version starts with a copy of the newest one.
 
 **dodo.** `docs/api/` is generated from `mojo doc dodo`, and
 `docs/index.md` lists every page in `docs/`. CI runs `--check`, so both
-always match the code.
+always match the code. At each release, `--release` copies the pages the
+index lists into `dodo-docs/<version>/`; a link that leaves `docs/` (to
+`research/`, say) becomes a link to that file on GitHub at the release tag.
 
 Each `index.md` is shaped like llms.txt and is the only list of files:
 `dodo docs pull` fetches every relative link in it.
@@ -49,6 +53,8 @@ import mdx_to_md  # noqa: E402
 REPO = Path(__file__).resolve().parent.parent
 MOJO_DOCS = REPO / "mojo-docs"
 DODO_DOCS = REPO / "docs"
+DODO_ARCHIVE = REPO / "dodo-docs"
+DODO_GITHUB = "https://github.com/dodo-mojo/dodo"
 MODULAR_GIT = "https://github.com/modular/modular.git"
 MODULAR_RAW = "https://raw.githubusercontent.com/modular/modular"
 MOJO_SITE = "https://mojolang.org"
@@ -129,10 +135,11 @@ def save_mojo(version: str) -> None:
             mojo_index(version, pages, notes, std), encoding="utf-8"
         )
         check_links(staging)
+        check_index_lists_every_file(staging)
         if out.exists():
             shutil.rmtree(out)
         shutil.copytree(staging, out)
-    write_versions_index()
+    write_versions_index(MOJO_DOCS, "Mojo", "tools/save_docs.py mojo VERSION")
     print(f"save_docs: Mojo {version} -> {out.relative_to(REPO)}")
 
 
@@ -553,6 +560,21 @@ def check_links(staging: Path) -> None:
 _STD_LINK = re.compile(r"(\[(?:[^\[\]]|\[[^\[\]]*\])*\])\(std:([^)]+)\)")
 
 
+def check_index_lists_every_file(folder: Path) -> None:
+    """`dodo docs pull` fetches only what `index.md` links, so a file it
+    does not link would never reach anyone."""
+    linked = set()
+    for target in relative_targets((folder / "index.md").read_text(encoding="utf-8")):
+        linked.add(posixpath.normpath(target))
+    unlisted = []
+    for path in sorted(folder.rglob("*")):
+        relative = path.relative_to(folder).as_posix()
+        if path.is_file() and relative != "index.md" and relative not in linked:
+            unlisted.append(relative)
+    if unlisted:
+        raise SaveError("files index.md does not link:\n  " + "\n  ".join(unlisted))
+
+
 def std_target(staging: Path, link: str) -> Optional[str]:
     """The page and anchor for `std/a/b/c#d`: the deepest of `a/b/c.md`,
     `a/b/c/index.md`, `a/b.md` ... that exists; the parts after it name a
@@ -601,23 +623,23 @@ def relative_targets(text: str) -> List[str]:
     return found
 
 
-def write_versions_index() -> None:
+def write_versions_index(archive: Path, label: str, saver: str) -> None:
+    """`archive/index.md`: every saved version, newest first."""
     versions = sorted(
-        (p.name for p in MOJO_DOCS.iterdir() if (p / "index.md").exists()),
+        (p.name for p in archive.iterdir() if (p / "index.md").exists()),
         key=parse_version,
         reverse=True,
     )
     lines = [
-        "# Mojo docs saved by dodo",
+        f"# {label} docs saved by dodo",
         "",
-        "> One folder per Mojo release, newest first. `dodo docs pull` reads "
-        "these from dodo's `dev` branch; `tools/save_docs.py mojo VERSION` "
-        "saves a new one.",
+        f"> One folder per {label} release, newest first. `dodo docs pull` "
+        f"reads these from dodo's `dev` branch; `{saver}` saves a new one.",
         "",
     ]
     for version in versions:
-        lines.append(f"- [Mojo {version}]({version}/index.md)")
-    (MOJO_DOCS / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        lines.append(f"- [{label} {version}]({version}/index.md)")
+    (archive / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ── dodo ──
@@ -652,7 +674,7 @@ def dodo_index(api_pages: List[api_to_md.Page]) -> str:
         f"# dodo {dodo_version()}",
         "",
         "> dodo's guides, design, decisions (ADRs) and API as plain Markdown. "
-        "Read at a release tag, these match that release.",
+        "Saved as `dodo-docs/<version>/` at each release, they match that release.",
         "",
         "Every relative link below is a file of these docs. `tools/save_docs.py "
         "dodo` writes this index and `api/`; edit the guides themselves.",
@@ -661,7 +683,7 @@ def dodo_index(api_pages: List[api_to_md.Page]) -> str:
     groups = [
         ("Guides", lambda p: p.parent == DODO_DOCS and p.name != "index.md" and not p.stem.endswith("-audit")),
         ("Best practices", lambda p: p.parent.name == "best-practices"),
-        ("Decisions (ADRs)", lambda p: p.parent.name == "adr" and not p.name.startswith("0000")),
+        ("Decisions (ADRs)", lambda p: p.parent.name == "adr"),
         ("Audits", lambda p: p.parent == DODO_DOCS and p.stem.endswith("-audit")),
     ]
     for title, wanted in groups:
@@ -671,6 +693,8 @@ def dodo_index(api_pages: List[api_to_md.Page]) -> str:
         lines += [f"## {title}", ""]
         for path in chosen:
             heading, summary = first_heading_and_line(path)
+            if path.name == "0000-template.md":
+                heading = "ADR template"
             lines.append(index_line(heading, path.relative_to(DODO_DOCS).as_posix(), summary))
         lines.append("")
     lines += ["## API", ""]
@@ -696,7 +720,7 @@ def first_heading_and_line(path: Path) -> Tuple[str, str]:
                 continue
             if summary == "":
                 sentence = " ".join(block.split())
-                summary = re.split(r"(?<=[.:])\s", sentence, maxsplit=1)[0]
+                summary = re.split(r"(?<=\.)\s", sentence, maxsplit=1)[0]
         if summary != "":
             break
     return heading, summary
@@ -708,6 +732,57 @@ def dodo_version() -> str:
     if match is None:
         raise SaveError("no version in pixi.toml")
     return match.group(1)
+
+
+def release_dodo() -> int:
+    """Refresh `docs/`, then copy what its index lists into
+    `dodo-docs/<version>/` and list the version in `dodo-docs/index.md`."""
+    save_dodo(check=False)
+    version = dodo_version()
+    with tempfile.TemporaryDirectory() as scratch:
+        staging = Path(scratch) / version
+        copy_release(DODO_DOCS, staging, version)
+        check_links(staging)
+        check_index_lists_every_file(staging)
+        target = DODO_ARCHIVE / version
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(staging, target)
+    write_versions_index(DODO_ARCHIVE, "dodo", "tools/save_docs.py dodo --release")
+    print(f"save_docs: dodo {version} -> dodo-docs/{version}")
+    return 0
+
+
+def copy_release(docs: Path, staging: Path, version: str) -> None:
+    """`index.md` and every page it links, from `docs` into `staging`."""
+    pages = ["index.md"]
+    for target in relative_targets((docs / "index.md").read_text(encoding="utf-8")):
+        pages.append(posixpath.normpath(target))
+    for relative in pages:
+        text = (docs / relative).read_text(encoding="utf-8")
+
+        def link(target: str, page: str = relative) -> str:
+            return release_link(target, page, version)
+
+        destination = staging / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(mdx_to_md.rewrite_links(text, link), encoding="utf-8")
+
+
+def release_link(target: str, page: str, version: str) -> str:
+    """A link of `docs/<page>`, as it reads from the copy: a link that
+    leaves `docs/` goes to that file on GitHub at the release tag."""
+    if target.startswith("#") or re.match(r"^[a-z]+:", target):
+        return target
+    path, mark, anchor = target.partition("#")
+    inside = posixpath.normpath(posixpath.join(posixpath.dirname(page), path))
+    if not inside.startswith("../") and inside != "..":
+        return target
+    in_repo = posixpath.normpath(posixpath.join("docs", posixpath.dirname(page), path))
+    kind = "blob"
+    if (REPO / in_repo).is_dir():
+        kind = "tree"
+    return f"{DODO_GITHUB}/{kind}/v{version}/{in_repo}{mark}{anchor}"
 
 
 def compare_dodo_docs(staging: Path) -> int:
@@ -747,6 +822,8 @@ def main(argv: List[str]) -> int:
             return save_dodo(check=False)
         if argv == ["dodo", "--check"]:
             return save_dodo(check=True)
+        if argv == ["dodo", "--release"]:
+            return release_dodo()
     except SaveError as error:
         print(f"save_docs: {error}", file=sys.stderr)
         return 1
