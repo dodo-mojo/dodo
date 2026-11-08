@@ -358,6 +358,41 @@ def test_handed_over_listener_becomes_the_shared_listener() raises:
     assert_true(not _fd_open(bound[0]), "shutdown left it open")
 
 
+def test_plain_handed_over_listener_is_shared() raises:
+    """A listener without SO_REUSEPORT (what `dodo dev` passes down) is
+    shared by every worker, since no sibling can join its port."""
+    from dodo.runtime.reuseport import allows_reuseport
+
+    var listener = TcpListener.bind(SocketAddr.localhost(0))
+    var addr = listener.local_addr()
+    var fd = Int(listener.into_raw_fd())
+    assert_true(not allows_reuseport(fd))
+    var fds = List[Int]()
+    fds.append(fd)
+    var s = Scheduler[_NopFrontend].start(
+        addr=addr,
+        frontend=_NopFrontend(0),
+        num_workers=3,
+        pin_cores=False,
+        listener_fds=fds,
+    )
+    var shared_fd = s._shared_listener_fd
+    var per_worker = len(s._per_worker_listener_addrs)
+    s.shutdown()
+    assert_equal(shared_fd, fd)
+    assert_equal(per_worker, 0)
+    assert_true(not _fd_open(fd), "shutdown left it open")
+
+
+def test_allows_reuseport_reads_the_flag() raises:
+    from dodo.runtime.reuseport import allows_reuseport
+
+    var bound = _bound_reuseport_fd()
+    assert_true(allows_reuseport(bound[0]))
+    _ = external_call["close", c_int](c_int(bound[0]))
+    assert_true(not allows_reuseport(bound[0]), "a closed fd reads False")
+
+
 def test_handed_over_listener_is_closed_when_start_raises() raises:
     var bound = _bound_reuseport_fd()
     var fds = List[Int]()

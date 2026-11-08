@@ -449,6 +449,12 @@ from test_scheduler import (
     test_handed_over_listener_becomes_the_shared_listener as test_scheduler__test_handed_over_listener_becomes_the_shared_listener,
 )
 from test_scheduler import (
+    test_plain_handed_over_listener_is_shared as test_scheduler__test_plain_handed_over_listener_is_shared,
+)
+from test_scheduler import (
+    test_allows_reuseport_reads_the_flag as test_scheduler__test_allows_reuseport_reads_the_flag,
+)
+from test_scheduler import (
     test_handed_over_listener_is_closed_when_start_raises as test_scheduler__test_handed_over_listener_is_closed_when_start_raises,
 )
 from test_scheduler import (
@@ -942,6 +948,8 @@ def main() raises:
     suite.test[
         test_scheduler__test_handed_over_listener_becomes_the_shared_listener
     ]()
+    suite.test[test_scheduler__test_plain_handed_over_listener_is_shared]()
+    suite.test[test_scheduler__test_allows_reuseport_reads_the_flag]()
     suite.test[
         test_scheduler__test_handed_over_listener_is_closed_when_start_raises
     ]()

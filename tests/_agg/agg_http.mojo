@@ -2523,6 +2523,60 @@ from test_offload import (
     test_h2_shutdown_sends_goaway_and_waits_tls as test_offload__test_h2_shutdown_sends_goaway_and_waits_tls,
 )
 from test_offload import (
+    test_h1_stop_answers_a_fresh_connection as test_offload__test_h1_stop_answers_a_fresh_connection,
+)
+from test_offload import (
+    test_h1_stop_answers_a_fresh_connection_tls as test_offload__test_h1_stop_answers_a_fresh_connection_tls,
+)
+from test_offload import (
+    test_h1_stop_answers_a_fresh_connection_cancellable as test_offload__test_h1_stop_answers_a_fresh_connection_cancellable,
+)
+from test_offload import (
+    test_h1_stop_answers_a_fresh_connection_h1_loop as test_offload__test_h1_stop_answers_a_fresh_connection_h1_loop,
+)
+from test_offload import (
+    test_h1_stop_finishes_a_request_being_read as test_offload__test_h1_stop_finishes_a_request_being_read,
+)
+from test_offload import (
+    test_h1_stop_finishes_a_request_being_read_tls as test_offload__test_h1_stop_finishes_a_request_being_read_tls,
+)
+from test_offload import (
+    test_h1_stop_finishes_a_request_being_read_cancellable as test_offload__test_h1_stop_finishes_a_request_being_read_cancellable,
+)
+from test_offload import (
+    test_h1_stop_finishes_a_request_being_read_h1_loop as test_offload__test_h1_stop_finishes_a_request_being_read_h1_loop,
+)
+from test_offload import (
+    test_h1_stop_closes_an_idle_keep_alive_connection as test_offload__test_h1_stop_closes_an_idle_keep_alive_connection,
+)
+from test_offload import (
+    test_h1_stop_closes_an_idle_keep_alive_connection_tls as test_offload__test_h1_stop_closes_an_idle_keep_alive_connection_tls,
+)
+from test_offload import (
+    test_h1_stop_closes_an_idle_keep_alive_connection_cancellable as test_offload__test_h1_stop_closes_an_idle_keep_alive_connection_cancellable,
+)
+from test_offload import (
+    test_h1_stop_closes_an_idle_keep_alive_connection_h1_loop as test_offload__test_h1_stop_closes_an_idle_keep_alive_connection_h1_loop,
+)
+from test_offload import (
+    test_h1_stop_closes_a_silent_connection_after_the_grace as test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace,
+)
+from test_offload import (
+    test_h1_stop_closes_a_silent_connection_after_the_grace_tls as test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace_tls,
+)
+from test_offload import (
+    test_h1_stop_closes_a_silent_connection_after_the_grace_cancellable as test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace_cancellable,
+)
+from test_offload import (
+    test_h1_stop_closes_a_silent_connection_after_the_grace_h1_loop as test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace_h1_loop,
+)
+from test_offload import (
+    test_h2_stop_sends_goaway_to_an_idle_connection as test_offload__test_h2_stop_sends_goaway_to_an_idle_connection,
+)
+from test_offload import (
+    test_h2_stop_sends_goaway_to_an_idle_connection_tls as test_offload__test_h2_stop_sends_goaway_to_an_idle_connection_tls,
+)
+from test_offload import (
     test_multi_worker_offloads_share_one_pool as test_offload__test_multi_worker_offloads_share_one_pool,
 )
 from test_ok_json_typed import (
@@ -6361,6 +6415,48 @@ def main() raises:
     ]()
     suite.test[test_offload__test_h2_shutdown_sends_goaway_and_waits]()
     suite.test[test_offload__test_h2_shutdown_sends_goaway_and_waits_tls]()
+    suite.test[test_offload__test_h1_stop_answers_a_fresh_connection]()
+    suite.test[test_offload__test_h1_stop_answers_a_fresh_connection_tls]()
+    suite.test[
+        test_offload__test_h1_stop_answers_a_fresh_connection_cancellable
+    ]()
+    suite.test[test_offload__test_h1_stop_answers_a_fresh_connection_h1_loop]()
+    suite.test[test_offload__test_h1_stop_finishes_a_request_being_read]()
+    suite.test[test_offload__test_h1_stop_finishes_a_request_being_read_tls]()
+    suite.test[
+        test_offload__test_h1_stop_finishes_a_request_being_read_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_finishes_a_request_being_read_h1_loop
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_an_idle_keep_alive_connection
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_an_idle_keep_alive_connection_tls
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_an_idle_keep_alive_connection_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_an_idle_keep_alive_connection_h1_loop
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace_tls
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace_cancellable
+    ]()
+    suite.test[
+        test_offload__test_h1_stop_closes_a_silent_connection_after_the_grace_h1_loop
+    ]()
+    suite.test[test_offload__test_h2_stop_sends_goaway_to_an_idle_connection]()
+    suite.test[
+        test_offload__test_h2_stop_sends_goaway_to_an_idle_connection_tls
+    ]()
     suite.test[test_offload__test_multi_worker_offloads_share_one_pool]()
     # tests/http/test_ok_json_typed.mojo
     suite.test[test_ok_json_typed__test_ok_json_value_object_round_trip]()

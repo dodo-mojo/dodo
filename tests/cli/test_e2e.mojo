@@ -12,7 +12,9 @@ from std.testing import TestSuite, assert_equal, assert_false, assert_true
 from std.time import perf_counter_ns, sleep
 
 from dodo.json import Value, loads
-from dodo.utils.process import run, spawn
+from dodo.net import SocketAddr
+from dodo.tcp import TcpListener
+from dodo.utils.process import Child, ExitStatus, run, spawn
 
 from cli.build import build_app
 from cli.report import (
@@ -20,6 +22,7 @@ from cli.report import (
     EXIT_FAILED,
     EXIT_INTERRUPTED,
     EXIT_OK,
+    EXIT_UNAVAILABLE,
     EXIT_USAGE,
     Report,
 )
@@ -598,6 +601,253 @@ def test_test_interrupted_while_building() raises:
     sleep(0.1)
     var left = run(["pgrep", "-f", builds], stdout_path="/dev/null")
     assert_false(left.succeeded())
+
+
+# ── dev ──
+
+comptime _DEV_APP = """from dodo import App, Request
+from std.time import sleep
+
+
+def home(req: Request) raises -> String:
+    return "VERSION"
+
+
+def slow(req: Request) raises -> String:
+    sleep(1.5)
+    return "slow done"
+
+
+def main() raises:
+    var app = App()
+    app.get["/"](home)
+    app.get["/slow"](slow, blocking=True)
+    # Port 1 cannot be bound by a test; `dodo dev` hands its own socket down.
+    app.serve(port=1, num_workers=2)
+"""
+
+
+def _dev_project() raises -> String:
+    """A project whose `main.mojo` imports dodo through a link to this
+    repository's package (the watcher does not follow links)."""
+    var dir = _scratch("dev")
+    _ = run(["ln", "-s", realpath("dodo"), join(dir, "dodo")])
+    with open(join(dir, "pixi.toml"), "w") as file:
+        file.write("")
+    _save_version(dir, "v1")
+    return dir
+
+
+def _save_version(dir: String, version: String) raises:
+    sleep(0.01)
+    with open(join(dir, "main.mojo"), "w") as file:
+        file.write(String(_DEV_APP).replace("VERSION", version))
+
+
+def _get(url: String) raises -> String:
+    """The body of `url`, or `refused` when nothing answered."""
+    var path = join(
+        getenv("TMPDIR", "/tmp"), String("dodo_e2e_get_", perf_counter_ns())
+    )
+    var status = run(
+        ["curl", "-s", "-m", "5", "-o", path, url], stderr_path="/dev/null"
+    )
+    var body = _read(path)
+    _ = run(["rm", "-f", path])
+    if not status.succeeded():
+        return String("refused (curl ", status, ")")
+    return body
+
+
+def _dev_events(out_path: String, name: String) raises -> List[Value]:
+    """Every `dodo dev` event called `name` printed so far."""
+    var found = List[Value]()
+    for line in _read(out_path).splitlines():
+        if not line.startswith('{"dodo_dev"'):
+            continue
+        var event = loads(String(line))["dodo_dev"].copy()
+        if event["event"].as_string() == name:
+            found.append(event^)
+    return found^
+
+
+def _wait_for_event(out_path: String, name: String, count: Int) raises:
+    """Wait (up to 2 minutes, for builds) until `name` was printed `count`
+    times."""
+    var tries = 0
+    while len(_dev_events(out_path, name)) < count:
+        var why = String("no ", name, ":\n", _read(out_path))
+        assert_true(tries < 12000, why)
+        sleep(0.01)
+        tries += 1
+
+
+def _wait_for_body(url: String, want: String, out_path: String) raises:
+    """Ask `url` until it answers `want`. Every answer on the way must be a
+    real answer: the port stays open while the app restarts."""
+    var tries = 0
+    var body = _get(url)
+    while body != want:
+        if body.startswith("refused"):
+            raise Error(body, " during a restart:\n", _read(out_path))
+        var why = String(
+            "never `", want, "`, last `", body, "`:\n", _read(out_path)
+        )
+        assert_true(tries < 1200, why)
+        sleep(0.1)
+        tries += 1
+        body = _get(url)
+
+
+def _start_dev(dir: String, json: Bool) raises -> Child:
+    """Start `dodo dev --port 0` in `dir`, printing to `dev.out` and
+    `dev.err` there."""
+    var argv: List[String] = [
+        "sh",
+        "-c",
+        'cd "$1" && shift && exec "$@"',
+        "sh",
+        dir,
+        _dodo(),
+        "dev",
+        "--port",
+        "0",
+    ]
+    if json:
+        argv.append("--json")
+    return spawn(
+        argv,
+        stdout_path=join(dir, "dev.out"),
+        stderr_path=join(dir, "dev.err"),
+    )
+
+
+def _stop_dev(mut dodo: Child) raises -> ExitStatus:
+    """Ctrl-C, as a user would; dodo stops its app before it exits."""
+    var status = dodo.poll()
+    if status:
+        return status.value()
+    dodo.send_signal(2)
+    return dodo.wait()
+
+
+def test_dev_session() raises:
+    var dir = _dev_project()
+    var dodo = _start_dev(dir, json=True)
+    try:
+        _dev_session_steps(dir, dodo)
+    except e:
+        # Never leave a server running behind a failed test.
+        _ = _stop_dev(dodo)
+        raise e^
+
+
+def _dev_session_steps(dir: String, mut dodo: Child) raises:
+    var out_path = join(dir, "dev.out")
+    var err_path = join(dir, "dev.err")
+    _wait_for_event(out_path, "listening", 1)
+    var url = _dev_events(out_path, "listening")[0]["url"].as_string()
+    assert_true(url.startswith("http://127.0.0.1:"), url)
+
+    # First start. Until the first build is done, a request waits unanswered.
+    _wait_for_event(out_path, "started", 1)
+    _wait_for_body(url, '"v1"', out_path)
+    var started = _dev_events(out_path, "started")
+    assert_false(started[0]["restart"].as_bool())
+
+    # A save restarts it; a request in flight is finished by the old app.
+    var slow_path = join(dir, "slow.out")
+    var slow = spawn(
+        ["curl", "-s", "-m", "60", "-o", slow_path, url + "/slow"],
+        stderr_path="/dev/null",
+    )
+    sleep(0.3)
+    _save_version(dir, "v2")
+    _wait_for_body(url, '"v2"', out_path)
+    assert_true(slow.wait().succeeded())
+    assert_equal(_read(slow_path), '"slow done"')
+    assert_true(_dev_events(out_path, "started")[1]["restart"].as_bool())
+
+    # A broken save keeps the last good build serving.
+    sleep(0.01)
+    with open(join(dir, "main.mojo"), "w") as file:
+        file.write("def main(:\n")
+    _wait_for_event(out_path, "build_failed", 1)
+    var failed = _dev_events(out_path, "build_failed")[0].copy()
+    var log = failed["log"].as_string()
+    assert_true("error" in log, log)
+    assert_equal(_get(url), '"v2"')
+    _save_version(dir, "v3")
+    _wait_for_body(url, '"v3"', out_path)
+
+    # An app that dies is reported, and the next save starts it again.
+    var pid = _dev_events(out_path, "started")[2]["pid"].as_int()
+    _ = run(["kill", "-9", String(pid)])
+    _wait_for_event(out_path, "app_exited", 1)
+    var exited = _dev_events(out_path, "app_exited")[0].copy()
+    assert_equal(Int(exited["exit_code"].as_int()), 137)
+    _save_version(dir, "v4")
+    _wait_for_event(out_path, "started", 4)
+    _wait_for_body(url, '"v4"', out_path)
+    assert_false(_dev_events(out_path, "started")[3]["restart"].as_bool())
+
+    # Ctrl-C stops the app and closes the port.
+    var app_pid = _dev_events(out_path, "started")[3]["pid"].as_int()
+    var status = _stop_dev(dodo)
+    assert_equal(status.shell_code(), EXIT_INTERRUPTED, _read(err_path))
+    assert_equal(len(_dev_events(out_path, "stopped")), 1)
+    assert_false(_is_running(String(app_pid)), "the app outlived dodo")
+    assert_true(_get(url).startswith("refused"))
+    var lines = _read(out_path).strip().splitlines()
+    var result = loads(String(lines[len(lines) - 1]))
+    assert_equal(result["command"].as_string(), "dev")
+    assert_equal(result["url"].as_string(), url)
+
+
+def test_dev_text_output() raises:
+    # Without --json, events go to stderr as plain lines; stdout is the
+    # app's.
+    var dir = _dev_project()
+    var err_path = join(dir, "dev.err")
+    var dodo = _start_dev(dir, json=False)
+    var tries = 0
+    while "started in" not in _read(err_path) and tries < 12000:
+        sleep(0.01)
+        tries += 1
+    var status = _stop_dev(dodo)
+    assert_equal(status.shell_code(), EXIT_INTERRUPTED)
+    var err = _read(err_path)
+    assert_true("started in" in err, err)
+    assert_true("dodo dev: serving " in err, err)
+    assert_true("(Ctrl-C to stop)" in err, err)
+    assert_true("dodo dev: stopped" in err, err)
+    assert_equal(_read(join(dir, "dev.out")), "")
+
+
+def test_dev_port_in_use() raises:
+    var taken = TcpListener.bind(SocketAddr.localhost(0))
+    var port = String(Int(taken.local_addr().port))
+    var ran = _dodo_run(["dev", _APP, "--port", port, "--json"])
+    assert_equal(ran.code, EXIT_UNAVAILABLE)
+    var error = ran.json()["error"].copy()
+    assert_equal(error["kind"].as_string(), "listen")
+    assert_true(port in error["message"].as_string())
+    _ = taken^
+
+
+def test_dev_bad_flags_and_files() raises:
+    for port in ["", "-1", "65536", "abc"]:
+        var ran = _dodo_run(["dev", _APP, "--port", port, "--json"])
+        assert_equal(ran.code, EXIT_USAGE, port)
+        assert_equal(ran.json()["error"]["kind"].as_string(), "usage")
+    var bad_host = _dodo_run(["dev", _APP, "--host", "example.com"])
+    assert_equal(bad_host.code, EXIT_USAGE)
+    assert_true("--host" in bad_host.err, bad_host.err)
+    var missing = _dodo_run(["dev", "nope.mojo", "--json"])
+    assert_equal(missing.code, EXIT_USAGE)
+    assert_equal(missing.json()["error"]["kind"].as_string(), "not_found")
+    var too_many = _dodo_run(["dev", _APP, _APP])
+    assert_equal(too_many.code, EXIT_USAGE)
 
 
 def main() raises:

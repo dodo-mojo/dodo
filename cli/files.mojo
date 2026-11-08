@@ -5,28 +5,64 @@ from std.os.path import isdir, islink, join
 
 
 def mojo_files(root: String) raises -> List[String]:
-    """Every `.mojo` file under `root`, sorted.
+    """Every `.mojo` file under `root`, sorted. `ProjectTree` says which
+    folders are skipped."""
+    var tree = ProjectTree(root)
+    return tree.files.copy()
+
+
+struct ProjectTree(Movable):
+    """The `.mojo` files under a root (sorted), and the folders walked to
+    find them with each folder's change time, read before it was listed.
 
     Skips hidden folders (`.git`, `.pixi`, `.dodo`), `build/`, and folders
-    reached through a symlink, so a link loop cannot hang the walk.
+    reached through a symlink, so a link loop cannot hang the walk. A
+    folder removed during the walk is left out.
     """
-    var found = List[String]()
-    _collect(root, found)
-    sort(found)
-    return found^
 
+    var files: List[String]
+    var dirs: List[String]
+    var dir_times: List[Int]
 
-def _collect(dir: String, mut found: List[String]) raises:
-    for name in listdir(dir):
-        if name.startswith("."):
-            continue
-        var path = join(dir, name)
-        if isdir(path):
-            if name == "build" or islink(path):
+    def __init__(out self, root: String) raises:
+        """Raises: Error: If `root` cannot be listed."""
+        self.files = List[String]()
+        self.dirs = List[String]()
+        self.dir_times = List[Int]()
+        var changed = time_or_zero(root)
+        var names = listdir(root)
+        self.dirs.append(root)
+        self.dir_times.append(changed)
+        self._collect(root, names)
+        sort(self.files)
+
+    def _collect(mut self, dir: String, names: List[String]):
+        for name in names:
+            if name.startswith("."):
                 continue
-            _collect(path, found)
-        elif name.endswith(".mojo"):
-            found.append(path)
+            var path = join(dir, name)
+            if isdir(path):
+                if name == "build" or islink(path):
+                    continue
+                var changed = time_or_zero(path)
+                var inner: List[String]
+                try:
+                    inner = listdir(path)
+                except:
+                    continue
+                self.dirs.append(path)
+                self.dir_times.append(changed)
+                self._collect(path, inner)
+            elif name.endswith(".mojo"):
+                self.files.append(path)
+
+
+def time_or_zero(path: String) -> Int:
+    """`mtime_ns(path)`, or 0 when `path` is gone."""
+    try:
+        return mtime_ns(path)
+    except:
+        return 0
 
 
 def mtime_ns(path: String) raises -> Int:

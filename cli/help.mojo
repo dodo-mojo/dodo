@@ -67,7 +67,8 @@ def exit_codes() -> String:
         "  something outside dodo is missing (network, mojo, git)\n",
     )
     text += String("  ", EXIT_INTERNAL, "  a bug in dodo\n")
-    text += "`dodo run` and `dodo dev` exit with the app's own code.\n"
+    text += "`dodo run` exits with the app's own code.\n"
+    text += "`dodo dev` runs until Ctrl-C and then exits with 130.\n"
     return text^
 
 

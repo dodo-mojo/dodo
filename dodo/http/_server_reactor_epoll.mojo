@@ -62,11 +62,16 @@ from dodo.http._offload_pool import (
     offload_port_open,
     offload_port_open_cancel,
 )
+from ._reactor.drain import (
+    DRAIN_POLL_MS,
+    DrainClock,
+    begin_drain_h1,
+    close_idle_h1,
+    drain_done,
+)
 from ._reactor.offload_loop import (
-    begin_offload_settle_h1,
     close_offload_port,
     deliver_offloads_h1,
-    offload_settled_h1,
     offload_timeout_h1,
 )
 from ._reactor.lifecycle import (
@@ -187,8 +192,9 @@ def _run_handler_loop_impl[
 
     A handler that may block gets a port to the offload pool, as on the
     unified loop: an offloaded request parks its connection until the
-    pool answers, and a stop waits up to ``shutdown_timeout_ms`` for
-    such requests.
+    pool answers. A stop drains: no new connections, and each open one
+    is answered and closed, for up to ``shutdown_timeout_ms``
+    (``_reactor/drain.mojo``).
 
     Args:
         listener_fd: Listener fd. The dedicated path obtains it from
@@ -230,26 +236,24 @@ def _run_handler_loop_impl[
             config.offload_threads,
             config.offload_queue_depth,
         )
-    # Non-zero once the stop flag is seen with offloaded requests out:
-    # the loop keeps serving their connections until this deadline.
-    var settle_deadline = 0
+    # Set once the stop flag is seen: the loop then stops accepting and
+    # finishes what its connections sent (``_reactor/drain.mojo``).
+    var draining = False
+    var clock = DrainClock(0, 0)
+    var listeners: List[Int] = [Int(listener_fd)]
+    var poll_cap_ms = 100
     while True:
-        if settle_deadline == 0 and load_stop_flag(stopping_addr):
-            if offload_outstanding(offload_port) == 0:
-                break
-            settle_deadline = monotonic_now_ms() + max(
-                config.shutdown_timeout_ms, 0
-            )
-            begin_offload_settle_h1(
-                offload_port, listener_fd, conns, reactor, wheel, timers
-            )
-        if settle_deadline != 0:
-            if offload_settled_h1(conns) or monotonic_now_ms() >= settle_deadline:
-                break
+        if not draining and load_stop_flag(stopping_addr):
+            draining = True
+            clock = DrainClock(monotonic_now_ms(), config.shutdown_timeout_ms)
+            poll_cap_ms = DRAIN_POLL_MS
+            begin_drain_h1(offload_port, listeners, conns, reactor)
+        if draining and drain_done(monotonic_now_ms(), clock, len(conns)):
+            break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         events.clear()
         try:
-            _ = reactor.poll(_poll_timeout_ms(wheel), events)
+            _ = reactor.poll(_poll_timeout_ms(wheel, poll_cap_ms), events)
         except:
             exit_status = WORKER_STATUS_CRASHED
             break
@@ -264,7 +268,7 @@ def _run_handler_loop_impl[
             if evt.is_wakeup():
                 continue
             if evt.token == LISTENER_TOKEN:
-                if settle_deadline == 0:
+                if not draining:
                     _accept_loop_fd(
                         listener_fd,
                         reactor,
@@ -328,7 +332,11 @@ def _run_handler_loop_impl[
                 )
                 continue
             _cleanup_conn(fd, conns, timers, reactor, wheel)
-        if settle_deadline == 0:
+        if draining:
+            close_idle_h1(
+                monotonic_now_ms(), clock, conns, reactor, wheel, timers
+            )
+        else:
             gate.sync(reactor, len(conns), config.max_connections)
 
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)
@@ -479,17 +487,16 @@ def run_reactor_loop_cancel[
 
     A handler that may block gets a port to the offload pool: a request
     it marks ``blocking`` runs on a pool thread while the connection is
-    parked, as on the unified loop. A stop with such requests out keeps
-    serving their connections until they are answered or
-    ``shutdown_timeout_ms`` passes.
+    parked, as on the unified loop. A stop drains as the other loops do
+    (``_reactor/drain.mojo``).
 
     Args:
         listener: Bound and listening ``TcpListener`` (caller-owned;
             borrowed for accept / fd access).
         config: Server configuration.
         handler: Per-request cancel-aware callback.
-        stopping: Checked each iteration; flipping it stops the loop
-            and closes in-flight connections.
+        stopping: Checked each iteration; flipping it starts the
+            drain.
         stats_addr: Address of this worker's stats block, or ``0`` for
             none. Inflight and exit-status counters are published to it.
     """
@@ -516,26 +523,24 @@ def run_reactor_loop_cancel[
             config.offload_threads,
             config.offload_queue_depth,
         )
-    # Non-zero once the stop flag is seen with offloaded requests out:
-    # the loop keeps serving their connections until this deadline.
-    var settle_deadline = 0
+    # Set once the stop flag is seen: the loop then stops accepting and
+    # finishes what its connections sent (``_reactor/drain.mojo``).
+    var draining = False
+    var clock = DrainClock(0, 0)
+    var listeners: List[Int] = [Int(listener_fd)]
+    var poll_cap_ms = 100
     while True:
-        if settle_deadline == 0 and load_stop_flag(stopping_addr):
-            if offload_outstanding(offload_port) == 0:
-                break
-            settle_deadline = monotonic_now_ms() + max(
-                config.shutdown_timeout_ms, 0
-            )
-            begin_offload_settle_h1(
-                offload_port, Int(listener_fd), conns, reactor, wheel, timers
-            )
-        if settle_deadline != 0:
-            if offload_settled_h1(conns) or monotonic_now_ms() >= settle_deadline:
-                break
+        if not draining and load_stop_flag(stopping_addr):
+            draining = True
+            clock = DrainClock(monotonic_now_ms(), config.shutdown_timeout_ms)
+            poll_cap_ms = DRAIN_POLL_MS
+            begin_drain_h1(offload_port, listeners, conns, reactor)
+        if draining and drain_done(monotonic_now_ms(), clock, len(conns)):
+            break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         events.clear()
         try:
-            _ = reactor.poll(_poll_timeout_ms(wheel), events)
+            _ = reactor.poll(_poll_timeout_ms(wheel, poll_cap_ms), events)
         except:
             exit_status = WORKER_STATUS_CRASHED
             break
@@ -550,7 +555,7 @@ def run_reactor_loop_cancel[
             if evt.is_wakeup():
                 continue
             if evt.token == LISTENER_TOKEN:
-                if settle_deadline == 0:
+                if not draining:
                     _accept_loop(
                         listener,
                         reactor,
@@ -614,7 +619,11 @@ def run_reactor_loop_cancel[
                 )
                 continue
             _cleanup_conn(fd, conns, timers, reactor, wheel)
-        if settle_deadline == 0:
+        if draining:
+            close_idle_h1(
+                monotonic_now_ms(), clock, conns, reactor, wheel, timers
+            )
+        else:
             gate.sync(reactor, len(conns), config.max_connections)
 
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)

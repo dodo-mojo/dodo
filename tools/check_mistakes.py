@@ -191,6 +191,114 @@ MISTAKES = [
         '            if part.startswith("test_"):\n                return True',
         '            if part.startswith("test_"):\n                return False',
     ),
+    Mistake(
+        "an edit is reported again on every check",
+        "cli/watch.mojo",
+        "                self.file_times[i] = now\n",
+        "",
+    ),
+    Mistake(
+        "a file added to a folder is missed",
+        "cli/watch.mojo",
+        "                return True\n        return False",
+        "                pass\n        return False",
+    ),
+    Mistake(
+        "a file saved by renaming over the old one is missed",
+        "cli/watch.mojo",
+        "            return old_times != self.file_times",
+        "            return False",
+    ),
+    Mistake(
+        "dev does not hand the app its listening socket",
+        "cli/cmd_dev.mojo",
+        '    var env: List[String] = [String("DODO_LISTEN_FD=", session.listen_fd)]\n',
+        "    var env = List[String]()\n",
+    ),
+    Mistake(
+        "dev stops the old app when a build fails",
+        "cli/cmd_dev.mojo",
+        "        if built == _BUILD_FAILED:\n            return _GO_ON",
+        "        if built == _BUILD_FAILED:\n            _ = _stop_app(session)\n            return _GO_ON",
+    ),
+    Mistake(
+        "dev leaves the old app running on a restart",
+        "cli/cmd_dev.mojo",
+        "        var hurried = _stop_app(session)\n",
+        "        var hurried = False\n",
+    ),
+    Mistake(
+        "dev exits with 0 on Ctrl-C",
+        "cli/cmd_dev.mojo",
+        "    return EXIT_INTERRUPTED\n",
+        "    return 0\n",
+    ),
+    Mistake(
+        "dev leaves the app running after Ctrl-C",
+        "cli/cmd_dev.mojo",
+        "    _ = _stop_app(session)\n    if step == _NO_MOJO:",
+        "    if step == _NO_MOJO:",
+    ),
+    Mistake(
+        "dev never notices the app died",
+        "cli/cmd_dev.mojo",
+        "        _notice_exit(session)\n",
+        "",
+    ),
+    Mistake(
+        "dev leaves a build running after Ctrl-C",
+        "cli/cmd_dev.mojo",
+        "            _ = child.kill_group()\n            _ = child.wait()\n            return _SIGNALLED",
+        "            return _SIGNALLED",
+    ),
+    Mistake(
+        "a draining connection is kept alive after its response",
+        "dodo/http/_reactor/conn_handle.mojo",
+        "        if self.draining:\n            final = True\n",
+        "",
+    ),
+    Mistake(
+        "an HTTP/1.1 loop holds idle keep-alive connections through the grace",
+        "dodo/http/_reactor/drain.mojo",
+        "        if served_before or grace_over:",
+        "        if grace_over:",
+    ),
+    Mistake(
+        "an HTTP/1.1 loop closes new connections at once on a stop",
+        "dodo/http/_reactor/drain.mojo",
+        "        if served_before or grace_over:",
+        "        if True:",
+    ),
+    Mistake(
+        "a stop ends with connections still open",
+        "dodo/http/_reactor/drain.mojo",
+        "    if open_conns == 0:\n        return True\n    return now_ms >= clock.deadline_ms",
+        "    return True",
+    ),
+    Mistake(
+        "the unified loop holds idle keep-alive connections through the grace",
+        "dodo/http/_unified_reactor_impl.mojo",
+        "            if ch[].keepalive_count > 0 or grace_over:",
+        "            if grace_over:",
+    ),
+    Mistake(
+        "the unified loop closes connections choosing a protocol at once",
+        "dodo/http/_unified_reactor_impl.mojo",
+        "        elif kind == KIND_PENDING or kind == KIND_TLS:\n            if grace_over:",
+        "        elif kind == KIND_PENDING or kind == KIND_TLS:\n            if True:",
+    ),
+    Mistake(
+        "a connection that picks HTTP/1.1 during a stop is kept alive",
+        "dodo/http/_unified_reactor_impl.mojo",
+        "    if draining:\n        _mark_new_h1_draining(fd, conns)\n    var packed2",
+        "    var packed2",
+    ),
+    Mistake(
+        "a stop sends no GOAWAY to HTTP/2 connections",
+        "dodo/http/_unified_reactor_impl.mojo",
+        "            if not h2[].should_close:\n                var step = h2[].begin_close(config)",
+        "            if False:\n                var step = h2[].begin_close(config)",
+    ),
 ]
 
 
@@ -203,6 +311,8 @@ def tests_for(file: str) -> list[str]:
         cli_tests.append(end_to_end)
     if file.startswith("dodo/utils/"):
         return ["tests/utils/test_process.mojo"] + cli_tests
+    if file.startswith("dodo/http/"):
+        return ["tests/http/test_offload.mojo"]
     return cli_tests
 
 
@@ -226,6 +336,16 @@ def kill_leftovers():
         subprocess.run(["pkill", "-9", "-f", name], capture_output=True)
 
 
+def kill_group(child: subprocess.Popen):
+    """Kill the test and everything it started. macOS has refused
+    `killpg` with EPERM for a hung test; then kill the test itself, and
+    `kill_leftovers` ends what it started."""
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        child.kill()
+
+
 def run_test(path: str) -> tuple[str, str]:
     """Run one test file. Returns ("passed" | "failed" | "hung", why)."""
     child = subprocess.Popen(
@@ -239,13 +359,13 @@ def run_test(path: str) -> tuple[str, str]:
     try:
         output, _ = child.communicate(timeout=CAP_SECONDS)
     except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
+        kill_group(child)
         child.wait()
         kill_leftovers()
         return "hung", f"still running after {CAP_SECONDS} s"
     except KeyboardInterrupt:
         # Stopped by Ctrl-C or SIGTERM: the test must not outlive us.
-        os.killpg(child.pid, signal.SIGKILL)
+        kill_group(child)
         child.wait()
         kill_leftovers()
         raise

@@ -41,6 +41,49 @@
 - [ ] `HttpFrontend.run_worker` and `StreamFrontend.run_worker` swallow every error from the reactor loop with `except: pass`. Check whether a worker that fails this way goes unnoticed, and report it if so.
 - [ ] `docs/design.md` calls the router a radix tree; it scans a list. Fix the text once the performance pass picks the lookup. `Router._match` is about 3% of busy samples at 25 routes (`docs/app-layer-audit.md`); recheck with hundreds of routes.
 
+## `dodo` CLI (branch `feat/cli`, in progress)
+
+Scope: `new`, `run`, `dev`, `test`, `routes`, `doctor`, `docs pull`. Every command has `--json`, stable exit codes and no prompts without a TTY. `dodo mcp` is the next PR.
+
+Decisions (asked one at a time):
+
+- [x] 1. Language of the CLI: Mojo, one binary in the conda package; docs pull uses dodo's own HTTP client
+- [x] 2. Where the CLI lives in the repo: top-level `cli/` (built to `bin/dodo`), tests in `tests/cli/`; it imports dodo like any app
+- [x] 3. Docs archive: `mojo-docs/<version>/` built from Modular's `mojo/v<version>` tag (MDX to plain Markdown, plus the stdlib API generated with `mojo doc`), read from `dev`; dodo's docs in `docs/` (with `best-practices/` and generated `api/`), read at each release tag. Each folder has an llms.txt-shaped `index.md`, the only file list. The AGENTS.md from `dodo new` embeds the short index.
+- [x] 4. `dodo dev`: polls file times every 200 ms (0.2 ms for 253 files; folders relisted only when their time changes). It owns the listening socket and passes it as `DODO_LISTEN_FD`; all workers share it. It builds before stopping the old app, which drains in-flight requests on SIGTERM.
+- [x] 5. `dodo routes`: `App` keeps a list of (method, path, blocking), mounts included; run with `DODO_ROUTES=json`, `app.serve` prints it and exits without binding. Has a timeout, since `main` runs up to `serve`.
+- [x] 6. `dodo test`: every `tests/**/test_*.mojo` is a `TestSuite` program, built into its own binary in parallel (2.1 s each against the package), skipped when no `.mojo` changed; one report or `--json`. Exit 0 pass, 1 test failed, 2 build failed.
+
+- [x] 7. Argument parser: our own small one (argmojo pins Mojo 1.2.x, so it would hold back upgrades).
+
+Build order, each step tested end to end before the next:
+
+- [x] Process spawning: posix_spawn, a waitpid that returns the exit status, passing Ctrl-C and SIGTERM on
+- [x] CLI core: argument parsing, `--json` output, exit codes, TTY check
+- [ ] Docs archive: Mojo 1.2.0 split into topic files with an index, the Mojo 1.x cheat sheet, dodo's docs per release, the save-a-new-release tool, license check and credit
+- [ ] `dodo docs pull`: project versions, `--mojo`/`--dodo` and `mojo@1.2 dodo@0.1`, short versions, every error case, never delete docs on a failed pull
+- [ ] Best practices guide in `docs/best-practices/`, examples built in CI; the rule in CONTRIBUTING.md, the PR template and CLAUDE.md
+- [ ] `dodo new` (pixi.toml, main.mojo, tests/, AGENTS.md, CLAUDE.md, TODO.md, docs/adr/, commit hook)
+- [x] `dodo run`, `dodo test`, `dodo routes`, `dodo doctor`
+- [x] Planted-mistake check for the CLI (`pixi run check-mistakes`): 24 mistakes, all caught
+- [ ] `dodo dev`: change detection, restart, socket kept open across restarts
+- [ ] Packaging: `mojo build` installs `$PREFIX/bin/dodo`, recipe tests cover it
+- [ ] Profile every command (startup, docs pull, dev restart time) and fix the slow parts, with before/after numbers
+- [ ] Retire `tools/docs_pull.py`; update CLAUDE.md, design.md and README
+- [ ] Planted mistakes for the library too (HTTP parser, router, scheduler, drivers), added as each area is next touched
+
+## Mojo ecosystem (survey in `docs/ecosystem.md`, 2026-11-04)
+
+Rule: learn from other packages and write our own; copy code only under a permissive license (never GPL or EUPL), with a credit in `THIRD_PARTY_NOTICES.md`. Most packages pin Mojo 1.0 or 1.1, so a dependency would hold back our upgrades.
+
+- [x] CLI: read mtest's runner for edge cases (hung tests, crashes, stray child processes, cached builds) before finishing `dodo test`.
+- [ ] Phase 3 AI: safetensors-mojo (weights), mbpe (tokens and budgets).
+- [ ] Phase 3b agents: mojo-regex (scorers, guardrails), uuid (request, trace and run ids).
+- [ ] Phase 3c vision: compare mosaic-mojo with our preprocessing kernels.
+- [ ] Phase 4 profiling: professor's spans.
+- [ ] Phase 5 gRPC: protomojo and grpc-mojo on our HTTP/2.
+- [ ] Database drivers: morrow for typed dates. Auth middleware: mcrypto for password hashing and token signing.
+
 ## Developer experience and AI agents (Phase 2 and later)
 
 Agents know little Mojo, and it changes fast, so these come first:

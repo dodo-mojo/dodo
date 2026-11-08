@@ -80,7 +80,7 @@ from ..tcp import TcpListener
 from ._thread import ThreadHandle, num_cpus, _OpaquePtr
 from .frontend import Frontend
 from ._balance import balance_group_alloc, balance_group_free
-from .reuseport import bind_reuseport, bind_shared
+from .reuseport import allows_reuseport, bind_reuseport, bind_shared
 
 # Re-exported so the reactor loops' existing
 # ``from dodo.runtime.scheduler import load_stop_flag`` imports keep
@@ -416,10 +416,11 @@ struct Scheduler[F: Frontend](Movable):
                 bare fds: ``addr``'s first, then one per extra
                 address in order. Empty (default) means the
                 scheduler binds every listener itself. When given,
-                they must carry ``SO_REUSEPORT``; worker 0 serves
-                them (or, with one shared listener, every worker
+                worker 0 serves them next to new ``SO_REUSEPORT``
+                listeners (or, with one shared listener, every worker
                 does), so the addresses are never left without a
-                listener. The scheduler owns them from the call on
+                listener. A single one without ``SO_REUSEPORT`` is
+                shared by every worker. The scheduler owns them from the call on
                 and closes them, also when ``start`` raises.
 
         Returns:
@@ -511,6 +512,17 @@ struct Scheduler[F: Frontend](Movable):
         var prebind_per_worker = (
             use_reuseport_workers or len(extra_addrs) > 0
         )
+        # A handed-over listener without SO_REUSEPORT, such as the one
+        # `dodo dev` passes down, cannot get siblings on its port, so
+        # every worker shares it. Its owner keeps it open across
+        # restarts; per-worker listeners would close with this process
+        # and reset the connections waiting in them.
+        if (
+            handed_over
+            and len(extra_addrs) == 0
+            and not allows_reuseport(listener_fds[0])
+        ):
+            prebind_per_worker = False
 
         # Probe-bind each address on this thread so an unusable one
         # raises here rather than inside an opaque pthread, and before

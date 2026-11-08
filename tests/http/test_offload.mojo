@@ -14,6 +14,7 @@ from std.os import remove
 from std.collections import Dict
 from std.os.path import exists
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
+from std.time import perf_counter_ns
 
 from dodo.http import (
     Cancel,
@@ -1530,6 +1531,227 @@ def test_h2_shutdown_sends_goaway_and_waits() raises:
 
 def test_h2_shutdown_sends_goaway_and_waits_tls() raises:
     _h2_shutdown_sends_goaway_and_waits(True)
+
+
+# ── Graceful stop with nothing offloaded ──────────────────────────────────
+#
+# A stop must not reset a request the server already has: it stops
+# accepting, answers what each connection sent (with `Connection: close`),
+# closes idle keep-alive connections at once, and gives a connection that
+# has not sent its first request a short grace to send it.
+
+
+def _ms_since(start_ns: Int) -> Int:
+    return Int((perf_counter_ns() - start_ns) // 1_000_000)
+
+
+def _closes_after_answer(response: String) -> Bool:
+    return "connection: close" in response.lower()
+
+
+def _h1_stop_answers_a_fresh_connection(
+    tls: Bool, loop: String = "unified"
+) raises:
+    """A connection accepted just before the stop sends its request just
+    after it, and is answered instead of reset."""
+    var prefix = _prefix("h1fresh" + _tag(tls) + _loop_tag(loop))
+    var srv = _spawn_server(
+        prefix, ServerConfig(shutdown_timeout_ms=10_000), tls, loop=loop
+    )
+    var got = String("")
+    try:
+        var s = _Conn(srv[1], tls)
+        usleep(50_000)
+        _touch(prefix + "stop")
+        # The loop sees the stop within its 100 ms poll; the request
+        # comes after that and inside the first-request grace.
+        usleep(200_000)
+        s.get("/fast")
+        got = s.response()
+        _wait_file(prefix + "exited")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, List[String]())
+    assert_true(got.startswith("HTTP/1.1 200"), got)
+    assert_true(got.endswith("fast"), got)
+    assert_true(_closes_after_answer(got), got)
+
+
+def test_h1_stop_answers_a_fresh_connection() raises:
+    _h1_stop_answers_a_fresh_connection(False)
+
+
+def test_h1_stop_answers_a_fresh_connection_tls() raises:
+    _h1_stop_answers_a_fresh_connection(True)
+
+
+def test_h1_stop_answers_a_fresh_connection_cancellable() raises:
+    _h1_stop_answers_a_fresh_connection(False, loop="cancel")
+
+
+def test_h1_stop_answers_a_fresh_connection_h1_loop() raises:
+    _h1_stop_answers_a_fresh_connection(False, loop="h1")
+
+
+def _h1_stop_finishes_a_request_being_read(
+    tls: Bool, loop: String = "unified"
+) raises:
+    """Half a request is in when the stop comes: the rest is read and
+    answered."""
+    var prefix = _prefix("h1half" + _tag(tls) + _loop_tag(loop))
+    var srv = _spawn_server(
+        prefix, ServerConfig(shutdown_timeout_ms=10_000), tls, loop=loop
+    )
+    var got = String("")
+    try:
+        var s = _Conn(srv[1], tls)
+        s.send("GET /fast HTTP/1.1\r\nHo")
+        usleep(50_000)
+        _touch(prefix + "stop")
+        usleep(200_000)
+        s.send("st: x\r\n\r\n")
+        got = s.response()
+        _wait_file(prefix + "exited")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, List[String]())
+    assert_true(got.startswith("HTTP/1.1 200"), got)
+    assert_true(_closes_after_answer(got), got)
+
+
+def test_h1_stop_finishes_a_request_being_read() raises:
+    _h1_stop_finishes_a_request_being_read(False)
+
+
+def test_h1_stop_finishes_a_request_being_read_tls() raises:
+    _h1_stop_finishes_a_request_being_read(True)
+
+
+def test_h1_stop_finishes_a_request_being_read_cancellable() raises:
+    _h1_stop_finishes_a_request_being_read(False, loop="cancel")
+
+
+def test_h1_stop_finishes_a_request_being_read_h1_loop() raises:
+    _h1_stop_finishes_a_request_being_read(False, loop="h1")
+
+
+def _h1_stop_closes_an_idle_keep_alive_connection(
+    tls: Bool, loop: String = "unified"
+) raises:
+    """A keep-alive connection between requests is closed at once: the
+    stop does not wait for it."""
+    var prefix = _prefix("h1idle" + _tag(tls) + _loop_tag(loop))
+    var srv = _spawn_server(
+        prefix, ServerConfig(shutdown_timeout_ms=10_000), tls, loop=loop
+    )
+    var first = String("")
+    var closed = False
+    var took_ms = 0
+    try:
+        var s = _Conn(srv[1], tls)
+        s.get("/fast")
+        first = s.response()
+        var start = perf_counter_ns()
+        _touch(prefix + "stop")
+        _wait_file(prefix + "exited")
+        took_ms = _ms_since(start)
+        closed = s.closed_by_server()
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, List[String]())
+    assert_false(_closes_after_answer(first), first)
+    assert_true(closed)
+    assert_true(took_ms < 450, String("the stop took ", took_ms, " ms"))
+
+
+def test_h1_stop_closes_an_idle_keep_alive_connection() raises:
+    _h1_stop_closes_an_idle_keep_alive_connection(False)
+
+
+def test_h1_stop_closes_an_idle_keep_alive_connection_tls() raises:
+    _h1_stop_closes_an_idle_keep_alive_connection(True)
+
+
+def test_h1_stop_closes_an_idle_keep_alive_connection_cancellable() raises:
+    _h1_stop_closes_an_idle_keep_alive_connection(False, loop="cancel")
+
+
+def test_h1_stop_closes_an_idle_keep_alive_connection_h1_loop() raises:
+    _h1_stop_closes_an_idle_keep_alive_connection(False, loop="h1")
+
+
+def _h1_stop_closes_a_silent_connection_after_the_grace(
+    tls: Bool, loop: String = "unified"
+) raises:
+    """A connection that never sends a request holds the stop only for
+    the short first-request grace, not for ``shutdown_timeout_ms``."""
+    var prefix = _prefix("h1silent" + _tag(tls) + _loop_tag(loop))
+    # A long idle timeout, so only the grace can close the connection.
+    var config = ServerConfig(shutdown_timeout_ms=10_000)
+    config.idle_timeout_ms = 10_000
+    var srv = _spawn_server(prefix, config^, tls, loop=loop)
+    var closed = False
+    var took_ms = 0
+    try:
+        var s = _Conn(srv[1], tls)
+        usleep(50_000)
+        var start = perf_counter_ns()
+        _touch(prefix + "stop")
+        _wait_file(prefix + "exited")
+        took_ms = _ms_since(start)
+        closed = s.closed_by_server()
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, List[String]())
+    assert_true(closed)
+    assert_true(took_ms >= 450, String("closed after ", took_ms, " ms"))
+    assert_true(took_ms < 2000, String("the stop took ", took_ms, " ms"))
+
+
+def test_h1_stop_closes_a_silent_connection_after_the_grace() raises:
+    _h1_stop_closes_a_silent_connection_after_the_grace(False)
+
+
+def test_h1_stop_closes_a_silent_connection_after_the_grace_tls() raises:
+    _h1_stop_closes_a_silent_connection_after_the_grace(True)
+
+
+def test_h1_stop_closes_a_silent_connection_after_the_grace_cancellable() raises:
+    _h1_stop_closes_a_silent_connection_after_the_grace(False, loop="cancel")
+
+
+def test_h1_stop_closes_a_silent_connection_after_the_grace_h1_loop() raises:
+    _h1_stop_closes_a_silent_connection_after_the_grace(False, loop="h1")
+
+
+def _h2_stop_sends_goaway_to_an_idle_connection(tls: Bool) raises:
+    """An idle HTTP/2 connection gets GOAWAY before it is closed, so the
+    client knows no stream was dropped."""
+    var prefix = _prefix("h2idle" + _tag(tls))
+    var srv = _spawn_server(
+        prefix, ServerConfig(shutdown_timeout_ms=10_000), tls
+    )
+    var c = _H2(srv[1], tls)
+    try:
+        c.get(1, "/fast")
+        c.wait_ended(1)
+        _touch(prefix + "stop")
+        while not c.closed:
+            c.pump()
+        _wait_file(prefix + "exited")
+    finally:
+        _stop_server(srv[0])
+        _cleanup(prefix, List[String]())
+    assert_equal(c.body[1], "fast")
+    assert_true(c.goaway)
+
+
+def test_h2_stop_sends_goaway_to_an_idle_connection() raises:
+    _h2_stop_sends_goaway_to_an_idle_connection(False)
+
+
+def test_h2_stop_sends_goaway_to_an_idle_connection_tls() raises:
+    _h2_stop_sends_goaway_to_an_idle_connection(True)
 
 
 # ── Several workers ────────────────────────────────────────────────────────
