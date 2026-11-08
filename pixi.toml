@@ -40,6 +40,7 @@ default = { solve-group = "default" }
 bench = { features = ["bench"], solve-group = "default" }
 
 [tasks]
+ci = "bash tools/ci.sh"
 tests = "bash tests/tools/run_tests.sh"
 tests-gen = "python3 tests/tools/gen_test_aggregates.py"
 docs-pull = "python3 tools/docs_pull.py"
