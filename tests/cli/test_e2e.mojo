@@ -663,7 +663,9 @@ def _stop_dev(mut dodo: Child) raises -> ExitStatus:
 
 
 def test_dev_session() raises:
-    var dir = _dev_project("dev_session", String(_DEV_APP).replace("VERSION", "v1"))
+    var dir = _dev_project(
+        "dev_session", String(_DEV_APP).replace("VERSION", "v1")
+    )
     var dodo = _start_dev(dir, json=True)
     try:
         _dev_session_steps(dir, dodo)
@@ -738,7 +740,9 @@ def _dev_session_steps(dir: String, mut dodo: Child) raises:
 def test_dev_text_output() raises:
     # Without --json, events go to stderr as plain lines; stdout is the
     # app's.
-    var dir = _dev_project("dev_text", String(_DEV_APP).replace("VERSION", "v1"))
+    var dir = _dev_project(
+        "dev_text", String(_DEV_APP).replace("VERSION", "v1")
+    )
     var err_path = join(dir, "dev.err")
     var dodo = _start_dev(dir, json=False)
     var tries = 0
@@ -882,7 +886,9 @@ def _wait_for_text(path: String, text: String) raises:
     """Wait up to 30 s until the file at `path` holds `text`."""
     var tries = 0
     while text not in read_or_empty(path):
-        assert_true(tries < 3000, String("no `", text, "`:\n", read_or_empty(path)))
+        assert_true(
+            tries < 3000, String("no `", text, "`:\n", read_or_empty(path))
+        )
         sleep(0.01)
         tries += 1
 

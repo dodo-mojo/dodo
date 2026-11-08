@@ -150,7 +150,9 @@ def test_parse_host() raises:
 
 
 def test_url_of() raises:
-    assert_equal(url_of(IpAddr.parse("127.0.0.1"), 8000), "http://127.0.0.1:8000")
+    assert_equal(
+        url_of(IpAddr.parse("127.0.0.1"), 8000), "http://127.0.0.1:8000"
+    )
     assert_equal(url_of(IpAddr.parse("::1"), 80), "http://[::1]:80")
 
 
