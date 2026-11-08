@@ -1,0 +1,238 @@
+# dodo 0.0.1
+
+> dodo's guides, design, decisions (ADRs) and API as plain Markdown. Saved as `dodo-docs/<version>/` at each release, they match that release.
+
+Every relative link below is a file of these docs. `tools/save_docs.py dodo` writes this index and `api/`; edit the guides themselves.
+
+## Guides
+
+- [The `dodo` command line](cli.md): One binary, written in Mojo, in `cli/`.
+- [Databases](databases.md): `dodo.db` talks to PostgreSQL, CockroachDB, MySQL, MariaDB, SQLite, Redis, Valkey, MongoDB and ClickHouse.
+- [dodo: design](design.md): Status: draft v0.1, 2026-10-26.
+- [Mojo ecosystem: what can help dodo](ecosystem.md): A survey of the 77 packages on the modular-community channel, done on 2026-11-04.
+- [Engineering standards](engineering-standards.md): These apply to everyone working on dodo, human or agent.
+- [Claiming the dodo name](naming.md): Checked 2026-10-26.
+
+## Decisions (ADRs)
+
+- [ADR template](adr/0000-template.md): What problem or force makes this decision necessary.
+- [ADR-0001: License dodo under Apache-2.0](adr/0001-license-apache-2.0.md): dodo is meant for production use by companies, and it reuses MIT-licensed code from Lightbug.
+- [ADR-0002: Wrap Python agent frameworks behind a Mojo API](adr/0002-python-frameworks-behind-mojo-api.md): Most agent tooling (LangGraph, LangChain, PydanticAI, the OpenAI and Claude agent SDKs) is in Python.
+- [ADR-0003: Fork Flare as dodo's networking core](adr/0003-fork-flare-core.md): dodo planned to write its own networking core after Lightbug failed our audit.
+- [ADR-0004: Offload pool for blocking handlers](adr/0004-offload-pool.md): Each worker runs one event loop, and handlers run inline on it.
+- [ADR-0005: Model workers in supervised child processes](adr/0005-model-workers.md): dodo runs HTTP, models and GPU kernels in one process.
+- [ADR-0006: Outgoing calls on the event loop](adr/0006-outgoing-calls-on-the-loop.md): A handler that calls other services (another API, a model server, later a database) uses the blocking `HttpClient`.
+- [ADR-0007: Remove the io_uring backend](adr/0007-remove-io-uring.md): The import (ADR-0003) brought an io_uring engine and an HTTP/1.1 loop on top of it that reads into a kernel buffer ring.
+- [ADR-0008: The App API](adr/0008-app-api.md): The imported core has most of an app layer (router, extractors, middleware, JSON with reflection), but no front door.
+- [ADR-0009: Native database drivers](adr/0009-database-drivers.md): A web backend needs a database, and dodo has no way to reach one.
+- [ADR-0010: Database migrations](adr/0010-database-migrations.md): ADR-0009 shipped the SQL drivers without a way to change a schema over time.
+- [ADR-0011: PostgreSQL LISTEN/NOTIFY and COPY](adr/0011-postgres-listen-notify-and-copy.md): ADR-0009 left PostgreSQL's `LISTEN/NOTIFY` and `COPY` out of v1.
+
+## Audits
+
+- [App layer audit](app-layer-audit.md): What the imported core already gives Phase 2 (`docs/design.md` section 9), measured against the API sketch in section 4.
+- [Flare audit](flare-audit.md): Audit of [Flare](https://github.com/ehsanmok/flare) to decide whether dodo builds on it.
+- [Lightbug audit](lightbug-audit.md): Audit of [Lightbug](https://github.com/Lightbug-HQ/lightbug_http) as a source of reusable code for dodo.
+
+## API
+
+- [`dodo`](api/index.md): The dodo web framework for Mojo.
+- [`dodo.errors`](api/errors.md): Cross-module typed-error vocabulary for dodo.
+- [`dodo.crypto`](api/crypto/index.md): ``dodo.crypto`` — minimal cryptographic primitives over the OpenSSL FFI.
+- [`dodo.crypto.base64`](api/crypto/base64.md): ``dodo.crypto.base64`` -- RFC 4648 §4 standard base64 encode/decode.
+- [`dodo.crypto.digest`](api/crypto/digest.md): Hashes, HMAC and PBKDF2 from the OpenSSL that `dodo.tls` already loads.
+- [`dodo.crypto.hmac`](api/crypto/hmac.md): HMAC-SHA256 + URL-safe base64 over the OpenSSL FFI.
+- [`dodo.crypto.random`](api/crypto/random.md): ``dodo.crypto.random`` -- bytes from the operating system's CSPRNG.
+- [`dodo.crypto.rsa`](api/crypto/rsa.md): RSA-OAEP encryption with a PEM public key.
+- [`dodo.db`](api/db/index.md): Database drivers, written in Mojo (ADR-0009).
+- [`dodo.db.error`](api/db/error.md): The one error every database driver raises.
+- [`dodo.db.migrate`](api/db/migrate.md): Schema migrations for the SQL drivers (ADR-0010).
+- [`dodo.db.param`](api/db/param.md): Query parameters: one value sent to the server apart from the SQL text.
+- [`dodo.db.pool`](api/db/pool.md): A thread-safe, bounded connection pool shared by every driver.
+- [`dodo.db.rows`](api/db/rows.md): Result sets from the SQL drivers, and reading them into structs.
+- [`dodo.db.clickhouse`](api/db/clickhouse/index.md): ClickHouse, over its HTTP interface.
+- [`dodo.db.clickhouse.client`](api/db/clickhouse/client.md): The ClickHouse pool most code uses.
+- [`dodo.db.clickhouse.connection`](api/db/clickhouse/connection.md): One HTTP keep-alive connection to a ClickHouse server.
+- [`dodo.db.clickhouse.protocol`](api/db/clickhouse/protocol.md): ClickHouse over HTTP, without I/O: request URLs, parameters, the RowBinaryWithNamesAndTypes result format, and errors.
+- [`dodo.db.mongo`](api/db/mongo/index.md): MongoDB, over OP_MSG with BSON.
+- [`dodo.db.mongo.bson`](api/db/mongo/bson.md): BSON, MongoDB's document format: building, validating and reading.
+- [`dodo.db.mongo.client`](api/db/mongo/client.md): The MongoDB pool most code uses, and collections on it.
+- [`dodo.db.mongo.connection`](api/db/mongo/connection.md): One connection to a MongoDB server.
+- [`dodo.db.mongo.protocol`](api/db/mongo/protocol.md): MongoDB's OP_MSG framing and command replies, without I/O.
+- [`dodo.db.mysql`](api/db/mysql/index.md): MySQL and MariaDB, over the MySQL client/server protocol.
+- [`dodo.db.mysql.client`](api/db/mysql/client.md): The MySQL pool most code uses, and transactions on it.
+- [`dodo.db.mysql.connection`](api/db/mysql/connection.md): One blocking connection to MySQL or MariaDB.
+- [`dodo.db.mysql.protocol`](api/db/mysql/protocol.md): MySQL client/server protocol (also MariaDB), sans I/O.
+- [`dodo.db.postgres`](api/db/postgres/index.md): PostgreSQL and CockroachDB, over the PostgreSQL wire protocol v3.
+- [`dodo.db.postgres.client`](api/db/postgres/client.md): The PostgreSQL pool most code uses, and transactions on it.
+- [`dodo.db.postgres.connection`](api/db/postgres/connection.md): One blocking connection to PostgreSQL or CockroachDB.
+- [`dodo.db.postgres.protocol`](api/db/postgres/protocol.md): PostgreSQL frontend/backend protocol v3, sans I/O.
+- [`dodo.db.redis`](api/db/redis/index.md): Redis and Valkey, over RESP2.
+- [`dodo.db.redis.client`](api/db/redis/client.md): The Redis pool most code uses, with typed helpers for common commands.
+- [`dodo.db.redis.connection`](api/db/redis/connection.md): One connection to a Redis or Valkey server.
+- [`dodo.db.redis.protocol`](api/db/redis/protocol.md): RESP2, the Redis wire protocol, without I/O.
+- [`dodo.db.sqlite`](api/db/sqlite/index.md): SQLite, through the libsqlite3 that pixi installs.
+- [`dodo.db.sqlite.client`](api/db/sqlite/client.md): The SQLite pool most code uses, and transactions on it.
+- [`dodo.db.sqlite.connection`](api/db/sqlite/connection.md): One connection to an SQLite database file, through libsqlite3.
+- [`dodo.dns`](api/dns/index.md): DNS resolution via `getaddrinfo(3)`.
+- [`dodo.dns.async_resolve`](api/dns/async_resolve.md): DNS resolution on a separate thread + happy-eyeballs ordering.
+- [`dodo.dns.cache`](api/dns/cache.md): TTL-bounded DNS resolution cache.
+- [`dodo.dns.resolver`](api/dns/resolver.md): DNS hostname resolution via libc ``getaddrinfo(3)``.
+- [`dodo.http`](api/http/index.md): HTTP/1.1 client and server.
+- [`dodo.http.alpn_dispatch`](api/http/alpn_dispatch.md): ALPN-driven wire dispatch.
+- [`dodo.http.app`](api/http/app.md): The App: one front door for routes, typed handlers, state and serving.
+- [`dodo.http.async_body`](api/http/async_body.md): Reactor-integrated external streaming source.
+- [`dodo.http.auth`](api/http/auth.md): HTTP authentication helpers.
+- [`dodo.http.auth_extract`](api/http/auth_extract.md): Server-side authentication extractors + CSRF helper.
+- [`dodo.http.body`](api/http/body.md): Streaming response body primitives.
+- [`dodo.http.cancel`](api/http/cancel.md): Cancel token plumbed from the reactor into request handlers.
+- [`dodo.http.client`](api/http/client.md): HTTP client: HTTP/1.1 and HTTP/2, over TCP or TLS.
+- [`dodo.http.client_pool`](api/http/client_pool.md): HTTP/1.1 client connection pool.
+- [`dodo.http.conditional`](api/http/conditional.md): Conditional GET / PUT middleware (RFC 9110 §13).
+- [`dodo.http.cookie`](api/http/cookie.md): HTTP cookie support (RFC 6265).
+- [`dodo.http.cors`](api/http/cors.md): ``Cors[Inner]`` middleware (Cross-Origin Resource Sharing).
+- [`dodo.http.encoding`](api/http/encoding.md): HTTP content-encoding helpers: gzip and deflate via zlib FFI.
+- [`dodo.http.error`](api/http/error.md): HTTP-level error types.
+- [`dodo.http.extract`](api/http/extract.md): Typed request extractors with reflective auto-injection.
+- [`dodo.http.form`](api/http/form.md): ``application/x-www-form-urlencoded`` parsing (WHATWG URL Living Standard, §5.1).
+- [`dodo.http.frontend`](api/http/frontend.md): HTTP frontends for the multicore :class:`dodo.runtime.Scheduler`.
+- [`dodo.http.fs`](api/http/fs.md): ``FileServer`` — serve files from a directory with HEAD + Range support.
+- [`dodo.http.handler`](api/http/handler.md): The ``Handler`` trait: dodo's request-to-response contract.
+- [`dodo.http.header_phf`](api/http/header_phf.md): Comptime perfect-hash dispatch for ~70 standard HTTP header names.
+- [`dodo.http.header_view`](api/http/header_view.md): Borrowed header storage.
+- [`dodo.http.headers`](api/http/headers.md): HTTP header collection with case-insensitive key lookup.
+- [`dodo.http.hpack_huffman`](api/http/hpack_huffman.md): HPACK Huffman codec — RFC 7541 Appendix B.
+- [`dodo.http.hpack_huffman_simd`](api/http/hpack_huffman_simd.md): HPACK Huffman fast decoder.
+- [`dodo.http.intern`](api/http/intern.md): Interned ``StaticString`` table for HTTP method names + common header values.
+- [`dodo.http.metrics`](api/http/metrics.md): Prometheus-text-exposition metrics middleware.
+- [`dodo.http.middleware`](api/http/middleware.md): Generic middleware library for .
+- [`dodo.http.multipart`](api/http/multipart.md): ``multipart/form-data`` parsing (RFC 7578).
+- [`dodo.http.multipart_builder`](api/http/multipart_builder.md): Client-side ``multipart/form-data`` request-body builder (RFC 7578).
+- [`dodo.http.offload`](api/http/offload.md): ``Offload``: run a blocking handler on the offload pool (ADR-0004).
+- [`dodo.http.proxy_protocol`](api/http/proxy_protocol.md): PROXY protocol v1 + v2 parser (HAProxy spec).
+- [`dodo.http.redirect_policy`](api/http/redirect_policy.md): HTTP redirect policy: configurable cross-origin + auth gating.
+- [`dodo.http.reliability`](api/http/reliability.md): Reliability middleware: ``Retry`` / ``PostHocDeadline`` / ``RateLimit`` / ``CircuitBreaker`` policies.
+- [`dodo.http.request`](api/http/request.md): HTTP request type.
+- [`dodo.http.request_builder`](api/http/request_builder.md): Fluent-ish per-request builder for the HTTP client.
+- [`dodo.http.request_chunks`](api/http/request_chunks.md): Streaming-shape adapter for inbound request bodies.
+- [`dodo.http.request_view`](api/http/request_view.md): Zero-copy HTTP request view.
+- [`dodo.http.response`](api/http/response.md): HTTP response type.
+- [`dodo.http.response_pool`](api/http/response_pool.md): Per-worker ``Response`` pool.
+- [`dodo.http.response_stream`](api/http/response_stream.md): Streaming-response plumbing for the normal Handler path.
+- [`dodo.http.router`](api/http/router.md): HTTP request router with method dispatch + path parameters.
+- [`dodo.http.routes`](api/http/routes.md): Comptime-compiled route table and ``ComptimeRouter``.
+- [`dodo.http.server`](api/http/server.md): HTTP server: HTTP/1.1 and HTTP/2, cleartext or TLS, on the reactor.
+- [`dodo.http.session`](api/http/session.md): Signed cookies + typed sessions.
+- [`dodo.http.simd_parsers`](api/http/simd_parsers.md): SIMD-friendly byte-scan primitives for the HTTP/1.1 parser hot path.
+- [`dodo.http.sse`](api/http/sse.md): Server-Sent Events (W3C SSE / RFC 9110 ``text/event-stream``).
+- [`dodo.http.status_reason`](api/http/status_reason.md): The standard reason phrase for each HTTP status code (RFC 9110 sec 15).
+- [`dodo.http.streaming_response`](api/http/streaming_response.md): Streaming response with a parametric body type.
+- [`dodo.http.streaming_serialize`](api/http/streaming_serialize.md): Streaming response serializer.
+- [`dodo.http.streaming_server`](api/http/streaming_server.md): Typed streaming-handler surface.
+- [`dodo.http.structured_logger`](api/http/structured_logger.md): Structured (JSON-shaped) request logger middleware.
+- [`dodo.http.template`](api/http/template.md): Tiny tag-based template engine.
+- [`dodo.http.url`](api/http/url.md): URL parser for HTTP/HTTPS URLs.
+- [`dodo.http.cache`](api/http/cache/index.md): ``dodo.http.cache`` — RFC 9111 HTTP cache primitives.
+- [`dodo.http.cache.control`](api/http/cache/control.md): ``Cache-Control`` header parser (RFC 9111 §5.2).
+- [`dodo.http.cache.key`](api/http/cache/key.md): Cache key derivation (RFC 9111 §4 "Constructing Responses from Caches").
+- [`dodo.http.cache.middleware`](api/http/cache/middleware.md): HTTP cache middleware (RFC 9111).
+- [`dodo.http.cache.store`](api/http/cache/store.md): Cache store trait + in-memory implementation.
+- [`dodo.http.ffi`](api/http/ffi/index.md)
+- [`dodo.http.proto`](api/http/proto/index.md): ``dodo.http.proto`` -- pure-function HTTP wire codecs and parsers.
+- [`dodo.http.proto.ascii`](api/http/proto/ascii.md): ``dodo.http.proto.ascii`` -- zero-validation ASCII helpers.
+- [`dodo.http.proto.chunked`](api/http/proto/chunked.md): Sans-I/O framing for ``Transfer-Encoding: chunked`` request bodies.
+- [`dodo.http.proto.h1_leniency`](api/http/proto/h1_leniency.md): Named opt-in flags for HTTP/1.1 parser leniency.
+- [`dodo.http.proto.h2_config`](api/http/proto/h2_config.md): HTTP/2 SETTINGS and per-connection limits.
+- [`dodo.http.proto.h2c_upgrade`](api/http/proto/h2c_upgrade.md): HTTP/1.1 -> HTTP/2 cleartext (h2c) upgrade detection (RFC 7540 §3.2).
+- [`dodo.http.proto.huffman`](api/http/proto/huffman.md): Canonical sans-I/O HPACK Huffman codec surface (``dodo.http.proto.huffman``) -- RFC 7541 §5.2 + Appendix B.
+- [`dodo.http.proto.utf8`](api/http/proto/utf8.md): Lossy UTF-8 decoding for caller-supplied byte bodies.
+- [`dodo.http.wire`](api/http/wire/index.md): Wire-neutral types shared by HTTP/1.1 and HTTP/2.
+- [`dodo.http2`](api/http2/index.md): ``dodo.http2`` -- low-level HTTP/2 driver primitives (RFC 9113 + RFC 7541).
+- [`dodo.http2.client`](api/http2/client.md): HTTP/2 client byte driver (RFC 9113).
+- [`dodo.http2.frame`](api/http2/frame.md): HTTP/2 frame codec (RFC 9113 §4).
+- [`dodo.http2.hpack`](api/http2/hpack.md): HPACK header compression (RFC 7541).
+- [`dodo.http2.server`](api/http2/server.md): HTTP/2 server glue (RFC 9113).
+- [`dodo.http2.state`](api/http2/state.md): HTTP/2 state machines (RFC 9113 §5).
+- [`dodo.http2.stream_slab`](api/http2/stream_slab.md): HTTP/2 per-connection stream slab.
+- [`dodo.io`](api/io/index.md): Buffered I/O utilities for dodo streams.
+- [`dodo.io.buf_reader`](api/io/buf_reader.md): Buffered reader for stream I/O.
+- [`dodo.io.byte_cursor`](api/io/byte_cursor.md): Safe, bounds-checked byte cursors.
+- [`dodo.json`](api/json/index.md): JSON for dodo: parse, build, serialise, and reflect structs.
+- [`dodo.json.config`](api/json/config.md)
+- [`dodo.json.deserialize`](api/json/deserialize.md)
+- [`dodo.json.document`](api/json/document.md)
+- [`dodo.json.dtoa`](api/json/dtoa.md)
+- [`dodo.json.errors`](api/json/errors.md)
+- [`dodo.json.parser`](api/json/parser.md): ``loads``: JSON text to a ``Value``.
+- [`dodo.json.pointer`](api/json/pointer.md)
+- [`dodo.json.reader`](api/json/reader.md)
+- [`dodo.json.reflection`](api/json/reflection.md): Reflection-based JSON serialization and deserialization.
+- [`dodo.json.serialize`](api/json/serialize.md)
+- [`dodo.json.unicode`](api/json/unicode.md)
+- [`dodo.json.writer`](api/json/writer.md)
+- [`dodo.json.cpu`](api/json/cpu/index.md): The CPU parser: a two-pass stage 1 + stage 2 walker.
+- [`dodo.json.cpu.number_parse`](api/json/cpu/number_parse.md)
+- [`dodo.json.cpu.simd_clmul`](api/json/cpu/simd_clmul.md)
+- [`dodo.json.cpu.stage1`](api/json/cpu/stage1.md)
+- [`dodo.json.cpu.stage1_scalar`](api/json/cpu/stage1_scalar.md)
+- [`dodo.json.cpu.stage2`](api/json/cpu/stage2.md)
+- [`dodo.json.cpu.validate`](api/json/cpu/validate.md)
+- [`dodo.json.ffi`](api/json/ffi/index.md): Native simdjson binding for ``dodo.json``.
+- [`dodo.json.ffi.simdjson`](api/json/ffi/simdjson.md): Bindings to simdjson through ``libdodo_simdjson.so``.
+- [`dodo.json.value`](api/json/value/index.md)
+- [`dodo.json.value.node`](api/json/value/node.md)
+- [`dodo.json.value.owned`](api/json/value/owned.md)
+- [`dodo.json.value.raw_ops`](api/json/value/raw_ops.md)
+- [`dodo.json.value.value`](api/json/value/value.md)
+- [`dodo.net`](api/net/index.md): Raw POSIX socket primitives — the foundation of the dodo networking stack.
+- [`dodo.net.address`](api/net/address.md): IP address and socket address types.
+- [`dodo.net.error`](api/net/error.md): Typed network errors for dodo.
+- [`dodo.net.socket`](api/net/socket.md): Raw POSIX socket wrapper — the single point where dodo touches the OS.
+- [`dodo.runtime`](api/runtime/index.md): ``dodo.runtime`` — event-loop primitives for the Stage 1 reactor.
+- [`dodo.runtime.blocking`](api/runtime/blocking.md): Blocking-escape hatch: ``block_in_pool``.
+- [`dodo.runtime.buffer_pool`](api/runtime/buffer_pool.md): Per-worker, size-class-bucketed buffer pool.
+- [`dodo.runtime.date_cache`](api/runtime/date_cache.md): Per-worker monotonic Date-header cache.
+- [`dodo.runtime.event`](api/runtime/event.md): Event primitives for the dodo reactor.
+- [`dodo.runtime.frontend`](api/runtime/frontend.md): Worker-target trait for the multicore :class:`Scheduler`.
+- [`dodo.runtime.handoff`](api/runtime/handoff.md): Cross-worker connection handoff.
+- [`dodo.runtime.iovec`](api/runtime/iovec.md): ``writev(2)`` vectored-I/O primitive.
+- [`dodo.runtime.pool`](api/runtime/pool.md): Typed heap-allocator wrapper.
+- [`dodo.runtime.reactor`](api/runtime/reactor.md): Reactor: the event-loop core powering dodo's single-threaded HTTP server.
+- [`dodo.runtime.reuseport`](api/runtime/reuseport.md): ``SO_REUSEPORT`` helpers for thread-per-core listeners.
+- [`dodo.runtime.scheduler`](api/runtime/scheduler.md): Multicore scheduler: 1 shared listener, N reactors, N workers.
+- [`dodo.runtime.scheduler_stats`](api/runtime/scheduler_stats.md): Cross-thread stop flag and per-worker stats cell.
+- [`dodo.runtime.timer_wheel`](api/runtime/timer_wheel.md): Hashed timing wheel for the dodo reactor.
+- [`dodo.runtime.watchdog`](api/runtime/watchdog.md): Deadline watchdog: a background thread that flips Cancel cells on expiry.
+- [`dodo.tcp`](api/tcp/index.md): Blocking TCP streams and listeners.
+- [`dodo.tcp.listener`](api/tcp/listener.md): TCP listener: a socket bound and listening for incoming connections.
+- [`dodo.tcp.stream`](api/tcp/stream.md): TCP stream: a connected, bidirectional byte stream.
+- [`dodo.testing`](api/testing/index.md): ``dodo.testing`` — handler + middleware testing helpers.
+- [`dodo.testing.client`](api/testing/client.md): In-process test client for ``Handler`` implementations.
+- [`dodo.testing.fork_server`](api/testing/fork_server.md): Fork-and-serve helpers for cookbook examples and integration tests.
+- [`dodo.tls`](api/tls/index.md): TLS/SSL layer — wraps `TcpStream` with OpenSSL encryption.
+- [`dodo.tls.acceptor`](api/tls/acceptor.md): Server-side TLS acceptor.
+- [`dodo.tls.config`](api/tls/config.md): TLS configuration: certificates, keys, and verification policy.
+- [`dodo.tls.error`](api/tls/error.md): TLS-specific error types for ``dodo.tls``.
+- [`dodo.tls.stream`](api/tls/stream.md): TLS stream: encrypts a TcpStream via OpenSSL FFI.
+- [`dodo.tls.ffi`](api/tls/ffi/index.md)
+- [`dodo.uds`](api/uds/index.md): ``dodo.uds`` — Unix domain socket primitives.
+- [`dodo.uds.frame_mux`](api/uds/frame_mux.md): Multiplexed duplex framed transport over one connection.
+- [`dodo.uds.listener`](api/uds/listener.md): AF_UNIX listener — bound + listening Unix domain socket.
+- [`dodo.uds.stream`](api/uds/stream.md): Connected AF_UNIX byte stream.
+- [`dodo.utils`](api/utils/index.md): Cross-cutting utility helpers that don't fit any other layer.
+- [`dodo.utils.dylib`](api/utils/dylib.md): Canonical FFI dylib path resolver shared across :mod:`dodo`.
+- [`dodo.utils.posix_proc`](api/utils/posix_proc.md): POSIX process-control helpers thin-wrapped over ``external_call``.
+- [`dodo.utils.process`](api/utils/process.md): Start programs, wait for them to end, and stop them.
+- [`dodo.utils.signals`](api/utils/signals.md): Notice Ctrl-C, SIGTERM and SIGHUP without being killed by them.
+- [`dodo.utils.ffi`](api/utils/ffi/index.md)
+- [`dodo.ws`](api/ws/index.md): WebSocket client and server (RFC 6455).
+- [`dodo.ws.auto_client`](api/ws/auto_client.md): `dodo.ws.auto_client` -- ALPN-driven WebSocket client dispatcher.
+- [`dodo.ws.client`](api/ws/client.md): WebSocket client (RFC 6455).
+- [`dodo.ws.client_h2`](api/ws/client_h2.md): WebSocket-over-HTTP/2 stream <-> frame adapter (RFC 8441).
+- [`dodo.ws.extensions`](api/ws/extensions.md): ``Sec-WebSocket-Extensions`` header parser + emitter (RFC 6455 §9 + RFC 7692 §7).
+- [`dodo.ws.frame`](api/ws/frame.md): WebSocket frame codec (RFC 6455 §5).
+- [`dodo.ws.permessage_deflate`](api/ws/permessage_deflate.md): WebSocket permessage-deflate extension (RFC 7692).
+- [`dodo.ws.protocol`](api/ws/protocol.md): Sans-I/O WebSocket server protocol core (RFC 6455).
+- [`dodo.ws.server`](api/ws/server.md): WebSocket server: upgrades HTTP connections to WebSocket (RFC 6455).
+- [`dodo.ws.server_h2`](api/ws/server_h2.md): Server-side WebSocket-over-HTTP/2 carrier (RFC 8441).
+- [`dodo.ws.server_reactor`](api/ws/server_reactor.md): Event-driven WebSocket handlers for HTTP/1.1 upgrades on the reactor.

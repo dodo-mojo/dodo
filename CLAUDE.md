@@ -10,18 +10,19 @@ A Mojo web framework with HTTP, AI (MAX), GPU kernels, computer vision and agent
 - `docs/engineering-standards.md`: how we write code, tests, docs, commits. **Follow it.**
 - `docs/adr/`: major decisions only. Read before changing anything they cover.
 - `TODO.md`: open tasks, split into what the human does and what Claude does.
-- `.dodo/docs/`: the Mojo docs for the toolchain in use, plus dodo's guides and API (`pixi run docs-pull`; generated, gitignored). Check Mojo syntax and stdlib APIs there, not from memory.
+- `mojo-docs/1.2.0/`: the Mojo docs for the toolchain in use, as plain Markdown (start at `index.md`; `changes-in-1x.md` lists what 1.x changed). Check Mojo syntax and stdlib APIs there, not from memory. dodo's own API is in `docs/api/`.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `dodo/` | The library. `http`, `http2`, `ws`, `tls`, `tcp`, `uds`, `dns`, `net`, `runtime`, `crypto`, `io`, `json` (vendored, see `THIRD_PARTY_NOTICES.md`), `db` (one subpackage per database), `testing`, `utils`. Native wrappers in `dodo/*/ffi/`. |
-| `cli/` | The `dodo` command line (`run`, `dev`, `test`, `routes`, `doctor`), one Mojo binary; `pixi run cli-build` builds `build/bin/dodo`. |
+| `cli/` | The `dodo` command line (`run`, `dev`, `test`, `routes`, `doctor`, `docs pull`), one Mojo binary; `pixi run cli-build` builds `build/bin/dodo`. |
 | `tests/` | One dir per package. `tests/compile_fail/` holds programs that must fail to build with the message in their first line. `tests/tools/run_tests.sh` builds one binary per dir from `tests/_agg/` (generated). `tests/live/` is not in it: h2spec, Autobahn, and `tests/live/db/` (database suites against Docker). |
 | `fuzz/` | Fuzzers, one per parser, on the vendored harness in `fuzz/mozz/` |
-| `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`, `app-layer-audit.md`), naming, standards, ADRs, the database guide (`databases.md`), the CLI and graceful stop (`cli.md`) |
-| `tools/` | Dev scripts: `ci.sh` (local CI), `docs_pull.py`, `build_native.sh` (builds every FFI wrapper; pixi activation and the recipe both run it, so a new wrapper goes only there), `check_recipe.py` (recipe deps and libraries match the repo), `check_mistakes.py` (plants known bugs one at a time and checks a test fails; `pixi run check-mistakes`) |
+| `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`, `app-layer-audit.md`), naming, standards, ADRs, the database guide (`databases.md`), the CLI and graceful stop (`cli.md`), the generated API (`api/`) and the index of it all (`index.md`); CI fails when those two are stale |
+| `mojo-docs/`, `dodo-docs/` | The docs `dodo docs pull` hands out, one folder per release, read from `dev` |
+| `tools/` | Dev scripts: `ci.sh` (local CI), `save_docs.py` (saves `mojo-docs/<version>/`, generates `docs/api/` and `docs/index.md`, and copies `docs/` to `dodo-docs/<version>/` at a release; tested by `test_docs_tools.py`), `build_native.sh` (builds every FFI wrapper; pixi activation and the recipe both run it, so a new wrapper goes only there), `check_recipe.py` (recipe deps and libraries match the repo), `check_mistakes.py` (plants known bugs one at a time and checks a test fails; `pixi run check-mistakes`) |
 | `research/` | Throwaway spikes and audit harnesses (probe servers, fuzzers). Not shipped. |
 | `packaging/` | Conda recipe for the modular-community channel, its smoke tests, `build_local.sh` (builds and tests the package from this checkout) |
 | `.github/` | Issue and PR templates. There is no CI on GitHub: `pixi run ci` (`tools/ci.sh`) runs the checks and every test on this machine, plus the conda package build when the branch changes packaging, wrappers or pixi. Run it on macOS and Linux (WSL) before merging into `dev` |

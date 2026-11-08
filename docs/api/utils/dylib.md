@@ -1,0 +1,121 @@
+# `dodo.utils.dylib`
+
+Canonical FFI dylib path resolver shared across :mod:`dodo`.
+
+Every call site that opens a dodo-bundled shared object goes
+through :func:`find_dodo_lib`; the bundled shim's name (the ``X`` in
+``libdodo_X.so``) is the only argument.
+
+Library naming convention
+-------------------------
+
+dodo bundles six FFI shims under ``$CONDA_PREFIX/lib/``:
+
+* ``libdodo_tls.so`` -- OpenSSL hooks (TLS handshake, AEAD,
+  hkdf, hmac, sha1) plus the ``dodo_read`` / ``dodo_write``
+  thin wrappers used by :mod:`dodo.net._libc_fileio`.
+* ``libdodo_zlib.so`` -- zlib + gzip + raw-deflate thin
+  wrappers consumed by :mod:`dodo.http.encoding` (HTTP
+  ``Content-Encoding``) and :mod:`dodo.ws.permessage_deflate`
+  (WebSocket ``permessage-deflate``).
+* ``libdodo_brotli.so`` -- libbrotlienc + libbrotlidec
+  consumed by :mod:`dodo.http.encoding` for ``Content-Encoding:
+  br``.
+* ``libdodo_fs.so`` -- ``access(2)`` + ``open(2)`` +
+  ``read(2)`` + ``close(2)`` thin wrappers consumed by
+  :mod:`dodo.http.fs` (``FileServer`` static-file path).
+* ``libdodo_simdjson.so`` -- simdjson parsing into a ``Document``
+  tape, consumed by :mod:`dodo.json` (``loads``).
+* ``libdodo_proc.so`` -- spawn, wait for and signal processes, and
+  record signals, consumed by :mod:`dodo.utils.process` and
+  :mod:`dodo.utils.signals`.
+
+Search order (used by every call site):
+1. ``$DODO_LIB_DIR/libdodo_<name>.so`` -- when ``DODO_LIB_DIR`` is
+   an absolute path; for running outside pixi.
+2. ``$CONDA_PREFIX/lib/libdodo_<name>.so`` -- the canonical
+   install location, populated by ``dodo/<sub>/ffi/build.sh``
+   on pixi activation.
+3. The bare ``libdodo_<name>.so``, which ``dlopen`` resolves on the
+   system library path. Never the working directory.
+The path is built via ``String("") += prefix += literal``
+rather than the ``prefix + literal`` concat operator. See the
+:mod:`dodo.tls.config` module docstring for the full rationale
+(Mojo's concat can return a String whose buffer aliases another
+``getenv`` + literal result, so two sequential
+``CONDA_PREFIX + ...`` calls can clobber each other's bytes).
+
+Public API
+----------
+
+``find_dodo_lib(name: String) -> String``
+    Resolves ``libdodo_<name>.so`` in the order above. ``name`` is
+    the bare suffix (``"tls"``, ``"zlib"``, ``"brotli"``, ``"fs"``,
+    ``"simdjson"``, ``"proc"``).
+
+``dl_sym[FT](lib: OwnedDLHandle, name: String) raises -> FT``
+    Resolve a C-ABI function symbol as a plain function pointer.
+    ``OwnedDLHandle.get_function`` returns an origin-bound
+    ``_DLCallable`` that cannot be stored, so every FFI call site in
+    :mod:`dodo` uses ``get_symbol`` and reinterprets the address.
+
+## Functions
+
+### `dl_sym`
+
+```mojo
+def dl_sym[FT: TrivialRegisterPassable](lib: OwnedDLHandle, name: String) raises -> FT
+```
+
+Look up a C-ABI function symbol as a plain callable value.
+
+Replaces the ``lib.get_function[FT](name)`` idiom, whose return
+type (an origin-bound ``_DLCallable``) can no longer be invoked
+directly or stored across scopes.
+
+### `find_dodo_lib`
+
+```mojo
+def find_dodo_lib(name: String) -> String
+```
+
+Return the path to ``libdodo_<name>.so``.
+
+Search order:
+
+1. ``$DODO_LIB_DIR/libdodo_<name>.so``, when ``DODO_LIB_DIR``
+   is an absolute path. For running outside pixi, e.g. a bare
+   checkout with ``DODO_LIB_DIR=$PWD/build``.
+2. ``$CONDA_PREFIX/lib/libdodo_<name>.so``, when ``CONDA_PREFIX``
+   is absolute: the install that ``dodo/<sub>/ffi/build.sh``
+   populates on pixi activation.
+3. The bare file name, which ``dlopen`` looks up on the system
+   library path (``LD_LIBRARY_PATH`` / ``DYLD_LIBRARY_PATH``,
+   rpath, the system directories). It never looks in the working
+   directory.
+
+The working directory is never searched: a program started from a
+directory someone else can write to (a shared ``/tmp``, a
+checked-out repository) would load and run whatever library it
+found there.
+
+Args:
+
+- `name`: The bare suffix, e.g. ``"tls"`` for ``libdodo_tls.so``.
+
+Returns: Path string suitable for passing to ``OwnedDLHandle(path)``.
+
+### `pinned_dodo_lib`
+
+```mojo
+def pinned_dodo_lib[name: StringSpan[ImmStaticOrigin]]() raises -> Pointer[OwnedDLHandle, MutUntrackedOrigin]
+```
+
+The process-wide handle to ``libdodo_<name>.so``, opened once.
+
+A per-call ``OwnedDLHandle`` costs a dlopen, symbol lookups and a
+dlclose under the loader lock every worker shares, and unmaps the
+library between calls when nothing else holds it. This one is opened
+on first use and never closed.
+
+Raises: Error: If the library cannot be loaded.

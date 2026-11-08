@@ -1,0 +1,57 @@
+# @export
+
+*From Modular's Mojo docs (`Mojo/docs/site/reference/decorators/export.mdx` at tag `mojo/v1.2.0`, Apache-2.0 with LLVM Exceptions, see `LICENSE.txt`), turned into plain Markdown by dodo.*
+
+You can add the `@export` decorator on any function to make it publicly
+available as an exported symbol in the compiled artifact, allowing it to be
+called from external code. An `@export` function must declare its calling
+convention with an explicit [`abi`](../../reference/function-declarations.md#abi-c)
+effect.
+
+```mojo
+# This function is internal - not an exported symbol
+def internal_helper():
+    print("Internal")
+
+# This function is exported under its own name, "my_exported_function"
+@export
+def my_exported_function() abi("Mojo"):
+    print("Exported!")
+    internal_helper()
+
+# This function is exported under the name "my_renamed_function"
+@export("my_renamed_function")
+def my_other_function() abi("Mojo"):
+    print("Another function.")
+```
+
+The `@export` decorator can take an optional argument:
+
+- An alternate name to export the function under, as shown above.
+
+Use the name specifier and `abi("C")` effect to export a function that complies
+with the C calling conventions. You must also supply a function name that is a
+valid C identifier. For example:
+
+```mojo
+@export("my_func")
+def my_function(
+    name: StaticString,
+    ptr: OpaquePointer[MutUntrackedOrigin],
+) abi("C") -> None:
+    pass
+```
+
+**Note: Initialize the runtime in shared libraries**
+If you compile an exported function into a shared library
+(`mojo build --emit shared-lib`) and call it from a non-Mojo host program
+such as C or C++, no Mojo `main()` function runs, so the Mojo runtime is
+never initialized. Call
+[`initialize_runtime()`](../../std/runtime/index.md#initialize_runtime)
+before calling any other standard library functions. See
+[Call a Mojo shared library from C or
+C++](../../tools/compilation.md#call-a-mojo-shared-library-from-c-or-c)
+for details.
+
+To call Mojo from Python, register functions with a module builder. See
+[Calling Mojo from Python](../../manual/python/mojo-from-python.md) for details.

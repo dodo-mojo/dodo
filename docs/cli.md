@@ -11,7 +11,8 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 | `dodo test [PATH...]` | Build every `tests/**/test_*.mojo` in parallel and run each. `--only NAME`, `--jobs N`, `--timeout SECONDS`. |
 | `dodo routes [FILE]` | List the app's routes. |
 | `dodo doctor` | Check the toolchain, the project and the machine. |
-| `dodo new`, `dodo docs pull` | Not built yet (`TODO.md`). |
+| `dodo docs pull [mojo@V] [dodo@V]` | Download the Mojo and dodo docs into `.dodo/docs/`. `--mojo V`, `--dodo V`. |
+| `dodo new` | Not built yet (`TODO.md`). |
 
 ## Exit codes
 
@@ -33,6 +34,15 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 - An app that exits by itself is reported and starts again on the next save.
 - The app and each build run in their own process group, so Ctrl-C reaches only dodo. dodo stops the app the same way and exits with 130. A second Ctrl-C half a second or more later kills the app at once.
 - With `--json`, each event is one line on stdout among the app's own output: `{"dodo_dev": {"event": "listening" | "building" | "build_failed" | "started" | "app_exited" | "stopped", ...}}`.
+
+## How `dodo docs pull` works
+
+- It pulls two sets of docs: Mojo's for the `mojo --version` on `PATH`, and dodo's for the version of this `dodo`. Name others with `mojo@1.2 dodo@0.1` or `--mojo`/`--dodo`. A short version means the newest saved one it names.
+- Both come from dodo's `dev` branch on GitHub: `mojo-docs/<version>/` and `dodo-docs/<version>/`, each with an `index.md` that lists its files. They land in `.dodo/docs/mojo-<version>/` and `.dodo/docs/dodo-<version>/` of the project root.
+- Files download into a hidden folder that takes the old docs' place only once all are in, so a pull that fails or is stopped keeps the docs you had. A failed half fails the command (exit 69) but keeps the half that worked.
+- An index that links outside its folder is refused. A server error is tried three times. A server silent for 30 s fails the pull.
+- `DODO_DOCS_URL` points the pull at another server (the tests use a local one); `DODO_DOCS_READ_TIMEOUT_MS` changes the 30 s.
+- Saving: `tools/save_docs.py mojo VERSION` saves a Mojo release, and `tools/save_docs.py dodo --release` saves dodo's at each release.
 
 ## Graceful stop
 
