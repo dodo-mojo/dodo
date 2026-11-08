@@ -91,10 +91,14 @@ def pull_mojo(version: str, staging: Path) -> Path | None:
     version."""
     served = served_version(fetch(MOJO_DOCS + "llms.txt").decode("utf-8"))
     if served != version:
+        kept = OUT / f"mojo-{version}"
+        if kept.is_dir():
+            outcome = f"Kept the Mojo docs already in {kept.relative_to(REPO)}."
+        else:
+            outcome = "No Mojo docs for it are pulled yet."
         print(
             f"docs-pull: mojolang.org serves the Mojo {served} docs, but this "
-            f"checkout builds with Mojo {version}. Kept the Mojo docs already "
-            f"in {OUT.relative_to(REPO)}.",
+            f"checkout builds with Mojo {version}. {outcome}",
             file=sys.stderr,
         )
         return None
