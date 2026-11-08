@@ -1,9 +1,7 @@
 """End-to-end tests: build the real `dodo` binary and run it as a user would.
 
-The binary is built with the CLI's own build cache (into `.dodo/build/` of
-this repository), so only the first test of a run pays for the build. The
-apps it builds are the fixtures in `tests/cli/fixtures/`. Run from the
-repository root, as `tests/tools/run_tests.sh` does.
+The apps it builds are the fixtures in `tests/cli/fixtures/`; how the
+binary is built and run is in `dodo_cli.mojo`.
 """
 
 from std.os import getenv, makedirs, remove
@@ -28,98 +26,25 @@ from cli.report import (
 )
 from cli.version import DODO_VERSION
 
+from dodo_cli import Ran, dodo_binary, dodo_run, read_or_empty, scratch
+
 comptime _APP = "tests/cli/fixtures/cli_app.mojo"
 comptime _BROKEN = "tests/cli/fixtures/broken_app.mojo"
 comptime _SUITES = "tests/cli/fixtures/suites"
-
-
-struct Ran(Movable):
-    """How one `dodo` command line ended."""
-
-    var code: Int
-    var out: String
-    var err: String
-
-    def __init__(out self, code: Int, var out: String, var err: String):
-        self.code = code
-        self.out = out^
-        self.err = err^
-
-    def json(self) raises -> Value:
-        """The stdout as the one JSON object `--json` promises."""
-        var lines = self.out.strip().splitlines()
-        assert_equal(
-            len(lines), 1, String("stdout is not one line: ", self.out)
-        )
-        return loads(String(lines[0]))
-
-
-def _dodo() raises -> String:
-    """The `dodo` binary, built from `cli/main.mojo` when it changed."""
-    var root = realpath(".")
-    var report = Report("test", True)
-    var build = build_app(
-        root,
-        join(root, "cli", "main.mojo"),
-        join(root, ".dodo", "build"),
-        report,
-    )
-    assert_equal(build.exit_code, EXIT_OK, build.log)
-    return build.binary
-
-
-def _scratch(name: String) raises -> String:
-    var dir = join(getenv("TMPDIR", "/tmp"), String("dodo_e2e_", name))
-    _ = run(["rm", "-rf", dir])
-    makedirs(dir, exist_ok=True)
-    return realpath(dir)
-
-
-def _read(path: String) -> String:
-    try:
-        with open(path, "r") as file:
-            return file.read()
-    except:
-        return ""
-
-
-def _dodo_run(
-    words: List[String],
-    env: List[String] = List[String](),
-    cwd: String = "",
-) raises -> Ran:
-    """Run `dodo WORDS...` (in `cwd` when given) and keep what it printed."""
-    var argv = List[String]()
-    if cwd != "":
-        # `sh -c` changes directory, then becomes dodo.
-        argv = ["sh", "-c", 'cd "$1" && shift && exec "$@"', "sh", cwd]
-    argv.append(_dodo())
-    for word in words:
-        argv.append(word)
-    var base = join(
-        getenv("TMPDIR", "/tmp"), String("dodo_e2e_", perf_counter_ns())
-    )
-    var out_path = base + ".out"
-    var err_path = base + ".err"
-    var status = run(argv, env=env, stdout_path=out_path, stderr_path=err_path)
-    var ran = Ran(status.shell_code(), _read(out_path), _read(err_path))
-    remove(out_path)
-    remove(err_path)
-    return ran^
 
 
 # ── version and help ──
 
 
 def test_version() raises:
-    var ran = _dodo_run(["--version"])
+    var ran = dodo_run(["--version"])
     assert_equal(ran.code, EXIT_OK)
     assert_equal(ran.out, String("dodo ", DODO_VERSION, "\n"))
     assert_equal(ran.err, "")
 
 
 def test_version_json() raises:
-    var ran = _dodo_run(["--version", "--json"])
+    var ran = dodo_run(["--version", "--json"])
     assert_equal(ran.code, EXIT_OK)
     var result = ran.json()
     assert_true(result["ok"].as_bool())
@@ -128,14 +53,14 @@ def test_version_json() raises:
 
 
 def test_help_lists_commands() raises:
-    var ran = _dodo_run(List[String]())
+    var ran = dodo_run(List[String]())
     assert_equal(ran.code, EXIT_OK)
     for name in ["new", "run", "dev", "test", "routes", "doctor", "docs pull"]:
         assert_true(name in ran.out, String("help misses ", name))
 
 
 def test_unknown_command() raises:
-    var ran = _dodo_run(["serve"])
+    var ran = dodo_run(["serve"])
     assert_equal(ran.code, EXIT_USAGE)
     assert_equal(ran.out, "")
     assert_true("serve" in ran.err)
@@ -143,7 +68,7 @@ def test_unknown_command() raises:
 
 
 def test_unknown_command_json() raises:
-    var ran = _dodo_run(["serve", "--json"])
+    var ran = dodo_run(["serve", "--json"])
     assert_equal(ran.code, EXIT_USAGE)
     assert_equal(ran.err, "")
     var result = ran.json()
@@ -153,7 +78,7 @@ def test_unknown_command_json() raises:
 
 
 def test_unknown_flag() raises:
-    var ran = _dodo_run(["routes", "--colour"])
+    var ran = dodo_run(["routes", "--colour"])
     assert_equal(ran.code, EXIT_USAGE)
     assert_true("--colour" in ran.err)
     assert_true("dodo routes --help" in ran.err)
@@ -163,13 +88,13 @@ def test_unknown_flag() raises:
 
 
 def test_routes_lists_the_app() raises:
-    var ran = _dodo_run(["routes", _APP])
+    var ran = dodo_run(["routes", _APP])
     assert_equal(ran.code, EXIT_OK, ran.err)
     assert_equal(ran.out, "GET  /\nGET  /slow  (blocking)\n")
 
 
 def test_routes_json() raises:
-    var ran = _dodo_run(["--json", "routes", _APP])
+    var ran = dodo_run(["--json", "routes", _APP])
     assert_equal(ran.code, EXIT_OK, ran.out)
     assert_equal(ran.err, "")
     var result = ran.json()
@@ -187,13 +112,13 @@ def test_routes_json() raises:
 
 
 def test_routes_second_run_skips_the_build() raises:
-    _ = _dodo_run(["routes", _APP])
-    var result = _dodo_run(["routes", _APP, "--json"]).json()
+    _ = dodo_run(["routes", _APP])
+    var result = dodo_run(["routes", _APP, "--json"]).json()
     assert_false(result["built"].as_bool())
 
 
 def test_routes_app_crashes() raises:
-    var ran = _dodo_run(["routes", _APP, "--json"], env=["CLI_APP_MODE=crash"])
+    var ran = dodo_run(["routes", _APP, "--json"], env=["CLI_APP_MODE=crash"])
     assert_equal(ran.code, EXIT_FAILED)
     var result = ran.json()
     assert_equal(result["error"]["kind"].as_string(), "app_failed")
@@ -202,7 +127,7 @@ def test_routes_app_crashes() raises:
 
 
 def test_routes_app_never_serves() raises:
-    var ran = _dodo_run(["routes", _APP], env=["CLI_APP_MODE=no_serve"])
+    var ran = dodo_run(["routes", _APP], env=["CLI_APP_MODE=no_serve"])
     assert_equal(ran.code, EXIT_FAILED)
     assert_equal(ran.out, "")
     assert_true("without calling serve()" in ran.err)
@@ -210,7 +135,7 @@ def test_routes_app_never_serves() raises:
 
 def test_routes_timeout() raises:
     var started = perf_counter_ns()
-    var ran = _dodo_run(
+    var ran = dodo_run(
         ["routes", _APP, "--timeout", "0.5", "--json"],
         env=["CLI_APP_MODE=hang"],
     )
@@ -222,13 +147,13 @@ def test_routes_timeout() raises:
 
 def test_routes_bad_timeout() raises:
     for bad in ["abc", "0", "-2", "99999"]:
-        var ran = _dodo_run(["routes", _APP, "--timeout", bad])
+        var ran = dodo_run(["routes", _APP, "--timeout", bad])
         assert_equal(ran.code, EXIT_USAGE, String(bad))
         assert_true("--timeout" in ran.err)
 
 
 def test_routes_build_failure() raises:
-    var ran = _dodo_run(["routes", _BROKEN])
+    var ran = dodo_run(["routes", _BROKEN])
     assert_equal(ran.code, EXIT_BUILD_FAILED)
     assert_equal(ran.out, "")
     assert_true("cannot implicitly convert" in ran.err)
@@ -236,7 +161,7 @@ def test_routes_build_failure() raises:
 
 
 def test_routes_build_failure_json() raises:
-    var ran = _dodo_run(["routes", _BROKEN, "--json"])
+    var ran = dodo_run(["routes", _BROKEN, "--json"])
     assert_equal(ran.code, EXIT_BUILD_FAILED)
     assert_equal(ran.err, "")
     var result = ran.json()
@@ -246,17 +171,17 @@ def test_routes_build_failure_json() raises:
 
 
 def test_routes_missing_or_wrong_file() raises:
-    var missing = _dodo_run(["routes", "nope.mojo", "--json"])
+    var missing = dodo_run(["routes", "nope.mojo", "--json"])
     assert_equal(missing.code, EXIT_USAGE)
     assert_equal(missing.json()["error"]["kind"].as_string(), "not_found")
-    var not_mojo = _dodo_run(["routes", "README.md"])
+    var not_mojo = dodo_run(["routes", "README.md"])
     assert_equal(not_mojo.code, EXIT_USAGE)
     assert_true("is not a .mojo file" in not_mojo.err)
 
 
 def test_routes_without_main_mojo() raises:
-    var dir = _scratch("no_main")
-    var ran = _dodo_run(["routes"], cwd=dir)
+    var dir = scratch("no_main")
+    var ran = dodo_run(["routes"], cwd=dir)
     assert_equal(ran.code, EXIT_USAGE)
     assert_true("no main.mojo" in ran.err)
 
@@ -265,7 +190,7 @@ def test_routes_without_main_mojo() raises:
 
 
 def test_run_passes_arguments_and_exit_code() raises:
-    var ran = _dodo_run(
+    var ran = dodo_run(
         ["run", _APP, "--", "3", "hello world", "--json"],
         env=["CLI_APP_MODE=args"],
     )
@@ -274,7 +199,7 @@ def test_run_passes_arguments_and_exit_code() raises:
 
 
 def test_run_json_reports_before_the_app() raises:
-    var ran = _dodo_run(
+    var ran = dodo_run(
         ["run", "--json", _APP, "--", "0"], env=["CLI_APP_MODE=args"]
     )
     assert_equal(ran.code, EXIT_OK)
@@ -288,13 +213,13 @@ def test_run_json_reports_before_the_app() raises:
 
 
 def test_run_app_error_is_its_exit_code() raises:
-    var ran = _dodo_run(["run", _APP], env=["CLI_APP_MODE=crash"])
+    var ran = dodo_run(["run", _APP], env=["CLI_APP_MODE=crash"])
     assert_equal(ran.code, 1)
     assert_true("database is down" in ran.err)
 
 
 def test_run_build_failure() raises:
-    var ran = _dodo_run(["run", _BROKEN, "--", "x"])
+    var ran = dodo_run(["run", _BROKEN, "--", "x"])
     assert_equal(ran.code, EXIT_BUILD_FAILED)
     assert_true("cannot implicitly convert" in ran.err)
 
@@ -303,7 +228,7 @@ def test_run_build_failure() raises:
 
 
 def test_doctor_in_the_repository() raises:
-    var ran = _dodo_run(["doctor", "--json"])
+    var ran = dodo_run(["doctor", "--json"])
     var result = ran.json()
     assert_equal(Int(result["exit_code"].as_int()), ran.code)
     var names = List[String]()
@@ -325,8 +250,8 @@ def test_doctor_in_the_repository() raises:
 
 
 def test_doctor_outside_a_project() raises:
-    var dir = _scratch("doctor")
-    var result = _dodo_run(["doctor", "--json"], cwd=dir).json()
+    var dir = scratch("doctor")
+    var result = dodo_run(["doctor", "--json"], cwd=dir).json()
     var checks = result["checks"].copy()
     for i in range(len(checks)):
         var name = checks[i]["name"].as_string()
@@ -336,13 +261,13 @@ def test_doctor_outside_a_project() raises:
 
 
 def test_doctor_text() raises:
-    var ran = _dodo_run(["doctor"])
+    var ran = dodo_run(["doctor"])
     assert_true(ran.out.startswith("ok    machine"), ran.out)
     assert_true("native libraries" in ran.out)
 
 
 def test_doctor_takes_no_arguments() raises:
-    var ran = _dodo_run(["doctor", "now"])
+    var ran = dodo_run(["doctor", "now"])
     assert_equal(ran.code, EXIT_USAGE)
     assert_true("takes no arguments" in ran.err)
 
@@ -379,7 +304,7 @@ def test_test_every_outcome() raises:
     # Every fixture but the hanging one, which has its own test: a short
     # --timeout here could also stop a slow first launch of a new binary.
     var dir = _suites_project()
-    var ran = _dodo_run(
+    var ran = dodo_run(
         [
             "test",
             "tests/passing",
@@ -414,14 +339,14 @@ def test_test_every_outcome() raises:
 
     # The test ran from the project root and its background program was
     # killed once the test file ended.
-    var pid = String(_read(join(dir, "leftover.pid")).strip())
+    var pid = String(read_or_empty(join(dir, "leftover.pid")).strip())
     assert_true(pid != "")
     assert_false(_is_running(pid))
 
 
 def test_test_timeout() raises:
     var dir = _suites_project()
-    var ran = _dodo_run(
+    var ran = dodo_run(
         ["test", "tests/hang", "--timeout", "0.5", "--json"], cwd=dir
     )
     assert_equal(ran.code, EXIT_FAILED, ran.out)
@@ -438,7 +363,7 @@ def test_test_timeout() raises:
 
 def test_test_text_report() raises:
     var dir = _suites_project()
-    var ran = _dodo_run(["test", "tests/passing", "tests/failing"], cwd=dir)
+    var ran = dodo_run(["test", "tests/passing", "tests/failing"], cwd=dir)
     assert_equal(ran.code, EXIT_FAILED)
     var lines = ran.out.strip().splitlines()
     assert_true(
@@ -462,8 +387,8 @@ def test_test_text_report() raises:
 
 def test_test_second_run_builds_nothing() raises:
     var dir = _suites_project()
-    _ = _dodo_run(["test", "tests/passing"], cwd=dir)
-    var ran = _dodo_run(["test", "tests/passing", "--json"], cwd=dir)
+    _ = dodo_run(["test", "tests/passing"], cwd=dir)
+    var ran = dodo_run(["test", "tests/passing", "--json"], cwd=dir)
     assert_equal(ran.code, EXIT_OK)
     var files = ran.json()["files"].copy()
     assert_equal(len(files), 2)
@@ -473,7 +398,7 @@ def test_test_second_run_builds_nothing() raises:
 
 def test_test_only_one_test() raises:
     var dir = _suites_project()
-    var ran = _dodo_run(["test", "--only", "test_double", "--json"], cwd=dir)
+    var ran = dodo_run(["test", "--only", "test_double", "--json"], cwd=dir)
     assert_equal(ran.code, EXIT_OK, ran.out)
     var result = ran.json()
     assert_equal(len(result["files"]), 1)
@@ -485,14 +410,14 @@ def test_test_only_one_test() raises:
 
 def test_test_only_unknown_name() raises:
     var dir = _suites_project()
-    var ran = _dodo_run(["test", "--only", "test_nothing"], cwd=dir)
+    var ran = dodo_run(["test", "--only", "test_nothing"], cwd=dir)
     assert_equal(ran.code, EXIT_FAILED)
     assert_true("no test file defines `test_nothing`" in ran.err)
 
 
 def test_test_from_a_subfolder() raises:
     var dir = _suites_project()
-    var ran = _dodo_run(
+    var ran = dodo_run(
         ["test", "--only", "test_add", "--json"],
         cwd=join(dir, "tests", "passing"),
     )
@@ -510,22 +435,22 @@ def test_test_bad_flags_and_paths() raises:
         for bad in ["0", "x", ""]:
             if String(flag) == "--only" and String(bad) != "":
                 continue
-            var ran = _dodo_run(
+            var ran = dodo_run(
                 ["test", String(flag), String(bad), "tests/passing"], cwd=dir
             )
             assert_equal(ran.code, EXIT_USAGE, String(flag, " ", bad))
-    var missing = _dodo_run(["test", "tests/nope", "--json"], cwd=dir)
+    var missing = dodo_run(["test", "tests/nope", "--json"], cwd=dir)
     assert_equal(missing.code, EXIT_USAGE)
     assert_equal(missing.json()["error"]["kind"].as_string(), "not_found")
-    var not_mojo = _dodo_run(["test", "tests/README.md"], cwd=dir)
+    var not_mojo = dodo_run(["test", "tests/README.md"], cwd=dir)
     assert_equal(not_mojo.code, EXIT_USAGE)
 
 
 def test_test_without_tests_folder() raises:
-    var dir = _scratch("empty_project")
+    var dir = scratch("empty_project")
     with open(join(dir, "pixi.toml"), "w") as file:
         file.write("")
-    var ran = _dodo_run(["test", "--json"], cwd=dir)
+    var ran = dodo_run(["test", "--json"], cwd=dir)
     assert_equal(ran.code, EXIT_FAILED)
     assert_equal(ran.json()["error"]["kind"].as_string(), "no_tests")
 
@@ -533,7 +458,7 @@ def test_test_without_tests_folder() raises:
 def test_test_interrupted() raises:
     var dir = _suites_project()
     # Build the hanging test first, so the interrupt lands while it runs.
-    _ = _dodo_run(["test", "tests/hang", "--timeout", "0.5"], cwd=dir)
+    _ = dodo_run(["test", "tests/hang", "--timeout", "0.5"], cwd=dir)
     var out_path = join(dir, "interrupted.out")
     var child = spawn(
         [
@@ -542,7 +467,7 @@ def test_test_interrupted() raises:
             'cd "$1" && shift && exec "$@"',
             "sh",
             dir,
-            _dodo(),
+            dodo_binary(),
             "test",
             "tests/hang",
         ],
@@ -553,7 +478,7 @@ def test_test_interrupted() raises:
     child.send_signal(2)
     var status = child.wait()
     assert_equal(status.shell_code(), EXIT_INTERRUPTED)
-    var output = _read(out_path)
+    var output = read_or_empty(out_path)
     assert_true("STOPPED tests/hang/test_hang.mojo" in output, output)
     var left = run(
         ["pgrep", "-f", "tests__hang__test_hang"], stdout_path="/dev/null"
@@ -564,7 +489,7 @@ def test_test_interrupted() raises:
 def test_test_interrupted_while_building() raises:
     # A fresh project, so dodo has to build; the builds run in process
     # groups of their own, so only dodo can stop them.
-    var dir = _scratch("interrupt_build")
+    var dir = scratch("interrupt_build")
     makedirs(join(dir, "tests"), exist_ok=True)
     _ = run(["cp", "-R", _SUITES + "/passing/.", join(dir, "tests")])
     with open(join(dir, "pixi.toml"), "w") as file:
@@ -578,7 +503,7 @@ def test_test_interrupted_while_building() raises:
             'cd "$1" && shift && exec "$@"',
             "sh",
             dir,
-            _dodo(),
+            dodo_binary(),
             "test",
         ],
         stdout_path=out_path,
@@ -592,12 +517,12 @@ def test_test_interrupted_while_building() raises:
         tries += 1
         var found = run(["pgrep", "-f", builds], stdout_path="/dev/null")
         building = found.succeeded()
-    assert_true(building, _read(out_path))
+    assert_true(building, read_or_empty(out_path))
 
     child.send_signal(2)
     var status = child.wait()
     assert_equal(status.shell_code(), EXIT_INTERRUPTED)
-    assert_true("stopped while building" in _read(out_path))
+    assert_true("stopped while building" in read_or_empty(out_path))
     sleep(0.1)
     var left = run(["pgrep", "-f", builds], stdout_path="/dev/null")
     assert_false(left.succeeded())
@@ -631,7 +556,7 @@ def _dev_project(name: String, main: String) raises -> String:
     """A project whose `main.mojo` is `main` and imports dodo through a
     link to this repository's package (the watcher does not follow
     links)."""
-    var dir = _scratch(name)
+    var dir = scratch(name)
     _ = run(["ln", "-s", realpath("dodo"), join(dir, "dodo")])
     with open(join(dir, "pixi.toml"), "w") as file:
         file.write("")
@@ -658,7 +583,7 @@ def _get(url: String) raises -> String:
     var status = run(
         ["curl", "-s", "-m", "5", "-o", path, url], stderr_path="/dev/null"
     )
-    var body = _read(path)
+    var body = read_or_empty(path)
     _ = run(["rm", "-f", path])
     if not status.succeeded():
         return String("refused (curl ", status, ")")
@@ -668,7 +593,7 @@ def _get(url: String) raises -> String:
 def _dev_events(out_path: String, name: String) raises -> List[Value]:
     """Every `dodo dev` event called `name` printed so far."""
     var found = List[Value]()
-    for line in _read(out_path).splitlines():
+    for line in read_or_empty(out_path).splitlines():
         if not line.startswith('{"dodo_dev"'):
             continue
         var event = loads(String(line))["dodo_dev"].copy()
@@ -682,7 +607,7 @@ def _wait_for_event(out_path: String, name: String, count: Int) raises:
     times."""
     var tries = 0
     while len(_dev_events(out_path, name)) < count:
-        var why = String("no ", name, ":\n", _read(out_path))
+        var why = String("no ", name, ":\n", read_or_empty(out_path))
         assert_true(tries < 12000, why)
         sleep(0.01)
         tries += 1
@@ -695,9 +620,9 @@ def _wait_for_body(url: String, want: String, out_path: String) raises:
     var body = _get(url)
     while body != want:
         if body.startswith("refused"):
-            raise Error(body, " during a restart:\n", _read(out_path))
+            raise Error(body, " during a restart:\n", read_or_empty(out_path))
         var why = String(
-            "never `", want, "`, last `", body, "`:\n", _read(out_path)
+            "never `", want, "`, last `", body, "`:\n", read_or_empty(out_path)
         )
         assert_true(tries < 1200, why)
         sleep(0.1)
@@ -714,7 +639,7 @@ def _start_dev(dir: String, json: Bool) raises -> Child:
         'cd "$1" && shift && exec "$@"',
         "sh",
         dir,
-        _dodo(),
+        dodo_binary(),
         "dev",
         "--port",
         "0",
@@ -771,7 +696,7 @@ def _dev_session_steps(dir: String, mut dodo: Child) raises:
     _save_version(dir, "v2")
     _wait_for_body(url, '"v2"', out_path)
     assert_true(slow.wait().succeeded())
-    assert_equal(_read(slow_path), '"slow done"')
+    assert_equal(read_or_empty(slow_path), '"slow done"')
     assert_true(_dev_events(out_path, "started")[1]["restart"].as_bool())
 
     # A broken save keeps the last good build serving.
@@ -800,11 +725,11 @@ def _dev_session_steps(dir: String, mut dodo: Child) raises:
     # Ctrl-C stops the app and closes the port.
     var app_pid = _dev_events(out_path, "started")[3]["pid"].as_int()
     var status = _stop_dev(dodo)
-    assert_equal(status.shell_code(), EXIT_INTERRUPTED, _read(err_path))
+    assert_equal(status.shell_code(), EXIT_INTERRUPTED, read_or_empty(err_path))
     assert_equal(len(_dev_events(out_path, "stopped")), 1)
     assert_false(_is_running(String(app_pid)), "the app outlived dodo")
     assert_true(_get(url).startswith("refused"))
-    var lines = _read(out_path).strip().splitlines()
+    var lines = read_or_empty(out_path).strip().splitlines()
     var result = loads(String(lines[len(lines) - 1]))
     assert_equal(result["command"].as_string(), "dev")
     assert_equal(result["url"].as_string(), url)
@@ -817,23 +742,23 @@ def test_dev_text_output() raises:
     var err_path = join(dir, "dev.err")
     var dodo = _start_dev(dir, json=False)
     var tries = 0
-    while "started in" not in _read(err_path) and tries < 12000:
+    while "started in" not in read_or_empty(err_path) and tries < 12000:
         sleep(0.01)
         tries += 1
     var status = _stop_dev(dodo)
     assert_equal(status.shell_code(), EXIT_INTERRUPTED)
-    var err = _read(err_path)
+    var err = read_or_empty(err_path)
     assert_true("started in" in err, err)
     assert_true("dodo dev: serving " in err, err)
     assert_true("(Ctrl-C to stop)" in err, err)
     assert_true("dodo dev: stopped" in err, err)
-    assert_equal(_read(join(dir, "dev.out")), "")
+    assert_equal(read_or_empty(join(dir, "dev.out")), "")
 
 
 def test_dev_port_in_use() raises:
     var taken = TcpListener.bind(SocketAddr.localhost(0))
     var port = String(Int(taken.local_addr().port))
-    var ran = _dodo_run(["dev", _APP, "--port", port, "--json"])
+    var ran = dodo_run(["dev", _APP, "--port", port, "--json"])
     assert_equal(ran.code, EXIT_UNAVAILABLE)
     var error = ran.json()["error"].copy()
     assert_equal(error["kind"].as_string(), "listen")
@@ -843,16 +768,16 @@ def test_dev_port_in_use() raises:
 
 def test_dev_bad_flags_and_files() raises:
     for port in ["", "-1", "65536", "abc"]:
-        var ran = _dodo_run(["dev", _APP, "--port", port, "--json"])
+        var ran = dodo_run(["dev", _APP, "--port", port, "--json"])
         assert_equal(ran.code, EXIT_USAGE, port)
         assert_equal(ran.json()["error"]["kind"].as_string(), "usage")
-    var bad_host = _dodo_run(["dev", _APP, "--host", "example.com"])
+    var bad_host = dodo_run(["dev", _APP, "--host", "example.com"])
     assert_equal(bad_host.code, EXIT_USAGE)
     assert_true("--host" in bad_host.err, bad_host.err)
-    var missing = _dodo_run(["dev", "nope.mojo", "--json"])
+    var missing = dodo_run(["dev", "nope.mojo", "--json"])
     assert_equal(missing.code, EXIT_USAGE)
     assert_equal(missing.json()["error"]["kind"].as_string(), "not_found")
-    var too_many = _dodo_run(["dev", _APP, _APP])
+    var too_many = dodo_run(["dev", _APP, _APP])
     assert_equal(too_many.code, EXIT_USAGE)
 
 
@@ -956,8 +881,8 @@ def test_dev_kills_an_app_that_ignores_sigterm() raises:
 def _wait_for_text(path: String, text: String) raises:
     """Wait up to 30 s until the file at `path` holds `text`."""
     var tries = 0
-    while text not in _read(path):
-        assert_true(tries < 3000, String("no `", text, "`:\n", _read(path)))
+    while text not in read_or_empty(path):
+        assert_true(tries < 3000, String("no `", text, "`:\n", read_or_empty(path)))
         sleep(0.01)
         tries += 1
 

@@ -335,6 +335,88 @@ MISTAKES = [
         "            if not h2[].should_close:\n                var step = h2[].begin_close(config)",
         "            if False:\n                var step = h2[].begin_close(config)",
     ),
+    Mistake(
+        "a docs index counts links inside code blocks",
+        "cli/docs_index.mojo",
+        '        if fence != "":\n',
+        '        if False:\n',
+    ),
+    Mistake(
+        "a docs index may link to hidden or parent folders",
+        "cli/docs_index.mojo",
+        '        if String(part).startswith("."):\n',
+        '        if String(part) == "never":\n',
+    ),
+    Mistake(
+        "a short version picks the first match, not the newest",
+        "cli/docs_index.mojo",
+        'if best == "" or _newer(parts, best_parts):',
+        'if best == "":',
+    ),
+    Mistake(
+        "a failed docs swap does not put the old docs back",
+        "cli/docs_folder.mojo",
+        "            move_path(aside, target)\n",
+        "            pass\n",
+    ),
+    Mistake(
+        "removing a docs folder follows symlinks",
+        "cli/docs_folder.mojo",
+        "    if islink(path):\n",
+        "    if False:\n",
+    ),
+    Mistake(
+        "a failed docs pull leaves its half-done folder",
+        "cli/cmd_docs.mojo",
+        "        _remove_quietly(staging)\n",
+        "",
+    ),
+    Mistake(
+        "docs pull saves an error page as a file",
+        "cli/cmd_docs.mojo",
+        "        raise Error(_bad_status(url, reply.status))\n",
+        "        pass\n",
+    ),
+    Mistake(
+        "docs pull does not retry a server error",
+        "cli/cmd_docs.mojo",
+        ".with_read_timeout(read_timeout).with_retry(RetryPolicy())",
+        ".with_read_timeout(read_timeout)",
+    ),
+    Mistake(
+        "a missing dodo version does not fail the pull",
+        "cli/cmd_docs.mojo",
+        """    if dodo.failed():
+        return report.fail(
+            dodo.error_kind, dodo.error, EXIT_UNAVAILABLE, hint=dodo.hint
+        )
+""",
+        "",
+    ),
+    Mistake(
+        "docs pull takes the dodo version twice",
+        "cli/cmd_docs.mojo",
+        "            if dodo_given:\n",
+        "            if False:\n",
+    ),
+    Mistake(
+        "docs pull defaults to the wrong dodo version",
+        "cli/cmd_docs.mojo",
+        "        pulled.version = DODO_VERSION\n",
+        '        pulled.version = "0.0.0"\n',
+    ),
+    Mistake(
+        "docs pull fetches links that leave the docs folder",
+        "cli/cmd_docs.mojo",
+        "        if not is_safe_path(link):\n",
+        "        if False:\n",
+    ),
+    Mistake(
+        "docs pull ignores DODO_DOCS_READ_TIMEOUT_MS",
+        "cli/cmd_docs.mojo",
+        "        read_timeout = Int(given)\n",
+        "        _ = Int(given)\n",
+    ),
 ]
 
 
