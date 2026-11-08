@@ -29,6 +29,7 @@ step_checks() {
   pixi run check-sans-io
   pixi run check-no-http-http2-cycle
   pixi run check-package
+  python3 tools/test_docs_tools.py
 }
 
 step_package() {
