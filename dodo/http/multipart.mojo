@@ -28,7 +28,7 @@ This module ships:
   name plus iteration in receive order.
 - ``parse_multipart_form_data`` — bytes + ``Content-Type`` header →
   ``MultipartForm``. The ``Multipart`` extractor in
-  [`extract.mojo`](extract.mojo) is the typed wrapper.
+  ``dodo.http.extract`` is the typed wrapper.
 
 The parser is buffered (the entire body is a ``List[UInt8]`` already
 held by ``Request.body``); a streaming variant on top of

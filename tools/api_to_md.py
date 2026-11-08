@@ -12,6 +12,7 @@ out most of them.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
@@ -207,7 +208,10 @@ def _function(decl: dict, level: str, owner: str) -> List[str]:
     overloads = decl.get("overloads", [])
     lines = [f"{level} `{owner}{decl['name']}`", ""]
     for overload in overloads:
-        lines += ["```mojo", overload.get("signature", decl["name"]), "```", ""]
+        signature = overload.get("signature", decl["name"])
+        if overload.get("raises", False):
+            signature = with_raises(signature)
+        lines += ["```mojo", signature, "```", ""]
         lines += _deprecated(overload)
         lines += _text(overload.get("summary", ""), overload.get("description", ""))
         if overload.get("constraints", "") != "":
@@ -223,6 +227,53 @@ def _function(decl: dict, level: str, owner: str) -> List[str]:
         if raises_doc != "":
             lines += [f"Raises: {_one_line(raises_doc)}", ""]
     return lines
+
+
+def with_raises(signature: str) -> str:
+    """`def f(x: Int) -> Int` as `def f(x: Int) raises -> Int`.
+
+    `mojo doc` keeps `raises` as a flag and leaves it out of the signature
+    (and drops the error type of `raises E`), so it goes back in right
+    after the argument list. A signature it cannot read is left as is.
+    """
+    args_start = signature.find("(")
+    params_start = signature.find("[")
+    if params_start >= 0 and (args_start < 0 or params_start < args_start):
+        params_end = _closing(signature, params_start)
+        if params_end < 0:
+            return signature
+        args_start = signature.find("(", params_end)
+    if args_start < 0:
+        return signature
+    args_end = _closing(signature, args_start)
+    if args_end < 0:
+        return signature
+    return signature[: args_end + 1] + " raises" + signature[args_end + 1 :]
+
+
+def _closing(text: str, start: int) -> int:
+    """Where the bracket opened at `start` closes, skipping nested brackets
+    and quoted strings; -1 when it never does."""
+    depth = 0
+    quote = ""
+    i = start
+    while i < len(text):
+        char = text[i]
+        if quote != "":
+            if char == "\\":
+                i += 1
+            elif char == quote:
+                quote = ""
+        elif char in "\"'":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
 
 
 def _arguments(label: str, args: List[dict]) -> List[str]:
@@ -249,8 +300,90 @@ def _text(summary: str, description: str) -> List[str]:
     if summary.strip() != "":
         lines += [summary.strip(), ""]
     if description.strip() != "":
-        lines += [description.strip(), ""]
+        lines += [fence_indented_code(description.strip()), ""]
     return lines
+
+
+def fence_indented_code(text: str) -> str:
+    """Docstrings often show code as a block indented under a line ending
+    in `:` ("Example:"). Markdown reads that as text when no blank line
+    comes first, and links appear in it. Such a block becomes a fenced
+    `mojo` block; fenced code and list items are left alone. `mojo doc`
+    takes the indent off an `Example:` section of a function, so the
+    lines right under one, up to a blank line, are code too."""
+    lines = text.split("\n")
+    out: List[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if not in_fence and _is_bare_example(line, out):
+            block = []
+            while i < len(lines) and lines[i].strip() != "":
+                block.append(lines[i])
+                i += 1
+            out += ["", "```mojo"] + block + ["```", ""]
+            continue
+        if in_fence or not _starts_code(line, out):
+            out.append(line)
+            i += 1
+            continue
+        block: List[str] = []
+        while i < len(lines) and (lines[i].strip() == "" or lines[i].startswith("    ")):
+            block.append(lines[i][4:])
+            i += 1
+        while block and block[-1].strip() == "":
+            block.pop()
+        out += ["", "```mojo"] + block + ["```", ""]
+    return "\n".join(out)
+
+
+def _is_bare_example(line: str, before: List[str]) -> bool:
+    """Whether `line` is the first, unindented line under `Example:`."""
+    if line.strip() == "" or line.startswith((" ", "```")):
+        return False
+    if not before:
+        return False
+    return before[-1].strip() in ("Example:", "Examples:")
+
+
+def _starts_code(line: str, before: List[str]) -> bool:
+    """Whether `line` opens an indented code block under a `...:` line."""
+    if not line.startswith("    ") or line.strip() == "":
+        return False
+    lead = ""
+    for earlier in reversed(before):
+        if earlier.strip() != "":
+            lead = earlier
+            break
+    if lead == "" or lead.startswith(" ") or not lead.rstrip().endswith(":"):
+        return False
+    if lead.strip()[:-1] in _SECTIONS:
+        return False
+    return re.match(r"^([-*+]|\d+\.)\s", lead) is None
+
+
+_SECTIONS = {
+    "Args",
+    "Arguments",
+    "Attributes",
+    "Constraints",
+    "Fields",
+    "Note",
+    "Notes",
+    "Parameters",
+    "Raises",
+    "Returns",
+    "See Also",
+    "Warning",
+    "Yields",
+}
+"""Docstring headings whose indented lines are prose, not code."""
 
 
 def _one_line(text: str) -> str:
