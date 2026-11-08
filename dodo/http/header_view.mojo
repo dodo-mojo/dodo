@@ -21,7 +21,7 @@ protocol layering).
 
 Example:
 
-    var raw = "GET / HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n\r\n".as_bytes()
+    var raw = "GET / HTTP/1.1\\r\\nHost: x\\r\\nX-A: 1\\r\\n\\r\\n".as_bytes()
     var view = parse_header_view(Span[UInt8, _](raw))
     assert_equal(view.get("host"), "x") # case-insensitive
     assert_equal(view.get("X-A"), "1")

@@ -1,6 +1,6 @@
 """Comptime-compiled route table and ``ComptimeRouter``.
 
-``Router`` in [`dodo.http.router`](./router.mojo) is a runtime-driven
+``Router`` in ``dodo.http.router`` is a runtime-driven
 dispatcher: patterns are parsed into segment lists at registration
 time and scanned linearly on every request. That's a fine default
 when routes are registered dynamically or come from user input, but
@@ -45,7 +45,7 @@ Response`` signature, the list is homogeneous and can live as a
 comptime constant — no separate ``set_handler`` step, no runtime
 handler-index book-keeping.
 
-A malformed pattern (see [`dodo.http._route_path`](./_route_path.mojo))
+A malformed pattern (see ``dodo.http._route_path``)
 is a compile error carrying the parser's message, and so is a method
 and path listed twice.
 
@@ -56,7 +56,7 @@ percent-decoded, and a bad escape returns 400, just like the runtime
 router.
 """
 
-from .handler import Handler
+from .handler import Handler, RouteInfo
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
 from .request import Request, Method, _child_request
@@ -192,6 +192,16 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
         if len(allowed) > 0:
             return _method_not_allowed(allowed)
         return not_found()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        """Every route, in table order, for `dodo routes`."""
+        var out = List[RouteInfo]()
+        comptime for i in range(len(Self.routes)):
+            comptime r = Self.routes[i]
+            out.append(
+                RouteInfo(String(r.method), String(r.pattern), False, "route")
+            )
+        return out^
 
 
 # ── Response helpers ────────────────────────────────────────────────────────

@@ -35,8 +35,16 @@ OUT_DIR = os.path.join(TESTS, "_agg")
 # The server and scripts the live checks run; no tests in it.
 LIVE_DIR = os.path.join(TESTS, "live")
 COMPILE_FAIL_DIR = os.path.join(TESTS, "compile_fail")
+# Programs tests build and run (sample apps); no tests in them.
+FIXTURES = "/fixtures/"
 
 # Tests that mutate process-global state; they must keep their own process.
+HELPERS = {
+    # Builds and runs the real `dodo` binary for the CLI's end-to-end tests.
+    "tests/cli/dodo_cli.mojo",
+}
+"""Modules that tests import; they hold no tests of their own."""
+
 EXCLUDE = {
     "tests/runtime/test_block_in_pool.mojo",
     "tests/runtime/test_closure_send_contract.mojo",
@@ -50,6 +58,8 @@ EXCLUDE = {
     # Points DODO_LIB_DIR at an empty directory; the library lookup is
     # cached per process.
     "tests/json/test_loads_fallback.mojo",
+    # Installs process-wide signal handlers and signals itself.
+    "tests/utils/test_signals.mojo",
 }
 
 TEST_DEF = re.compile(r"^def (test_[A-Za-z0-9_]*)\s*\(", re.M)
@@ -94,7 +104,9 @@ def discover() -> dict[str, list[tuple[str, list[str]]]]:
         skipped_dirs = (OUT_DIR, LIVE_DIR, COMPILE_FAIL_DIR)
         if path.startswith(skipped_dirs):
             continue
-        if path in EXCLUDE:
+        if path in EXCLUDE or path in HELPERS:
+            continue
+        if FIXTURES in path:
             continue
         names = TEST_DEF.findall(open(path).read())
         if not names:

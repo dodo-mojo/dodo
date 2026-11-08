@@ -28,9 +28,12 @@ from ..net.socket import (
 )
 from ..net._libc import (
     _bind,
+    _getsockopt,
     _listen,
     _accept,
     _strerror,
+    SOL_SOCKET,
+    SO_ACCEPTCONN,
     SOCKADDR_IN_SIZE,
     SOCKADDR_IN6_SIZE,
 )
@@ -220,6 +223,38 @@ struct TcpListener(Movable):
         var sock = RawSocket(fd, family, SOCK_STREAM, _wrap=True)
         return TcpListener(sock^, local)
 
+    @staticmethod
+    def inherit(fd: Int) raises -> TcpListener:
+        """Take over a listening socket another process passed down, such
+        as the one `dodo dev` keeps open across restarts.
+
+        Unlike :meth:`from_raw_fd` it checks the fd and reads its address.
+
+        Raises:
+            Error: If `fd` is not an open, listening TCP socket.
+        """
+        if fd < 0:
+            raise Error(
+                "inherited listener fd must not be negative (got ", fd, ")"
+            )
+        var sock = RawSocket(c_int(fd), AF_INET, SOCK_STREAM, _wrap=True)
+        var local: SocketAddr
+        try:
+            local = sock.local_addr()
+        except e:
+            # Not ours to close: it may not even be a socket.
+            sock.fd = INVALID_FD
+            raise Error("fd ", fd, " is not an open socket: ", e)
+        if local.port == 0:
+            sock.fd = INVALID_FD
+            raise Error("fd ", fd, " is a socket but is not bound to a port")
+        if not _is_listening(sock.fd):
+            sock.fd = INVALID_FD
+            raise Error("fd ", fd, " is a socket but is not listening")
+        if local.ip.is_v6():
+            sock.family = AF_INET6
+        return TcpListener(sock^, local)
+
     def into_raw_fd(mut self) -> c_int:
         """Give up ownership of the socket and return its fd.
 
@@ -344,3 +379,21 @@ def accept_fd(listener_fd: c_int) raises -> TcpStream:
         raise NetworkError(_strerror(e.value) + " (accept)", Int(e.value))
 
     return _adopt_accepted(client_fd, peer_buf, _SockaddrDecoder())
+
+
+def _is_listening(fd: c_int) -> Bool:
+    """Whether `fd` is a socket in the listening state.
+
+    macOS cannot read `SO_ACCEPTCONN` (ENOPROTOOPT), so there a bound
+    socket counts as listening and a wrong one fails at the first accept.
+    """
+    var value = stack_allocation[1, c_int]()
+    value.unsafe_write(0)
+    var size = stack_allocation[1, c_uint]()
+    size.unsafe_write(c_uint(4))
+    var rc = _getsockopt(
+        fd, SOL_SOCKET, SO_ACCEPTCONN, value.unsafe_bitcast[UInt8](), size
+    )
+    if rc < 0:
+        return get_errno() == ErrNo.ENOPROTOOPT
+    return value.unsafe_load() != 0

@@ -24,7 +24,7 @@ layer is monomorphised into the handler chain.
 
 from std.collections import Optional
 
-from .handler import Handler
+from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
 
@@ -226,6 +226,9 @@ struct Cors[Inner: Handler & Copyable](Copyable, Handler):
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
+
+    def route_list(self) raises -> List[RouteInfo]:
+        return self.inner.route_list()
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)

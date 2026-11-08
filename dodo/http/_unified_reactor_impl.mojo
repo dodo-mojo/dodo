@@ -104,6 +104,12 @@ from ._h2_conn_handle import (
     _pending_conn_free_addr,
     _pending_conn_ptr_from_int,
 )
+from ._reactor.drain import (
+    DRAIN_POLL_MS,
+    DrainClock,
+    drain_done,
+    stop_accepting,
+)
 from ._reactor.offload_loop import close_offload_port
 from ._reactor.lifecycle import (
     _arm_idle_timer,
@@ -855,6 +861,7 @@ def _unified_handle_conn_event[
     ws_hooks: Optional[WsH2Hooks] = None,
     peer_hup: Bool = False,
     offload_port: Int = 0,
+    draining: Bool = False,
 ) raises:
     """Dispatch one reactor event for an already-known connection fd.
 
@@ -866,6 +873,9 @@ def _unified_handle_conn_event[
     keep-alive workloads), then HTTP/2, then the cold pending
     (preface-peek) path which migrates to KIND_H1 / KIND_H2 and
     drives the chosen handle once to consume any prefetched bytes.
+    While ``draining``, a connection that turns out to be HTTP/1.1 is
+    marked before that first drive, so its answer says
+    ``Connection: close``.
     """
     var k = _kind(packed)
 
@@ -1007,6 +1017,8 @@ def _unified_handle_conn_event[
         # already hold buffered) is consumed without another wakeup.
         if fd not in conns:
             return
+        if draining:
+            _mark_new_h1_draining(fd, conns)
         var tpacked = conns[fd]
         if _kind(tpacked) == KIND_H2:
             if _drive_h2(
@@ -1060,6 +1072,8 @@ def _unified_handle_conn_event[
     # the 24-byte preface in the same TCP segment).
     if fd not in conns:
         return
+    if draining:
+        _mark_new_h1_draining(fd, conns)
     var packed2 = conns[fd]
     var k2 = _kind(packed2)
     if k2 == KIND_H2:
@@ -1252,63 +1266,90 @@ def _offload_timer_fired(
     return False
 
 
-def _begin_offload_settle(
-    port: Int,
+def _begin_drain_unified(
+    offload_port: Int,
     listener_fds: List[Int],
+    config: ServerConfig,
+    bal: Balancer,
+    mut conns: Dict[Int, Int],
+    mut reactor: Reactor,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+) raises:
+    """Start a graceful stop (``_reactor/drain.mojo``): stop accepting and
+    taking hand-offs, cancel queued offload jobs, and mark every
+    connection. Streams peers handed over before this are still adopted
+    and served."""
+    stop_accepting(listener_fds, reactor)
+    bal.close()
+    if offload_port != 0:
+        offload_cancel_all(offload_port, CancelReason.SHUTDOWN)
+    _mark_draining_unified(config, conns, reactor, wheel, timers)
+
+
+def _mark_draining_unified(
     config: ServerConfig,
     mut conns: Dict[Int, Int],
     mut reactor: Reactor,
     mut wheel: TimerWheel,
     mut timers: Dict[Int, UInt64],
 ) raises:
-    """Start a graceful shutdown that waits for offloaded requests.
-
-    Stops accepting, flips ``SHUTDOWN`` on every job still out (queued
-    ones are then answered 503 without running), sends GOAWAY on HTTP/2
-    connections with parked streams, and closes every connection that
-    has nothing parked.
-    """
-    for i in range(len(listener_fds)):
-        try:
-            reactor.unregister(c_int(listener_fds[i]))
-        except:
-            pass
-    offload_cancel_all(port, CancelReason.SHUTDOWN)
-    var fds = List[Int]()
-    for kv in conns.items():
-        fds.append(kv.key)
-    for i in range(len(fds)):
-        var fd = fds[i]
-        var packed = conns[fd]
+    """HTTP/1.1: close after the current response. HTTP/2: send GOAWAY,
+    finish the open streams, then close. Idempotent."""
+    for entry in conns.items():
+        var fd = entry.key
+        var packed = entry.value
         if _kind(packed) == KIND_H1:
-            var ch = _conn_ptr_from_int(_addr(packed))
-            if ch[].state == STATE_PARKED:
-                ch[].offload_close = True
-                continue
-            ch[].cancel_cell.flip(CancelReason.SHUTDOWN)
+            _conn_ptr_from_int(_addr(packed))[].start_draining()
         elif _kind(packed) == KIND_H2:
             var h2 = _h2_conn_ptr_from_int(_addr(packed))
-            if h2[].has_parked_streams():
+            if not h2[].should_close:
                 var step = h2[].begin_close(config)
                 _apply_step_h2(fd, step, reactor, wheel, timers, h2)
+
+
+def _mark_new_h1_draining(fd: Int, conns: Dict[Int, Int]) raises:
+    """Mark a connection that just chose HTTP/1.1 during a drain. One that
+    chose HTTP/2 gets GOAWAY after its first streams are read, so they
+    are served (``_mark_draining_unified``)."""
+    var packed = conns[fd]
+    if _kind(packed) == KIND_H1:
+        _conn_ptr_from_int(_addr(packed))[].start_draining()
+
+
+def _close_idle_unified(
+    now_ms: Int,
+    clock: DrainClock,
+    config: ServerConfig,
+    mut conns: Dict[Int, Int],
+    mut reactor: Reactor,
+    mut wheel: TimerWheel,
+    mut timers: Dict[Int, UInt64],
+) raises:
+    """Mark connections that arrived since the last pass, then close each
+    one that waits for a request it will not get. A WebSocket closes at
+    once; a connection still choosing its protocol (or in its TLS
+    handshake) is new, and closes after the first-request grace."""
+    _mark_draining_unified(config, conns, reactor, wheel, timers)
+    var grace_over = now_ms >= clock.first_request_deadline_ms
+    var idle = List[Int]()
+    for entry in conns.items():
+        var packed = entry.value
+        var kind = _kind(packed)
+        if kind == KIND_H1:
+            var ch = _conn_ptr_from_int(_addr(packed))
+            if not ch[].waits_for_request():
                 continue
-            h2[].signal_drain()
+            if ch[].keepalive_count > 0 or grace_over:
+                ch[].cancel_cell.flip(CancelReason.SHUTDOWN)
+                idle.append(entry.key)
+        elif kind == KIND_WS:
+            idle.append(entry.key)
+        elif kind == KIND_PENDING or kind == KIND_TLS:
+            if grace_over:
+                idle.append(entry.key)
+    for fd in idle:
         _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
-
-
-def _offload_settled(conns: Dict[Int, Int]) raises -> Bool:
-    """No connection is parked or still writing a response."""
-    for kv in conns.items():
-        var packed = kv.value
-        if _kind(packed) == KIND_H1:
-            var state = _conn_ptr_from_int(_addr(packed))[].state
-            if state == STATE_PARKED or state == STATE_WRITING:
-                return False
-        elif _kind(packed) == KIND_H2:
-            var h2 = _h2_conn_ptr_from_int(_addr(packed))
-            if h2[].has_parked_streams() or h2[].state == STATE_WRITING:
-                return False
-    return True
 
 
 # ── Unified reactor loop -- single listener (single-worker) ────────────────
@@ -1389,37 +1430,37 @@ def _run_unified_loop_for_fd[
     all_listeners.append(listener_fd)
     for i in range(len(extra_fds)):
         all_listeners.append(extra_fds[i])
-    # Non-zero once the stop flag is seen with offloaded requests out:
-    # the loop keeps serving their connections until this deadline.
-    var settle_deadline = 0
+    # Set once the stop flag is seen: the loop then stops accepting and
+    # finishes what its connections sent (``_reactor/drain.mojo``).
+    var draining = False
+    var clock = DrainClock(0, 0)
+    var poll_cap_ms = 100
     while True:
-        if settle_deadline == 0 and load_stop_flag(stopping_addr):
-            if offload_outstanding(offload_port) == 0:
-                break
-            settle_deadline = monotonic_now_ms() + max(
-                config.shutdown_timeout_ms, 0
-            )
-            _begin_offload_settle(
+        if not draining and load_stop_flag(stopping_addr):
+            draining = True
+            clock = DrainClock(monotonic_now_ms(), config.shutdown_timeout_ms)
+            poll_cap_ms = DRAIN_POLL_MS
+            _begin_drain_unified(
                 offload_port,
                 all_listeners,
                 config,
+                bal,
                 conns,
                 reactor,
                 wheel,
                 timers,
             )
-        if settle_deadline != 0:
-            if _offload_settled(conns) or monotonic_now_ms() >= settle_deadline:
-                break
+        if draining and drain_done(monotonic_now_ms(), clock, len(conns)):
+            break
         store_worker_stat(stats_addr, WORKER_STAT_INFLIGHT, len(conns))
         bal.publish(len(conns))
         events.clear()
         try:
-            _ = reactor.poll(_poll_timeout_ms(wheel), events)
+            _ = reactor.poll(_poll_timeout_ms(wheel, poll_cap_ms), events)
         except:
             exit_status = WORKER_STATUS_CRASHED
             break
-        if settle_deadline == 0 and bal.pending() > 0:
+        if bal.pending() > 0:
             _adopt_handed_off(
                 bal,
                 reactor,
@@ -1441,6 +1482,8 @@ def _run_unified_loop_for_fd[
             if evt.is_wakeup():
                 continue
             if evt.token == LISTENER_TOKEN:
+                if draining:
+                    continue
                 _accept_loop_unified_fd(
                     listener_fd,
                     reactor,
@@ -1455,6 +1498,8 @@ def _run_unified_loop_for_fd[
                 continue
             var fd = Int(evt.token)
             if len(listener_fds) > 0 and fd in listener_fds:
+                if draining:
+                    continue
                 _accept_loop_unified_fd(
                     fd,
                     reactor,
@@ -1485,6 +1530,7 @@ def _run_unified_loop_for_fd[
                 ws_hooks.copy(),
                 peer_hup=evt.is_hup(),
                 offload_port=offload_port,
+                draining=draining,
             )
 
         if offload_outstanding(offload_port) > 0:
@@ -1527,7 +1573,17 @@ def _run_unified_loop_for_fd[
                     )
                 continue
             _cleanup_conn_unified(fd, conns, timers, reactor, wheel)
-        if settle_deadline == 0:
+        if draining:
+            _close_idle_unified(
+                monotonic_now_ms(),
+                clock,
+                config,
+                conns,
+                reactor,
+                wheel,
+                timers,
+            )
+        else:
             gate.sync(reactor, len(conns), config.max_connections)
 
     store_worker_stat(stats_addr, WORKER_STAT_STATUS, exit_status)

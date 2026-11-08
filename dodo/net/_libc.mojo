@@ -63,6 +63,9 @@ comptime SO_REUSEADDR: c_int = c_int(_pm["SO_REUSEADDR", linux=2, macos=4]())
 comptime SO_REUSEPORT: c_int = c_int(
     _pm["SO_REUSEPORT", linux=15, macos=0x0200]()
 )
+comptime SO_ACCEPTCONN: c_int = c_int(
+    _pm["SO_ACCEPTCONN", linux=30, macos=0x0002]()
+)
 comptime SO_KEEPALIVE: c_int = c_int(_pm["SO_KEEPALIVE", linux=9, macos=8]())
 comptime SO_RCVTIMEO: c_int = c_int(
     _pm["SO_RCVTIMEO", linux=20, macos=0x1006]()

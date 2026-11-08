@@ -30,6 +30,7 @@ STANDALONE=(
   tests/runtime/test_reuseport.mojo
   tests/runtime/stress_scheduler.mojo
   tests/json/test_loads_fallback.mojo
+  tests/utils/test_signals.mojo
 )
 
 echo "── prerequisites ──"

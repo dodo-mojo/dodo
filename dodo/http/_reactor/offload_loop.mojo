@@ -3,12 +3,11 @@
 The cancel-aware loop (``serve_cancellable``) keeps plain
 ``ConnHandle`` addresses in its connection table, so it uses these
 helpers instead of the unified loop's tagged ones: hand finished jobs
-back to their connections, answer a handler deadline, start and check a
-graceful stop, and close the worker's port.
+back to their connections, answer a handler deadline, and close the
+worker's port. A graceful stop is in ``drain.mojo``.
 """
 
 from std.collections import Dict, List
-from std.ffi import c_int
 
 from dodo.http.cancel import CancelReason
 from dodo.http._offload_pool import (
@@ -20,7 +19,7 @@ from dodo.http._offload_pool import (
 )
 from dodo.runtime import Reactor, TimerWheel
 
-from .keepalive_scan import STATE_PARKED, STATE_WRITING
+from .keepalive_scan import STATE_PARKED
 from .lifecycle import _apply_step, _cleanup_conn, _conn_ptr_from_int
 
 
@@ -77,51 +76,6 @@ def offload_timeout_h1(
         return False
     var step = ch[].offload_timeout()
     _apply_step(fd, step, reactor, wheel, timers, ch)
-    return True
-
-
-def begin_offload_settle_h1(
-    port: Int,
-    listener_fd: Int,
-    mut conns: Dict[Int, Int],
-    mut reactor: Reactor,
-    mut wheel: TimerWheel,
-    mut timers: Dict[Int, UInt64],
-):
-    """Start a graceful stop that waits for offloaded requests.
-
-    Stops accepting, flips ``SHUTDOWN`` on every job still out (queued
-    ones are then answered 503 without running), and closes every
-    connection that has nothing parked. A parked one closes after its
-    response.
-    """
-    try:
-        reactor.unregister(c_int(listener_fd))
-    except:
-        pass
-    offload_cancel_all(port, CancelReason.SHUTDOWN)
-    var fds = List[Int]()
-    for kv in conns.items():
-        fds.append(kv.key)
-    for i in range(len(fds)):
-        var fd = fds[i]
-        try:
-            var ch = _conn_ptr_from_int(conns[fd])
-            if ch[].state == STATE_PARKED:
-                ch[].offload_close = True
-                continue
-            ch[].cancel_cell.flip(CancelReason.SHUTDOWN)
-        except:
-            pass
-        _cleanup_conn(fd, conns, timers, reactor, wheel)
-
-
-def offload_settled_h1(conns: Dict[Int, Int]) raises -> Bool:
-    """No connection is parked or still writing a response."""
-    for kv in conns.items():
-        var state = _conn_ptr_from_int(kv.value)[].state
-        if state == STATE_PARKED or state == STATE_WRITING:
-            return False
     return True
 
 

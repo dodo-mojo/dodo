@@ -64,6 +64,43 @@ from .request import Request
 from .response import Response, ResponseImpl
 
 
+# ── Route list ───────────────────────────────────────────────────────────────
+
+
+@fieldwise_init
+struct RouteInfo(Copyable, Movable):
+    """One entry of the route list `dodo routes` prints."""
+
+    var method: String
+    """`GET`, `POST` and so on, or `*` for a handler that takes every method."""
+    var path: String
+    """The path pattern as registered, such as `/users/{id}` or `/files/{*rest}`."""
+    var blocking: Bool
+    """Whether it runs on the offload pool (`blocking=True` or `Offload`)."""
+    var kind: String
+    """`route` for a registered route, `fallback` for a router's custom
+    fallback, `handler` for a handler that does not list its routes."""
+
+
+def prefix_routes(
+    var routes: List[RouteInfo], prefix: String
+) -> List[RouteInfo]:
+    """`routes` with `prefix` (such as a mount point) put in front of each path.
+    """
+    for i in range(len(routes)):
+        routes[i].path = join_route_path(prefix, routes[i].path)
+    return routes^
+
+
+def join_route_path(prefix: String, path: String) -> String:
+    """`/api` + `/users` is `/api/users`; `/api` + `/` is `/api`."""
+    if prefix == "" or prefix == "/":
+        return path
+    if path == "/":
+        return prefix
+    return prefix + path
+
+
 # ── Trait ────────────────────────────────────────────────────────────────────
 
 
@@ -175,6 +212,15 @@ trait Handler(Deinitable, Movable):
         an ``Offload`` inside it inline. A raise counts as ``False``.
         """
         return False
+
+    def route_list(self) raises -> List[RouteInfo]:
+        """The routes this handler answers, for `dodo routes`.
+
+        By default one entry for every method and path. A ``Router`` or
+        ``App`` lists its routes, and a wrapper returns its inner
+        handler's list, the same way it forwards :meth:`may_block`.
+        """
+        return [RouteInfo("*", "/{*path}", self.may_block(), "handler")]
 
 
 # ── HandlerExtractor: convenience trait composition ──────────────────────────

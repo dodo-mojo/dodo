@@ -24,7 +24,7 @@ decides whether the unified loop adopts it or it is deleted (see
 
 Example:
 
-    var raw = "GET /a?q=1 HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes()
+    var raw = "GET /a?q=1 HTTP/1.1\\r\\nHost: x\\r\\n\\r\\n".as_bytes()
     var view = parse_request_view(Span[UInt8, _](raw))
     print(view.method) # GET
     print(view.url) # /a?q=1

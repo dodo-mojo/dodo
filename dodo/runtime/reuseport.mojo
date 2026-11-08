@@ -13,8 +13,27 @@ function name (``bind_reuseport``) and a small sanity check over the
 returned listener's address.
 """
 
+from std.ffi import c_int, c_uint
+from std.memory import stack_allocation
+
 from ..net import SocketAddr
+from ..net._libc import SOL_SOCKET, SO_REUSEPORT, _getsockopt
 from ..tcp import TcpListener
+
+
+def allows_reuseport(fd: Int) -> Bool:
+    """Whether the socket `fd` has ``SO_REUSEPORT`` set, so other
+    listeners can join its port. False when it cannot be read."""
+    var value = stack_allocation[1, c_int]()
+    value.unsafe_write(0)
+    var size = stack_allocation[1, c_uint]()
+    size.unsafe_write(c_uint(4))
+    var rc = _getsockopt(
+        c_int(fd), SOL_SOCKET, SO_REUSEPORT, value.unsafe_bitcast[UInt8](), size
+    )
+    if rc < 0:
+        return False
+    return value.unsafe_load() != 0
 
 
 def bind_reuseport(addr: SocketAddr, backlog: Int = 1024) raises -> TcpListener:

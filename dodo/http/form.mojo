@@ -18,7 +18,7 @@ This module ships:
   values, e.g. checkboxes), backed by parallel lists for stable
   insertion order.
 - ``parse_form_urlencoded`` — bytes/string → ``FormData``; the
-  ``Form`` extractor in [`extract.mojo`](extract.mojo) is the typed
+  ``Form`` extractor in ``dodo.http.extract`` is the typed
   handler-side wrapper.
 """
 

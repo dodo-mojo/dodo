@@ -293,6 +293,8 @@ struct ConnHandle(Movable):
     wrapper) manages the actual TimerWheel entry."""
     var should_close: Bool
     """True once we've decided this connection must close after writing."""
+    var draining: Bool
+    """The server is stopping: answer what was sent, then close."""
     var last_interest: Int
     """Last reactor interest bits for this conn. Used by the orchestrator
     to skip redundant ``reactor.modify`` syscalls when the wanted interest
@@ -474,6 +476,7 @@ struct ConnHandle(Movable):
         self.keepalive_count = 0
         self.idle_timer_id = UInt64(0)
         self.should_close = False
+        self.draining = False
         # Accept registers with INTEREST_READ only.
         self.last_interest = 1  # INTEREST_READ
         self.send_in_flight = False
@@ -881,6 +884,8 @@ struct ConnHandle(Movable):
         if self.keepalive_count >= config.max_keepalive_requests:
             final = True
         if not config.keep_alive:
+            final = True
+        if self.draining:
             final = True
         if self.peer_eof and not self._another_request_follows():
             final = True
@@ -1739,6 +1744,24 @@ struct ConnHandle(Movable):
         self.state = STATE_CLOSING
         self.should_close = True
         return StepResult(want_read=False, want_write=False, done=True)
+
+    def start_draining(mut self):
+        """The server is stopping. The request being read or answered
+        still gets its response, and the connection closes after it.
+        Idempotent."""
+        self.draining = True
+        if self.state == STATE_WRITING:
+            self.should_close = True
+        if self.state == STATE_PARKED:
+            self.offload_close = True
+
+    def waits_for_request(self) -> Bool:
+        """Between requests, with no byte of the next one read yet."""
+        if self.state != STATE_READING:
+            return False
+        if len(self.read_buf) > 0:
+            return False
+        return self.request_started_ms == 0
 
     def close(mut self) -> None:
         """Explicitly close the underlying stream. Idempotent.
