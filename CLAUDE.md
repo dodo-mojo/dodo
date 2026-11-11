@@ -17,7 +17,7 @@ A Mojo web framework with HTTP, AI (MAX), GPU kernels, computer vision and agent
 | Path | What |
 |---|---|
 | `dodo/` | The library. `http`, `http2`, `ws`, `tls`, `tcp`, `uds`, `dns`, `net`, `runtime`, `crypto`, `io`, `json` (vendored, see `THIRD_PARTY_NOTICES.md`), `db` (one subpackage per database), `testing`, `utils`. Native wrappers in `dodo/*/ffi/`. |
-| `cli/` | The `dodo` command line (`run`, `dev`, `test`, `routes`, `doctor`, `docs pull`), one Mojo binary; `pixi run cli-build` builds `build/bin/dodo`. |
+| `cli/` | The `dodo` command line (`new`, `run`, `dev`, `test`, `routes`, `doctor`, `docs pull`), one Mojo binary; `pixi run cli-build` builds `build/bin/dodo`. |
 | `tests/` | One dir per package. `tests/compile_fail/` holds programs that must fail to build with the message in their first line. `tests/tools/run_tests.sh` builds one binary per dir from `tests/_agg/` (generated). `tests/live/` is not in it: h2spec, Autobahn, and `tests/live/db/` (database suites against Docker). |
 | `fuzz/` | Fuzzers, one per parser, on the vendored harness in `fuzz/mozz/` |
 | `docs/` | Design, audits (`lightbug-audit.md`, `flare-audit.md`, `app-layer-audit.md`), naming, standards, ADRs, the database guide (`databases.md`), the CLI and graceful stop (`cli.md`), the generated API (`api/`) and the index of it all (`index.md`); CI fails when those two are stale |

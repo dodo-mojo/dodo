@@ -3,7 +3,7 @@
 from std.testing import TestSuite, assert_equal
 
 from cli.main import run_cli
-from cli.report import EXIT_INTERNAL, EXIT_OK, EXIT_USAGE
+from cli.report import EXIT_OK, EXIT_USAGE
 
 
 def test_no_arguments_shows_help() raises:
@@ -35,10 +35,6 @@ def test_usage_errors() raises:
     assert_equal(run_cli(["docs"]), EXIT_USAGE)
     assert_equal(run_cli(["doctor", "now", "--json"]), EXIT_USAGE)
     assert_equal(run_cli(["dev", "--port"]), EXIT_USAGE)
-
-
-def test_unbuilt_command_is_internal() raises:
-    assert_equal(run_cli(["new", "app"]), EXIT_INTERNAL)
 
 
 def main() raises:
