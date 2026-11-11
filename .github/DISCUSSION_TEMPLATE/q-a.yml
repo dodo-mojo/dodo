@@ -1,0 +1,19 @@
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+    validations:
+      required: true
+  - type: textarea
+    id: code
+    attributes:
+      label: Code
+      description: The smallest code that shows what you mean, if there is any.
+      render: mojo
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and Mojo version
+      description: If it's about something that fails on your machine.
+      placeholder: macOS 15 arm64, Mojo 1.2.0

@@ -6,10 +6,17 @@ Before you start, read [docs/engineering-standards.md](docs/engineering-standard
 
 ## Ways to help
 
-- **Report a bug.** Open an issue with the smallest code or request that reproduces it.
-- **Report a security problem privately.** See [SECURITY.md](SECURITY.md). Never in a public issue.
-- **Propose a feature.** Open an issue first and say what you want to build with it. Big changes need an ADR (see below), so talk before you code.
+- **A question?** Ask in [Discussions › Q&A](https://github.com/dodo-mojo/dodo/discussions/categories/q-a).
+- **An idea?** Share it in [Discussions › Ideas](https://github.com/dodo-mojo/dodo/discussions/categories/ideas) first and say what you want to build with it, so we can shape it together before anyone writes code. Big changes need an ADR (see below).
+- **A bug?** Open an [issue](https://github.com/dodo-mojo/dodo/issues/new/choose) with the smallest code or request that reproduces it.
+- **A security problem?** Never in public. See [SECURITY.md](SECURITY.md).
+- **Want to write code?** Pick an issue and say in a comment that you're on it:
+  - [good first issue](https://github.com/dodo-mojo/dodo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22): small and self-contained, with pointers to the code. Good for a first PR here.
+  - [help wanted](https://github.com/dodo-mojo/dodo/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22): bigger or trickier, open to anyone who's done one here.
+  - An issue labeled `needs discussion` gets its shape agreed in the issue before code.
 - **Send a fix.** Small fixes can go straight to a PR.
+
+New to Mojo? The docs for the version dodo uses are in [`mojo-docs/1.2.0/`](mojo-docs/1.2.0/index.md), and [`changes-in-1x.md`](mojo-docs/1.2.0/changes-in-1x.md) lists what changed in 1.x.
 
 ## Set up
 

@@ -1,29 +1,52 @@
 name: Bug report
-description: Something is broken
+description: Something in dodo doesn't work as it should.
 labels: [bug]
 body:
-  - type: input
+  - type: textarea
+    id: what
     attributes:
-      label: dodo commit
-      placeholder: d265cee
-    validations:
-      required: true
-  - type: input
-    attributes:
-      label: Platform
-      placeholder: Ubuntu 24.04 x86_64, macOS 15 arm64, WSL
+      label: What happened
+      description: And what you expected instead.
     validations:
       required: true
   - type: textarea
+    id: reproduce
     attributes:
-      label: How to reproduce
+      label: How to make it happen
       description: The smallest code or request that shows the bug.
     validations:
       required: true
-  - type: textarea
+  - type: dropdown
+    id: area
     attributes:
-      label: Expected
-  - type: textarea
+      label: Where
+      options:
+        - HTTP server (HTTP/1.1, HTTP/2, TLS, WebSocket)
+        - HTTP client
+        - App API (routes, handlers, extractors)
+        - Databases
+        - The dodo command line
+        - Docs
+        - Somewhere else
+    validations:
+      required: true
+  - type: input
+    id: commit
     attributes:
-      label: Actual
+      label: dodo commit or version
+      placeholder: d2d485e
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and Mojo version
+      placeholder: Ubuntu 24.04 x86_64 (WSL), Mojo 1.2.0
+    validations:
+      required: true
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
       description: Output, error or crash log.
+      render: text

@@ -1,0 +1,19 @@
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to build
+      description: The app or the moment where dodo gets in your way.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: The API or behavior you'd like. A short code sketch helps.
+    validations:
+      required: true
+  - type: textarea
+    id: else
+    attributes:
+      label: What you do now instead
