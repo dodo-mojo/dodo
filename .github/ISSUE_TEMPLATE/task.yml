@@ -1,0 +1,24 @@
+name: Agreed change
+description: A change already agreed in Discussions, ready to be built.
+body:
+  - type: input
+    id: discussion
+    attributes:
+      label: Discussion
+      description: Link to where it was agreed.
+      placeholder: https://github.com/dodo-mojo/dodo/discussions/…
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What to build
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      placeholder: "- An app can …"
+    validations:
+      required: true

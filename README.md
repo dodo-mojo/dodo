@@ -4,7 +4,7 @@ A Mojo web framework with AI, GPU kernels, computer vision and agents natively s
 
 They run in one process by default, with no glue services or serialization between them. When you need crash isolation or separate scaling, move AI or GPU work into a supervised worker process, call a hosted AI service, or run dodo as one service among many, without a rewrite.
 
-> **Status: pre-alpha.** The networking core works and is tested. The app API below is planned. Nothing is stable yet.
+> **Status: pre-alpha.** The networking core, the App API, the database drivers and the `dodo` command line work and are tested. Nothing is stable yet.
 
 ## What dodo will be
 
@@ -24,7 +24,7 @@ They run in one process by default, with no glue services or serialization betwe
 | Phase | Goal | State |
 |---|---|---|
 | 1 | Core server: HTTP/1.1, HTTP/2, TLS, WebSocket, reactor | In progress |
-| 2 | App API, CLI, AGENTS.md, `dodo mcp` | Planned |
+| 2 | App API, CLI, AGENTS.md, `dodo mcp` | In progress |
 | 3 | AI, GPU, streaming | Planned |
 | 3b | Agent harness kit | Planned |
 | 3c | Computer vision | Planned |
@@ -45,7 +45,7 @@ pixi run tests
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.md).
+New here? Pick a [good first issue](https://github.com/dodo-mojo/dodo/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22), ask anything in [Discussions](https://github.com/dodo-mojo/dodo/discussions), and read [CONTRIBUTING.md](CONTRIBUTING.md). Security issues: [SECURITY.md](SECURITY.md).
 
 ## License
 

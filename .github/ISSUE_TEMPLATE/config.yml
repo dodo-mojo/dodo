@@ -1,5 +1,11 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Security vulnerability
+  - name: Ask a question
+    url: https://github.com/dodo-mojo/dodo/discussions/categories/q-a
+    about: How something works, or how to do something with dodo.
+  - name: Share an idea
+    url: https://github.com/dodo-mojo/dodo/discussions/categories/ideas
+    about: New features start here, so they can be shaped together first.
+  - name: Report a security problem
     url: https://github.com/dodo-mojo/dodo/security/advisories/new
-    about: Report it privately, never in a public issue.
+    about: Privately, never as a public issue.
