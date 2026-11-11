@@ -10,8 +10,12 @@ test.
     pixi run check-mistakes 3 7        # only these
     pixi run check-mistakes --list     # what each number plants
 
+The test files run once first with nothing planted, and the run stops if
+one fails: a test that already fails would mark every mistake caught.
+
 Exit code: 0 when every mistake was caught, 1 when one was missed, 2 when a
-mistake's text is no longer in its file (the code moved: update the list).
+test fails with nothing planted or a mistake's text is no longer in its
+file (the code moved: update the list).
 
 A planted file is copied to `.dodo/mistakes/` first, so a run that is
 killed outright still leaves the original; the next run puts it back.
@@ -402,8 +406,8 @@ MISTAKES = [
     Mistake(
         "docs pull defaults to the wrong dodo version",
         "cli/cmd_docs.mojo",
-        "        pulled.version = DODO_VERSION\n",
-        '        pulled.version = "0.0.0"\n',
+        "        version = DODO_VERSION\n",
+        '        version = "0.0.0"\n',
     ),
     Mistake(
         "docs pull fetches links that leave the docs folder",
@@ -471,6 +475,54 @@ MISTAKES = [
         '    if channel != "":\n        return channel\n',
         "",
     ),
+    Mistake(
+        "mcp answers notifications",
+        "cli/mcp.mojo",
+        "            # A notification (initialized, cancelled): no answer.\n            return \"\"\n",
+        "            pass\n",
+    ),
+    Mistake(
+        "mcp serves any protocol version",
+        "cli/mcp.mojo",
+        "            if asked != MODERN_VERSION:\n",
+        "            if False:\n",
+    ),
+    Mistake(
+        "mcp passes flag-like words to dodo",
+        "cli/mcp.mojo",
+        '    if text.startswith("-"):\n        raise Error("`", key, "` cannot start with -")\n',
+        "",
+    ),
+    Mistake(
+        "mcp tools inherit the protocol's stdin",
+        "cli/cmd_mcp.mojo",
+        "        _point_at_null(0)\n",
+        "",
+    ),
+    Mistake(
+        "dev starts a second session in the same project",
+        "cli/cmd_dev.mojo",
+        "    if previous and is_running(previous.value()):\n",
+        "    if False:\n",
+    ),
+    Mistake(
+        "a killed dev still counts as running",
+        "cli/dev_state.mojo",
+        '        return process_alive(Int(state["pid"].as_int()))\n',
+        "        return True\n",
+    ),
+    Mistake(
+        "dev copies half lines to the terminal",
+        "cli/app_output.mojo",
+        "            end = _after_last_newline(added)\n",
+        "            pass\n",
+    ),
+    Mistake(
+        "docs search ranks by count before words matched",
+        "cli/cmd_docs_search.mojo",
+        "        if self.terms != other.terms:\n            return self.terms > other.terms\n",
+        "",
+    ),
 ]
 
 
@@ -506,8 +558,11 @@ def restore_left_backups():
 
 
 def kill_leftovers():
+    """Kill programs a killed test left running: orphans (parent pid 1)
+    whose command line names a scratch folder. A test still running, here
+    or in another checkout, has a live parent and is left alone."""
     for name in SCRATCH_DIRS:
-        subprocess.run(["pkill", "-9", "-f", name], capture_output=True)
+        subprocess.run(["pkill", "-9", "-P", "1", "-f", name], capture_output=True)
 
 
 def kill_group(child: subprocess.Popen):
@@ -555,6 +610,22 @@ def run_test(path: str) -> tuple[str, str]:
             if "error:" in line:
                 failed.append(line.strip())
     return "failed", "; ".join(failed[:3])
+
+
+def failing_before_planting(picked: list[int]) -> list[str]:
+    """Run each test file the picked mistakes need once, with nothing
+    planted. A file that already fails would mark every mistake caught."""
+    needed = []
+    for number in picked:
+        for test in tests_for(MISTAKES[number - 1].file):
+            if test not in needed:
+                needed.append(test)
+    lines = []
+    for test in needed:
+        outcome, why = run_test(test)
+        if outcome != "passed":
+            lines.append(f"{test} {outcome} with nothing planted: {why}")
+    return lines
 
 
 def check(number: int, mistake: Mistake) -> str:
@@ -605,6 +676,12 @@ def main() -> int:
     restore_left_backups()
     lines = []
     try:
+        broken = failing_before_planting(picked)
+        if broken:
+            for line in broken:
+                print(line)
+            print("fix these first: a test that already fails catches every mistake")
+            return 2
         for number in picked:
             line = check(number, MISTAKES[number - 1])
             print(line, flush=True)

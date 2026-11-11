@@ -81,10 +81,19 @@ def dodo_run(
 
 def scratch(name: String) raises -> String:
     """An empty folder for one test, made fresh each run."""
-    var dir = join(getenv("TMPDIR", "/tmp"), String("dodo_e2e_", name))
+    var dir = scratch_path(name)
     _ = run(["rm", "-rf", dir])
     makedirs(dir, exist_ok=True)
     return realpath(dir)
+
+
+def scratch_path(name: String) raises -> String:
+    """Where test `name` keeps its files. Each checkout has its own, so
+    two checkouts can run the tests at once."""
+    var checkout = hash(realpath(".")) % 1_000_000_007
+    return join(
+        getenv("TMPDIR", "/tmp"), String("dodo_e2e_", checkout, "_", name)
+    )
 
 
 def read_or_empty(path: String) -> String:

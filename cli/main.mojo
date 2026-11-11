@@ -7,8 +7,12 @@ from dodo.json import Value
 from cli.args import ParsedArgs, parse_args
 from cli.cmd_dev import cmd_dev
 from cli.cmd_docs import cmd_docs_pull
+from cli.cmd_docs_search import cmd_docs_search
 from cli.cmd_doctor import cmd_doctor
+from cli.cmd_logs import cmd_logs
+from cli.cmd_mcp import cmd_mcp
 from cli.cmd_new import cmd_new
+from cli.cmd_request import cmd_request
 from cli.cmd_routes import cmd_routes
 from cli.cmd_run import cmd_run
 from cli.cmd_test import cmd_test
@@ -71,6 +75,14 @@ def _dispatch(parsed: ParsedArgs, mut report: Report) raises -> Int:
         return cmd_dev(parsed, report)
     if parsed.command == "docs pull":
         return cmd_docs_pull(parsed, report)
+    if parsed.command == "docs search":
+        return cmd_docs_search(parsed, report)
+    if parsed.command == "logs":
+        return cmd_logs(parsed, report)
+    if parsed.command == "request":
+        return cmd_request(parsed, report)
+    if parsed.command == "mcp":
+        return cmd_mcp(parsed, report)
     return report.fail("internal", "not built yet", EXIT_INTERNAL)
 
 
