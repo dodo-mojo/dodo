@@ -247,7 +247,8 @@ All profiling output is saved as files plus a JSON summary, so an agent can read
 | Errors | Stable codes (`DODO-E0142`), one-line cause, a suggested fix and a docs link, in both human and JSON form. |
 | Introspection | `dodo routes --json`, generated OpenAPI spec, `dodo explain <error-code>` |
 | Scaffolding | `dodo add route|model|middleware|test`. Output is deterministic, so agent edits are predictable and reviewable. |
-| Standards built in | `dodo new` sets up a project the way dodo itself is run (see [engineering-standards.md](engineering-standards.md)):<br>• a short `CLAUDE.md`/`AGENTS.md` that `dodo doctor` flags when it falls behind the code (new routes, commands or ADRs not mentioned)<br>• `docs/` with `docs/adr/` and `dodo adr new "<title>"`<br>• `TODO.md`<br>• a commit-message check (`type: one line`, no em dashes, no AI co-author trailers) installed as a git hook<br>• readability lints (dense one-liners, nested conditional expressions)<br>• `dodo test ui`, which runs every form field and button against a built-in list of edge cases in a real browser |
+| New projects | `dodo new` makes only what an app needs: `pixi.toml`, `main.mojo`, `app.mojo`, `tests/`, `.gitignore`, and an `AGENTS.md` (with a `CLAUDE.md` that imports it) that sends agents to the version-pinned docs. How a team runs its own project (ADRs, TODO lists, commit rules) is its own choice, so dodo adds none of it. |
+| Quality tools | Readability lints (dense one-liners, nested conditional expressions); `dodo test ui`, which runs every form field and button against a built-in list of edge cases in a real browser. |
 | One question at a time | When dodo's MCP tools or agents need a human decision, they ask one question with a recommended answer. They don't send a batch. |
 
 ## 8. Testing strategy

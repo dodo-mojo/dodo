@@ -12,7 +12,7 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 | `dodo routes [FILE]` | List the app's routes. |
 | `dodo doctor` | Check the toolchain, the project and the machine. |
 | `dodo docs pull [mojo@V] [dodo@V]` | Download the Mojo and dodo docs into `.dodo/docs/`. `--mojo V`, `--dodo V`. |
-| `dodo new` | Not built yet (`TODO.md`). |
+| `dodo new NAME` | Make a project folder: `pixi.toml`, `main.mojo`, `app.mojo`, `tests/`, `AGENTS.md`, `CLAUDE.md`. `--no-git` skips `git init`. |
 
 ## Exit codes
 
@@ -25,6 +25,16 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 | 69 | something outside dodo is missing (network, mojo, git) |
 | 70 | a bug in dodo |
 | 130 | `dodo dev` stopped by Ctrl-C |
+
+## How `dodo new` works
+
+- It only writes files; it never downloads. It prints the next steps: `pixi run dodo docs pull`, then `pixi run dodo dev`.
+- `NAME` may be a path (`apps/shop`); its last part is the project's name: a letter, then letters, digits, `-` or `_`, at most 64 bytes. The folder above must exist.
+- A path that is there and is not an empty folder is refused, a symlink included.
+- The files go into a hidden `.NAME.new.PID` folder next to the target and are moved into place at the end, so a failure leaves nothing.
+- It runs `git init` (no first commit), unless `--no-git` is given or the folder is inside a git repository already.
+- `pixi.toml` gets `dodo` from the modular-community channel, pinned to this CLI's version. `DODO_PACKAGE_CHANNEL` swaps the channel, for a package built locally with `packaging/build_local.sh` (`file:///path/to/build/conda`).
+- `AGENTS.md` tells an agent to read the docs in `.dodo/docs/` first; `CLAUDE.md` is the one line `@AGENTS.md`.
 
 ## How `dodo dev` works
 
