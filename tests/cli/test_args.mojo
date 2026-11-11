@@ -33,12 +33,12 @@ def test_two_word_command() raises:
 def test_group_without_subcommand() raises:
     var parsed = _parse(["docs"])
     assert_equal(parsed.command, "")
-    assert_equal(parsed.error, "`docs` needs a subcommand: pull")
+    assert_equal(parsed.error, "`docs` needs a subcommand: pull, search")
 
 
 def test_group_with_unknown_subcommand() raises:
     var parsed = _parse(["docs", "push"])
-    assert_equal(parsed.error, "`docs` needs a subcommand: pull")
+    assert_equal(parsed.error, "`docs` needs a subcommand: pull, search")
 
 
 def test_unknown_command() raises:

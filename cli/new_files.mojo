@@ -43,6 +43,7 @@ def project_files(name: String, channel: String) -> List[NewFile]:
     files.append(NewFile("tests/test_app.mojo", _TEST_APP_MOJO))
     files.append(NewFile("AGENTS.md", fill(_AGENTS_MD, name, channel)))
     files.append(NewFile("CLAUDE.md", "@AGENTS.md\n"))
+    files.append(NewFile(".mcp.json", _MCP_JSON))
     files.append(NewFile(".gitignore", _GITIGNORE))
     files.append(NewFile(".gitattributes", _GITATTRIBUTES))
     return files^
@@ -170,15 +171,32 @@ Mojo changes fast, and most of what you remember about it is out of date. Check 
 | `pixi run dodo test` | Build and run every test file. |
 | `pixi run dodo run` | Build and run the app once. |
 | `pixi run dodo routes` | List the routes. |
+| `pixi run dodo request GET /path` | Send one request to the app `dodo dev` runs. |
+| `pixi run dodo logs` | What `dodo dev` and the app printed, failed builds included. |
+| `pixi run dodo docs search "words"` | Search the pulled docs. |
 | `pixi run dodo doctor` | Check the toolchain and the project. |
 
 Every command takes `--json` and `--help`.
+
+## MCP
+
+`pixi run dodo mcp` serves the same powers as MCP tools over stdio: `routes_list`, `request_send`, `test_run`, `logs_tail`, `docs_search`, `doctor`. `.mcp.json` sets it up for Claude Code; give other agents the same command.
 
 ## Mojo 1.x
 
 - `def` only. `fn` is gone.
 - A function that can fail says `raises`.
 - `App` as a return type is written `App[]`.
+"""
+
+comptime _MCP_JSON = """{
+  "mcpServers": {
+    "dodo": {
+      "command": "pixi",
+      "args": ["run", "dodo", "mcp"]
+    }
+  }
+}
 """
 
 comptime _GITIGNORE = """.pixi/

@@ -26,7 +26,14 @@ from cli.report import (
 )
 from cli.version import DODO_VERSION
 
-from dodo_cli import Ran, dodo_binary, dodo_run, read_or_empty, scratch
+from dodo_cli import (
+    Ran,
+    dodo_binary,
+    dodo_run,
+    read_or_empty,
+    scratch,
+    scratch_path,
+)
 
 comptime _APP = "tests/cli/fixtures/cli_app.mojo"
 comptime _BROKEN = "tests/cli/fixtures/broken_app.mojo"
@@ -279,7 +286,7 @@ def _suites_project() raises -> String:
     """A project whose tests/ is a copy of the suites fixture. It is kept
     between runs and copied with times kept (`cp -p`), so its builds stay
     cached until a fixture changes."""
-    var dir = join(getenv("TMPDIR", "/tmp"), "dodo_e2e_suites")
+    var dir = scratch_path("suites")
     makedirs(join(dir, "tests"), exist_ok=True)
     var copied = run(["cp", "-Rp", _SUITES + "/.", join(dir, "tests")])
     assert_true(copied.succeeded())
@@ -356,7 +363,12 @@ def test_test_timeout() raises:
         result["files"][0]["exit"].as_string(), "still running after 0.50 s"
     )
     var left = run(
-        ["pgrep", "-f", "tests__hang__test_hang"], stdout_path="/dev/null"
+        [
+            "pgrep",
+            "-f",
+            join(dir, ".dodo", "build", "tests", "tests__hang__test_hang"),
+        ],
+        stdout_path="/dev/null",
     )
     assert_false(left.succeeded())
 
@@ -481,7 +493,12 @@ def test_test_interrupted() raises:
     var output = read_or_empty(out_path)
     assert_true("STOPPED tests/hang/test_hang.mojo" in output, output)
     var left = run(
-        ["pgrep", "-f", "tests__hang__test_hang"], stdout_path="/dev/null"
+        [
+            "pgrep",
+            "-f",
+            join(dir, ".dodo", "build", "tests", "tests__hang__test_hang"),
+        ],
+        stdout_path="/dev/null",
     )
     assert_false(left.succeeded())
 
@@ -535,6 +552,7 @@ from std.time import sleep
 
 
 def home(req: Request) raises -> String:
+    print("home asked")
     return "VERSION"
 
 
@@ -688,6 +706,55 @@ def _dev_session_steps(dir: String, mut dodo: Child) raises:
     var started = _dev_events(out_path, "started")
     assert_false(started[0]["restart"].as_bool())
 
+    # What the app prints reaches dodo's stdout and `dodo logs`.
+    _wait_for_text(out_path, "home asked\n")
+    var logs = dodo_run(["logs", "--json"], cwd=dir)
+    assert_equal(logs.code, EXIT_OK, logs.err)
+    assert_true(logs.json()["running"].as_bool())
+    assert_equal(logs.json()["url"].as_string(), url)
+    assert_true("home asked" in logs.json()["stdout"].as_string())
+
+    # `dodo request` finds the session by itself.
+    var asked = dodo_run(["request", "GET", "/", "--json"], cwd=dir)
+    assert_equal(asked.code, EXIT_OK, asked.err)
+    assert_equal(Int(asked.json()["status"].as_int()), 200)
+    assert_equal(asked.json()["body"].as_string(), '"v1"')
+
+    # One project runs one `dodo dev`. A second one that wrongly starts
+    # would run forever, so it gets a deadline.
+    var second_dir = scratch("dev_session_second")
+    var second_dodo = spawn(
+        [
+            "sh",
+            "-c",
+            'cd "$1" && shift && exec "$@"',
+            "sh",
+            dir,
+            dodo_binary(),
+            "dev",
+            "--port",
+            "0",
+            "--json",
+        ],
+        stdout_path=join(second_dir, "dev.out"),
+        stderr_path=join(second_dir, "dev.err"),
+    )
+    var second_started = perf_counter_ns()
+    while not second_dodo.poll():
+        if _seconds_since(second_started) > 30.0:
+            # Ctrl-C, so it stops the app it started too.
+            _ = _stop_dev(second_dodo)
+            raise Error("a second `dodo dev` started in the same project")
+        sleep(0.1)
+    var second_status = second_dodo.poll().value()
+    var second = Ran(
+        second_status.shell_code(),
+        read_or_empty(join(second_dir, "dev.out")),
+        read_or_empty(join(second_dir, "dev.err")),
+    )
+    assert_equal(second.code, EXIT_UNAVAILABLE, second.out)
+    assert_equal(second.json()["error"]["kind"].as_string(), "busy")
+
     # A save restarts it; a request in flight is finished by the old app.
     var slow_path = join(dir, "slow.out")
     var slow = spawn(
@@ -709,6 +776,11 @@ def _dev_session_steps(dir: String, mut dodo: Child) raises:
     var failed = _dev_events(out_path, "build_failed")[0].copy()
     var log = failed["log"].as_string()
     assert_true("error" in log, log)
+    var failed_logs = dodo_run(["logs", "--json"], cwd=dir).json()
+    var events = failed_logs["events"].copy()
+    var last = events[len(events) - 1].copy()
+    assert_equal(last["event"].as_string(), "build_failed")
+    assert_true("error" in last["log"].as_string())
     assert_equal(_get(url), '"v2"')
     _save_version(dir, "v3")
     _wait_for_body(url, '"v3"', out_path)
@@ -735,6 +807,8 @@ def _dev_session_steps(dir: String, mut dodo: Child) raises:
     var result = loads(String(lines[len(lines) - 1]))
     assert_equal(result["command"].as_string(), "dev")
     assert_equal(result["url"].as_string(), url)
+    var stopped = dodo_run(["logs", "--json"], cwd=dir)
+    assert_false(stopped.json()["running"].as_bool())
 
 
 def test_dev_text_output() raises:

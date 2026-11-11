@@ -12,7 +12,11 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 | `dodo routes [FILE]` | List the app's routes. |
 | `dodo doctor` | Check the toolchain, the project and the machine. |
 | `dodo docs pull [mojo@V] [dodo@V]` | Download the Mojo and dodo docs into `.dodo/docs/`. `--mojo V`, `--dodo V`. |
-| `dodo new NAME` | Make a project folder: `pixi.toml`, `main.mojo`, `app.mojo`, `tests/`, `AGENTS.md`, `CLAUDE.md`. `--no-git` skips `git init`. |
+| `dodo docs search QUERY...` | Find pages in `.dodo/docs/` that have the query's words, best first, with their best lines. `--limit N` (default 10). |
+| `dodo logs` | What the project's `dodo dev` printed: its latest events (failed builds with the compiler's errors) and the app's last stdout and stderr lines. `--lines N` (default 100). |
+| `dodo request METHOD PATH [NAME:VALUE...]` | Send one request to the running `dodo dev` (or to a full `http(s)://` URL) and show the answer. `--body`, `--body-file`, `--url`, `--timeout SECONDS` (default 30). Redirects are not followed. |
+| `dodo mcp` | An MCP server over stdio for agents (below). |
+| `dodo new NAME` | Make a project folder: `pixi.toml`, `main.mojo`, `app.mojo`, `tests/`, `AGENTS.md`, `CLAUDE.md`, `.mcp.json`. `--no-git` skips `git init`. |
 
 ## Exit codes
 
@@ -34,7 +38,7 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 - The files go into a hidden `.NAME.new.PID` folder next to the target and are moved into place at the end, so a failure leaves nothing.
 - It runs `git init` (no first commit), unless `--no-git` is given or the folder is inside a git repository already.
 - `pixi.toml` gets `dodo` from the modular-community channel, pinned to this CLI's version. `DODO_PACKAGE_CHANNEL` swaps the channel, for a package built locally with `packaging/build_local.sh` (`file:///path/to/build/conda`).
-- `AGENTS.md` tells an agent to read the docs in `.dodo/docs/` first; `CLAUDE.md` is the one line `@AGENTS.md`.
+- `AGENTS.md` tells an agent to read the docs in `.dodo/docs/` first; `CLAUDE.md` is the one line `@AGENTS.md`. `.mcp.json` hooks up `pixi run dodo mcp`, so Claude Code finds the tools on its own.
 
 ## How `dodo dev` works
 
@@ -44,6 +48,16 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 - An app that exits by itself is reported and starts again on the next save.
 - The app and each build run in their own process group, so Ctrl-C reaches only dodo. dodo stops the app the same way and exits with 130. A second Ctrl-C half a second or more later kills the app at once.
 - With `--json`, each event is one line on stdout among the app's own output: `{"dodo_dev": {"event": "listening" | "building" | "build_failed" | "started" | "app_exited" | "stopped", ...}}`.
+- The app writes to `.dodo/dev/app.out` and `app.err`; dodo copies each whole new line to its own stdout and stderr. `.dodo/dev/state.json` holds the session's pid, URL and last 50 events (written to a temporary file, then renamed). `dodo logs` and `dodo request` read them.
+- One project runs one `dodo dev`: a second is refused while the first one's pid is alive. A session that was killed outright counts as stopped.
+
+## How `dodo mcp` works
+
+- An MCP server on stdin and stdout, one JSON-RPC message per line. It speaks the stateless `2026-07-28` protocol (`server/discover`, the version in each request's `_meta`) and the older `initialize` handshake (`2025-11-25` back to `2024-11-05`), so current and older clients both work.
+- Six tools, each running the matching command with `--json` and returning its object as `structuredContent`: `routes_list`, `request_send`, `test_run`, `logs_tail`, `docs_search`, `doctor`. A command that fails is a tool result with `isError: true`, so the agent sees why.
+- Tool arguments are checked before anything runs: unknown keys, wrong types and words that look like flags are refused.
+- Before reading, dodo moves the message stream to private descriptors and points stdin at `/dev/null` and stdout at stderr, so a test that reads stdin or prints cannot break the stream. A line over 16 MiB is answered with a parse error and skipped.
+- `request_send` and `logs_tail` need `dodo dev` running in a terminal; the server never starts it.
 
 ## How `dodo docs pull` works
 

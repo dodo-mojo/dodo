@@ -21,6 +21,7 @@ comptime _FILES: List[String] = [
     "tests/test_app.mojo",
     "AGENTS.md",
     "CLAUDE.md",
+    ".mcp.json",
     ".gitignore",
     ".gitattributes",
 ]

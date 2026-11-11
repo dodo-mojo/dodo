@@ -48,6 +48,48 @@ def command_specs() -> List[CommandSpec]:
     )
     specs.append(
         CommandSpec(
+            name="logs",
+            summary="Show what the running `dodo dev` and its app printed",
+            usage="",
+            flags=[
+                FlagSpec(
+                    "lines",
+                    "N",
+                    "Show this many of the app's last lines (default 100)",
+                ),
+            ],
+            max_positionals=0,
+            allows_passthrough=False,
+        )
+    )
+    specs.append(
+        CommandSpec(
+            name="request",
+            summary="Send one request to the app that `dodo dev` runs",
+            usage="METHOD PATH [NAME:VALUE...]",
+            flags=[
+                FlagSpec("body", "TEXT", "The request body"),
+                FlagSpec("body-file", "FILE", "Send this file as the body"),
+                FlagSpec(
+                    "url",
+                    "URL",
+                    "Send to this server instead of the running `dodo dev`",
+                ),
+                FlagSpec(
+                    "timeout",
+                    "SECONDS",
+                    (
+                        "Give up waiting for the answer after this long"
+                        " (default 30)"
+                    ),
+                ),
+            ],
+            max_positionals=-1,
+            allows_passthrough=False,
+        )
+    )
+    specs.append(
+        CommandSpec(
             name="test",
             summary="Build and run every tests/**/test_*.mojo file",
             usage="[PATH...]",
@@ -106,6 +148,30 @@ def command_specs() -> List[CommandSpec]:
                 ),
             ],
             max_positionals=2,
+            allows_passthrough=False,
+        )
+    )
+    specs.append(
+        CommandSpec(
+            name="docs search",
+            summary="Search the pulled docs in .dodo/docs/",
+            usage="QUERY...",
+            flags=[
+                FlagSpec(
+                    "limit", "N", "Show this many pages at most (default 10)"
+                ),
+            ],
+            max_positionals=-1,
+            allows_passthrough=False,
+        )
+    )
+    specs.append(
+        CommandSpec(
+            name="mcp",
+            summary="Serve dodo's tools to AI agents over MCP (stdio)",
+            usage="",
+            flags=List[FlagSpec](),
+            max_positionals=0,
             allows_passthrough=False,
         )
     )
