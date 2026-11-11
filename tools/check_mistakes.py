@@ -417,6 +417,60 @@ MISTAKES = [
         "        read_timeout = Int(given)\n",
         "        _ = Int(given)\n",
     ),
+    Mistake(
+        "new accepts any project name",
+        "cli/cmd_new.mojo",
+        '    if problem != "":\n',
+        "    if False:\n",
+    ),
+    Mistake(
+        "new writes through a symlink",
+        "cli/cmd_new.mojo",
+        "    if islink(path):\n        return True\n",
+        "",
+    ),
+    Mistake(
+        "new refuses an empty folder",
+        "cli/cmd_new.mojo",
+        "        return len(listdir(path)) > 0\n",
+        "        return True\n",
+    ),
+    Mistake(
+        "new leaves its hidden folder behind on failure",
+        "cli/cmd_new.mojo",
+        "        _remove_quietly(staging)\n",
+        "",
+    ),
+    Mistake(
+        "new makes a repository inside a repository",
+        "cli/cmd_new.mojo",
+        "            git = GIT_INSIDE_REPO\n",
+        "            pass\n",
+    ),
+    Mistake(
+        "new ignores --no-git",
+        "cli/cmd_new.mojo",
+        '    if not parsed.has("no-git"):\n',
+        "    if True:\n",
+    ),
+    Mistake(
+        "new skips the write check and leaks the hidden folder's name",
+        "cli/cmd_new.mojo",
+        "    if not can_write(parent):\n",
+        "    if False:\n",
+    ),
+    Mistake(
+        "new prints a path with spaces unquoted",
+        "cli/cmd_new.mojo",
+        '    if plain and word != "":\n',
+        '    if word != "":\n',
+    ),
+    Mistake(
+        "new ignores DODO_PACKAGE_CHANNEL",
+        "cli/new_files.mojo",
+        '    if channel != "":\n        return channel\n',
+        "",
+    ),
 ]
 
 

@@ -8,6 +8,7 @@ from cli.args import ParsedArgs, parse_args
 from cli.cmd_dev import cmd_dev
 from cli.cmd_docs import cmd_docs_pull
 from cli.cmd_doctor import cmd_doctor
+from cli.cmd_new import cmd_new
 from cli.cmd_routes import cmd_routes
 from cli.cmd_run import cmd_run
 from cli.cmd_test import cmd_test
@@ -56,6 +57,8 @@ def run_cli(words: List[String]) -> Int:
 
 
 def _dispatch(parsed: ParsedArgs, mut report: Report) raises -> Int:
+    if parsed.command == "new":
+        return cmd_new(parsed, report)
     if parsed.command == "run":
         return cmd_run(parsed, report)
     if parsed.command == "routes":
