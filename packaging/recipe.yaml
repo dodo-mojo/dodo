@@ -33,6 +33,10 @@ build:
 
         mojo precompile dodo -o "${PREFIX}/lib/mojo/dodo.mojoc"
 
+        # The `dodo` command, so a project can `pixi run dodo ...`.
+        mkdir -p "${PREFIX}/bin"
+        mojo build -I . cli/main.mojo -o "${PREFIX}/bin/dodo"
+
 requirements:
   build:
     - ${{ compiler('c') }}
@@ -91,6 +95,15 @@ tests:
             sleep 0.2
           done
           test "${BODY}" = "hello from dodo"
+
+          # The `dodo` command runs and finds the package it came with.
+          test -x "${PREFIX}/bin/dodo"
+          test "$(dodo --version)" = "dodo ${{ version }}"
+          dodo help --json | grep -q '"ok":true'
+          DOCTOR="$(dodo doctor --json || true)"
+          for check in "mojo" "dodo package" "native libraries"; do
+            echo "${DOCTOR}" | grep -q "\"name\":\"${check}\",\"status\":\"ok\""
+          done
 
 about:
   homepage: https://github.com/dodo-mojo/dodo

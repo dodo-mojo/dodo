@@ -1,6 +1,6 @@
 # The `dodo` command line
 
-One binary, written in Mojo, in `cli/`. Build it with `pixi run cli-build` (to `build/bin/dodo`). It imports dodo like any app. Tests are in `tests/cli/`.
+One binary, written in Mojo, in `cli/`. Build it with `pixi run cli-build` (to `build/bin/dodo`). The conda package installs it as `bin/dodo`, so a project that depends on `dodo` runs it with `pixi run dodo`. It imports dodo like any app. Tests are in `tests/cli/`.
 
 Every command takes `--json` (one JSON object on stdout) and `--help`. dodo never asks questions; everything is a flag. `dodo help COMMAND` prints a command's flags.
 
