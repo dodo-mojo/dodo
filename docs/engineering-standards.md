@@ -33,7 +33,7 @@ elif cfg.idle > 0:
 - Unit tests for every module. Conformance tests for protocol behavior. Fuzzing for every parser.
 - Every user-facing input field and button is tested in a real browser against its edge cases: empty, whitespace only, very long, Unicode and emoji, HTML and script injection, SQL-like strings, negative and huge numbers, paste, double-submit, slow network, and keyboard-only use. Claude runs these in its built-in browser before calling UI work done.
 - Performance claims need a reproducible benchmark committed in `bench/`.
-- Tests are checked by planting mistakes: `pixi run check-mistakes` (`tools/check_mistakes.py`) makes one small, deliberate bug at a time (a flipped check, a skipped kill, a wrong exit code), runs the tests and puts the file back. Every mistake must make a test fail; one that does not gets a new test. Add mistakes to the list for each new piece of logic, and run it after changing code the list covers.
+- Tests are checked by planting mistakes: `pixi run check-mistakes` (`tools/check_mistakes.py`) makes one small, deliberate bug at a time (a flipped check, a skipped kill, a wrong exit code), runs the tests and puts the file back. It first runs the tests with nothing planted and stops if one fails, since a failing test would catch every mistake. Every mistake must make a test fail; one that does not gets a new test. Add mistakes to the list for each new piece of logic, and run it after changing code the list covers.
 
 ## 3. Performance
 

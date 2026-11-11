@@ -43,7 +43,7 @@
 
 ## `dodo` CLI (branch `feat/cli`, in progress)
 
-Scope: `new`, `run`, `dev`, `test`, `routes`, `doctor`, `docs pull`. Every command has `--json`, stable exit codes and no prompts without a TTY. `dodo mcp` is the next PR.
+Scope: `new`, `run`, `dev`, `test`, `routes`, `doctor`, `docs pull`, then `logs`, `request`, `docs search` and `mcp` for agents. Every command has `--json`, stable exit codes and no prompts without a TTY.
 
 Decisions (asked one at a time):
 
@@ -65,8 +65,9 @@ Build order, each step tested end to end before the next:
 - [ ] First release that saves its docs (`tools/save_docs.py dodo --release`); until then the dodo half of `dodo docs pull` finds none, since dev still says 0.0.1
 - [x] `dodo new`: pixi.toml (dodo from modular-community, pinned), main.mojo, app.mojo, tests/, AGENTS.md, CLAUDE.md (`@AGENTS.md`), .gitignore; only writes files; `git init` unless `--no-git` or inside a repository. No TODO.md, ADRs or commit hook: those are the dodo repo's own habits, not every app's (decided 2026-11-11).
 - [x] `dodo run`, `dodo test`, `dodo routes`, `dodo doctor`
-- [x] Planted-mistake check for the CLI (`pixi run check-mistakes`): 61 mistakes, all caught
+- [x] Planted-mistake check for the CLI (`pixi run check-mistakes`): 78 mistakes
 - [x] `dodo dev`: change detection, restart, socket kept open across restarts
+- [x] `dodo mcp` with six tools (`routes_list`, `request_send`, `test_run`, `logs_tail`, `docs_search`, `doctor`), both the 2026-07-28 and the older protocol; `dodo logs`, `dodo request` and `dodo docs search` as commands too; `dodo dev` keeps its state and the app's output in `.dodo/dev/`; `dodo new` writes `.mcp.json`. Checked with Claude Code 2.1.306 as the client. `profile_run`, `bench_run` and `add_route` come with their commands.
 - [x] Packaging: the recipe builds `$PREFIX/bin/dodo` and its tests run `--version`, `help` and `doctor`, so a project from `dodo new` has `pixi run dodo`
 - [ ] Profile every command (startup, docs pull, dev restart time) and fix the slow parts, with before/after numbers
 - [x] Retire `tools/docs_pull.py`; update CLAUDE.md, design.md and README
@@ -93,7 +94,7 @@ Rule: learn from other packages and write our own; copy code only under a permis
 Agents know little Mojo, and it changes fast, so these come first:
 
 - [x] `pixi run docs-pull` (`tools/docs_pull.py`): pulls the Mojo docs for the toolchain in use (`.dodo/docs/mojo-1.2.0/`, from mojolang.org) and dodo's guides plus `mojo doc` API JSON (`.dodo/docs/dodo-0.0.1/`). Retired 2026-11-08: replaced by `dodo docs pull` and the archives in `mojo-docs/` and `docs/`.
-- [ ] `dodo docs`: the CLI form of the above, with versions from the project and `dodo docs pull mojo@1.2 dodo@0.1` for others. mojolang.org serves only the latest release, so pulling an older Mojo needs another source. The generated AGENTS.md points agents there. `dodo docs search "<query>"` searches them, with `--json`.
+- [x] `dodo docs`: the CLI form of the above, with versions from the project and `dodo docs pull mojo@1.2 dodo@0.1` for others. mojolang.org serves only the latest release, so pulling an older Mojo needs another source. The generated AGENTS.md points agents there. `dodo docs search "<query>"` searches them, with `--json`.
 - [ ] Mojo 1.x cheat sheet for agents in those docs: what changed (no `fn`, explicit `raises`, `comptime`, `std.` paths) with before and after examples.
 - [ ] `dodo fix`: rewrite outdated Mojo syntax automatically, like `cargo fix`.
 - [ ] Compiler error explainer: wrap `mojo build` and turn common errors into a plain cause and a fix, as text or JSON.
