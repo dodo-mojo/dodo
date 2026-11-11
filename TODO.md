@@ -67,7 +67,7 @@ Build order, each step tested end to end before the next:
 - [x] `dodo run`, `dodo test`, `dodo routes`, `dodo doctor`
 - [x] Planted-mistake check for the CLI (`pixi run check-mistakes`): 61 mistakes, all caught
 - [x] `dodo dev`: change detection, restart, socket kept open across restarts
-- [ ] Packaging: `mojo build` installs `$PREFIX/bin/dodo`, recipe tests cover it. Until then a project from `dodo new` has no `dodo` command (checked 2026-11-11 with `build/bin/dodo` on `PATH` and the local package).
+- [x] Packaging: the recipe builds `$PREFIX/bin/dodo` and its tests run `--version`, `help` and `doctor`, so a project from `dodo new` has `pixi run dodo`
 - [ ] Profile every command (startup, docs pull, dev restart time) and fix the slow parts, with before/after numbers
 - [x] Retire `tools/docs_pull.py`; update CLAUDE.md, design.md and README
 - [ ] Planted mistakes for the library too (HTTP parser, router, scheduler, drivers), added as each area is next touched
