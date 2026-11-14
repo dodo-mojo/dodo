@@ -32,6 +32,7 @@ from std.memory import Pointer, stack_allocation
 from std.sys.info import CompilationTarget, platform_map
 from std.os import getenv
 
+from ..utils.c_string import prepare_c_string
 from ..utils.dylib import find_dodo_lib
 from ._libc_cloexec import (
     F_GETFD,
@@ -746,6 +747,7 @@ def _getaddrinfo(
         0 on success, non-zero ``EAI_*`` error code on failure.
     """
     var host_copy = host
+    prepare_c_string(host_copy)
     return external_call["getaddrinfo", c_int](
         host_copy.as_c_string_span(),
         Optional[Pointer[UInt8, MutUntrackedOrigin]](None),
@@ -807,6 +809,7 @@ def _inet_pton(family: c_int, src: String, dst: Pointer[UInt8, _]) -> c_int:
     """
     # as_c_string_span() is mutating; copy into a local var first.
     var src_copy = src
+    prepare_c_string(src_copy)
     return external_call["inet_pton", c_int](
         family, src_copy.as_c_string_span(), dst.unsafe_bitcast[NoneType]()
     )

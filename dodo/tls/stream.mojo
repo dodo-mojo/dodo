@@ -52,6 +52,7 @@ from std.ffi import OwnedDLHandle, c_char, c_int, CStringSpan
 from std.memory import Pointer, stack_allocation
 from ..dns import resolve
 from ..net import SocketAddr, NetworkError, _find_dodo_lib
+from ..utils.c_string import prepare_c_string
 from ..utils.dylib import dl_sym
 from ..tcp import TcpStream
 from ..tcp.stream import _connect_with_fallback
@@ -137,17 +138,18 @@ def _do_ssl_ctx_load_ca_bundle(
     var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
         lib, "dodo_ssl_ctx_load_ca_bundle"
     )
-    # NUL-terminate in place before the C call. A path materialized from
-    # a StringSlice is not NUL-terminated under unsafe_ptr, so OpenSSL's
-    # file open would read past it (same defect as the SNI host fixed in
-    # _do_ssl_connect). `ca_path` is owned and outlives the call; `ca_c`
-    # views its now-terminated buffer.
+    # NUL-terminate in place before the C call. A path made from a
+    # StringSlice is not NUL-terminated under unsafe_ptr, and the empty
+    # default path points into the static string pool (see
+    # `dodo.utils.c_string`). `ca_path` is owned and outlives the call;
+    # `ca_c` views its now-terminated buffer.
+    prepare_c_string(ca_path)
     var ca_c = ca_path.as_c_string_span()
     var rc = Int(f(ctx, Int(ca_c.ptr())))
     # The C-string pointer escapes as raw Int; anchor the owned buffer
     # past the synchronous call so it is not ASAP-destroyed before
     # OpenSSL reads the path (heap-use-after-free under asan when
-    # as_c_string_slice had to reallocate a slice-derived path).
+    # as_c_string_span had to reallocate a slice-derived path).
     _ = ca_path^
     return rc
 
@@ -163,7 +165,9 @@ def _do_ssl_ctx_load_cert_key(
     )
     # See _do_ssl_ctx_load_ca_bundle: NUL-terminate slice-derived paths
     # in place. Both owned args outlive the single FFI call.
+    prepare_c_string(cert_path)
     var cert_c = cert_path.as_c_string_span()
+    prepare_c_string(key_path)
     var key_c = key_path.as_c_string_span()
     var rc = Int(f(ctx, Int(cert_c.ptr()), Int(key_c.ptr())))
     # Anchor the owned buffers past the call (see _do_ssl_ctx_load_ca_bundle).
@@ -203,7 +207,8 @@ def _do_ssl_connect(
     # common case — `Url.parse(...).host`) is not NUL-terminated under
     # `unsafe_ptr`, so OpenSSL's SSL_set_tlsext_host_name would read past the
     # hostname and send a corrupted SNI (some servers reply handshake_failure).
-    # `as_c_string_slice` is mutating and `sni` is owned + lives across the call.
+    # `as_c_string_span` is mutating and `sni` is owned + lives across the call.
+    prepare_c_string(sni)
     var cstr = sni.as_c_string_span()
     var rc = Int(f(ssl, Int(cstr.ptr())))
     # Anchor the owned SNI buffer past the call (see
@@ -225,6 +230,7 @@ def _do_ssl_connect_ex(
         lib, "dodo_ssl_connect_ex"
     )
     # Same NUL-termination dance as _do_ssl_connect; see the note there.
+    prepare_c_string(sni)
     var cstr = sni.as_c_string_span()
     var rc = Int(f(ssl, Int(cstr.ptr())))
     _ = sni^

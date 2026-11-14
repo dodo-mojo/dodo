@@ -220,6 +220,7 @@ Every relative link below is a file of these docs. `tools/save_docs.py dodo` wri
 - [`dodo.uds.listener`](api/uds/listener.md): AF_UNIX listener — bound + listening Unix domain socket.
 - [`dodo.uds.stream`](api/uds/stream.md): Connected AF_UNIX byte stream.
 - [`dodo.utils`](api/utils/index.md): Cross-cutting utility helpers that don't fit any other layer.
+- [`dodo.utils.c_string`](api/utils/c_string.md): Passing a `String` to C.
 - [`dodo.utils.dylib`](api/utils/dylib.md): Canonical FFI dylib path resolver shared across :mod:`dodo`.
 - [`dodo.utils.posix_proc`](api/utils/posix_proc.md): POSIX process-control helpers thin-wrapped over ``external_call``.
 - [`dodo.utils.process`](api/utils/process.md): Start programs, wait for them to end, and stop them.

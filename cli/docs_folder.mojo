@@ -5,6 +5,8 @@ from std.ffi import external_call
 from std.os import listdir, makedirs, remove, rmdir
 from std.os.path import basename, dirname, exists, isdir, islink, join
 
+from dodo.utils.c_string import prepare_c_string
+
 
 def remove_tree(path: String) raises:
     """Delete `path` and everything under it. A symlink is deleted, never
@@ -35,6 +37,8 @@ def move_path(old: String, new: String) raises:
     """
     var from_path = old
     var to_path = new
+    prepare_c_string(from_path)
+    prepare_c_string(to_path)
     var rc = external_call["rename", Int32](
         from_path.as_c_string_span(), to_path.as_c_string_span()
     )
