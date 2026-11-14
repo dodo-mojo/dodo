@@ -10,6 +10,7 @@ Cross-cutting utility helpers that don't fit any other layer.
 - :mod:`dodo.utils.signals`: record Ctrl-C, SIGTERM and SIGHUP instead
   of dying, for loops that shut down cleanly.
 - :mod:`dodo.utils.dylib`: finds and loads dodo's wrapper libraries.
+- :mod:`dodo.utils.c_string`: makes a ``String`` safe to pass to C.
 
 Future inhabitants belong here when they're (a) low-level enough
 that they don't fit a protocol-shaped subpackage like
@@ -23,6 +24,7 @@ specific should land in the most-specific subpackage that uses it.
 
 ## Modules
 
+- [`dodo.utils.c_string`](c_string.md): Passing a `String` to C.
 - [`dodo.utils.dylib`](dylib.md): Canonical FFI dylib path resolver shared across :mod:`dodo`.
 - [`dodo.utils.posix_proc`](posix_proc.md): POSIX process-control helpers thin-wrapped over ``external_call``.
 - [`dodo.utils.process`](process.md): Start programs, wait for them to end, and stop them.

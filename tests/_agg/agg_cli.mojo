@@ -118,6 +118,9 @@ from test_args import (
 )
 from test_dev import test_nothing_changed as test_dev__test_nothing_changed
 from test_dev import test_edit_is_seen_once as test_dev__test_edit_is_seen_once
+from test_dev import (
+    test_edit_right_after_a_look_is_seen as test_dev__test_edit_right_after_a_look_is_seen,
+)
 from test_dev import test_new_file_is_seen as test_dev__test_new_file_is_seen
 from test_dev import (
     test_removed_file_is_seen as test_dev__test_removed_file_is_seen,
@@ -135,7 +138,7 @@ from test_dev import (
     test_missing_root_raises as test_dev__test_missing_root_raises,
 )
 from test_dev import (
-    test_tree_lists_folders_with_times as test_dev__test_tree_lists_folders_with_times,
+    test_tree_lists_folders_with_listings as test_dev__test_tree_lists_folders_with_listings,
 )
 from test_dev import test_parse_port as test_dev__test_parse_port
 from test_dev import test_parse_host as test_dev__test_parse_host
@@ -668,13 +671,14 @@ def main() raises:
     # tests/cli/test_dev.mojo
     suite.test[test_dev__test_nothing_changed]()
     suite.test[test_dev__test_edit_is_seen_once]()
+    suite.test[test_dev__test_edit_right_after_a_look_is_seen]()
     suite.test[test_dev__test_new_file_is_seen]()
     suite.test[test_dev__test_removed_file_is_seen]()
     suite.test[test_dev__test_save_by_rename_is_seen]()
     suite.test[test_dev__test_new_folder_with_a_file_is_seen]()
     suite.test[test_dev__test_other_files_and_skipped_folders_are_ignored]()
     suite.test[test_dev__test_missing_root_raises]()
-    suite.test[test_dev__test_tree_lists_folders_with_times]()
+    suite.test[test_dev__test_tree_lists_folders_with_listings]()
     suite.test[test_dev__test_parse_port]()
     suite.test[test_dev__test_parse_host]()
     suite.test[test_dev__test_url_of]()

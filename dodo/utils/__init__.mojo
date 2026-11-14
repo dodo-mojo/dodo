@@ -8,6 +8,7 @@
 - :mod:`dodo.utils.signals`: record Ctrl-C, SIGTERM and SIGHUP instead
   of dying, for loops that shut down cleanly.
 - :mod:`dodo.utils.dylib`: finds and loads dodo's wrapper libraries.
+- :mod:`dodo.utils.c_string`: makes a ``String`` safe to pass to C.
 
 Future inhabitants belong here when they're (a) low-level enough
 that they don't fit a protocol-shaped subpackage like

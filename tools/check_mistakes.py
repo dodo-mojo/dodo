@@ -198,7 +198,7 @@ MISTAKES = [
     Mistake(
         "an edit is reported again on every check",
         "cli/watch.mojo",
-        "                self.file_times[i] = now\n",
+        "                self.file_times[i] = now[0]\n",
         "",
     ),
     Mistake(
@@ -210,8 +210,17 @@ MISTAKES = [
     Mistake(
         "a file saved by renaming over the old one is missed",
         "cli/watch.mojo",
-        "            return old_times != self.file_times",
+        (
+            "            return old_times != self.file_times"
+            " or old_sizes != self.file_sizes"
+        ),
         "            return False",
+    ),
+    Mistake(
+        "an edit in the same tick as the last look is missed",
+        "cli/watch.mojo",
+        "            if now[0] != self.file_times[i] or now[1] != self.file_sizes[i]:",
+        "            if now[0] != self.file_times[i]:",
     ),
     Mistake(
         "dev does not hand the app its listening socket",

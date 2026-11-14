@@ -19,6 +19,7 @@ from std.os.path import (
 )
 
 from dodo.json import Value
+from dodo.utils.c_string import prepare_c_string
 
 from .args import ParsedArgs
 from .capture import capture
@@ -162,6 +163,7 @@ def can_write(folder: String) -> Bool:
     """`access(2)` with `W_OK`."""
     comptime W_OK = 2
     var path = folder
+    prepare_c_string(path)
     var rc = external_call["access", Int32](
         path.as_c_string_span(), Int32(W_OK)
     )

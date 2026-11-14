@@ -50,6 +50,7 @@ from std.ffi import c_int, OwnedDLHandle
 from std.memory import Pointer
 
 from ..net import _find_dodo_lib
+from ..utils.c_string import prepare_c_string
 from ..utils.dylib import dl_sym
 
 
@@ -63,11 +64,11 @@ from ..utils.dylib import dl_sym
 # stays mapped across the entire FFI surface.
 #
 # Path arguments are taken as owned ``var`` and NUL-terminated in place
-# with ``as_c_string_slice`` before the C call: a path materialized from
-# a StringSlice is not NUL-terminated under ``unsafe_ptr``, so OpenSSL's
-# file open would read past it (same defect as the SNI host fixed in
-# ``dodo/tls/stream.mojo`` ``_do_ssl_connect``). The owned arg outlives
-# the call; the slice views its now-terminated buffer.
+# with ``prepare_c_string`` and ``as_c_string_span`` before the C call: a
+# path made from a StringSlice is not NUL-terminated under
+# ``unsafe_ptr``, and an empty default one points into the static string
+# pool (see ``dodo.utils.c_string``). The owned arg outlives the call;
+# the span views its now-terminated buffer.
 
 
 def _do_ssl_ctx_new_server(
@@ -76,12 +77,14 @@ def _do_ssl_ctx_new_server(
     var f = dl_sym[def(Int, Int) thin abi("C") -> Int](
         lib, "dodo_ssl_ctx_new_server"
     )
+    prepare_c_string(cert_path)
     var cert_c = cert_path.as_c_string_span()
+    prepare_c_string(key_path)
     var key_c = key_path.as_c_string_span()
     var addr = f(Int(cert_c.ptr()), Int(key_c.ptr()))
     # The C-string pointers escape as raw Int, so the compiler does not
     # see that the owned path buffers must stay live across the call.
-    # as_c_string_slice may reallocate (a slice-derived, exact-length
+    # as_c_string_span may reallocate (a slice-derived, exact-length
     # path has no spare byte for the NUL), and without anchoring the
     # owner is ASAP-destroyed before OpenSSL reads the path -- a
     # heap-use-after-free. Keep both alive until the synchronous call
@@ -107,7 +110,9 @@ def _do_ssl_ctx_reload(
     var f = dl_sym[def(Int, Int, Int) thin abi("C") -> c_int](
         lib, "dodo_ssl_ctx_reload"
     )
+    prepare_c_string(cert_path)
     var cert_c = cert_path.as_c_string_span()
+    prepare_c_string(key_path)
     var key_c = key_path.as_c_string_span()
     var rc = Int(f(addr, Int(cert_c.ptr()), Int(key_c.ptr())))
     # Anchor the owned buffers past the call (see _do_ssl_ctx_new_server).
@@ -127,8 +132,11 @@ def _do_ssl_ctx_set_cert(
     var f = dl_sym[def(Int, Int, Int, Int) thin abi("C") -> c_int](
         lib, "dodo_ssl_ctx_set_cert"
     )
+    prepare_c_string(host)
     var host_c = host.as_c_string_span()
+    prepare_c_string(cert_path)
     var cert_c = cert_path.as_c_string_span()
+    prepare_c_string(key_path)
     var key_c = key_path.as_c_string_span()
     var rc = Int(
         f(addr, Int(host_c.ptr()), Int(cert_c.ptr()), Int(key_c.ptr()))
@@ -156,6 +164,7 @@ def _do_ssl_ctx_set_verify_client_cert(
     var f = dl_sym[def(Int, Int) thin abi("C") -> c_int](
         lib, "dodo_ssl_ctx_set_verify_client_cert"
     )
+    prepare_c_string(ca_path)
     var ca_c = ca_path.as_c_string_span()
     var rc = Int(f(addr, Int(ca_c.ptr())))
     # Anchor the owned buffer past the call (see _do_ssl_ctx_new_server).
