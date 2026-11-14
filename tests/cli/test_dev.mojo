@@ -60,6 +60,16 @@ def test_edit_is_seen_once() raises:
     assert_false(watcher.changed())
 
 
+def test_edit_right_after_a_look_is_seen() raises:
+    # No sleep: the edit can land in the same tick of the file system's
+    # clock as the look, so the change time alone may not move.
+    var dir = _project("watch_quick_edit")
+    var watcher = Watcher(dir)
+    with open(join(dir, "src", "lib.mojo"), "w") as file:
+        file.write("def f():\n    print(12345)\n")
+    assert_true(watcher.changed())
+
+
 def test_new_file_is_seen() raises:
     var dir = _project("watch_new")
     var watcher = Watcher(dir)
@@ -116,13 +126,14 @@ def test_missing_root_raises() raises:
         _ = watcher.changed()
 
 
-def test_tree_lists_folders_with_times() raises:
+def test_tree_lists_folders_with_listings() raises:
     var dir = _project("watch_tree")
     var tree = ProjectTree(dir)
     assert_equal(len(tree.dirs), 2)
     assert_equal(tree.dirs[0], dir)
     assert_equal(tree.dirs[1], join(dir, "src"))
-    assert_true(tree.dir_times[0] > 0)
+    assert_equal(tree.dir_listings[0], "main.mojo\nsrc")
+    assert_equal(tree.dir_listings[1], "lib.mojo")
     assert_equal(len(tree.files), 2)
 
 
