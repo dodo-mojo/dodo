@@ -347,9 +347,11 @@ def test_a_missing_file_keeps_the_old_docs() raises:
 def test_a_missing_file_stops_the_other_downloads() raises:
     var site = _site("stops")
     var folder = join(site, "dev", "mojo-docs", "1.3.1")
+    # Each page takes a second, so a thread that sees the stop asks for
+    # at most the one page it was on when gone.md failed.
     var links = String("- [Gone](gone.md)\n")
     for i in range(80):
-        var name = String("page_", i, ".md")
+        var name = String("slow_page_", i, ".md")
         links += String("- [Page](", name, ")\n")
         _write(join(folder, name), "page")
     _docs_folder(folder, "Mojo 1.3.1", links)
@@ -365,9 +367,9 @@ def test_a_missing_file_stops_the_other_downloads() raises:
     var asked = 0
     for i in range(80):
         asked += server.requests_for(
-            String("/dev/mojo-docs/1.3.1/page_", i, ".md")
+            String("/dev/mojo-docs/1.3.1/slow_page_", i, ".md")
         )
-    assert_true(asked < 80, String("every page was still asked for"))
+    assert_true(asked <= 16, String(asked, " pages were still asked for"))
     _assert_old_docs_kept(project)
 
 
