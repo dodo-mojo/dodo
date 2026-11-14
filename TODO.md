@@ -17,7 +17,6 @@
 - [ ] Performance pass: set up a bare-metal Linux benchmark box (cloud VM is fine); profile the HTTP/1.1 hot path (allocations, copies, syscalls per request); rewrite or remove what's slow; benchmark against other Mojo frameworks and the fastest Rust/Go servers.
 - [ ] Clean imported code as we touch it: remove Flare's changelog-style and personal comments, restyle to our standards.
 - [ ] Phase 0 spikes (see `docs/design.md` §9).
-- [ ] Publish `0.0.1`: tag `v0.0.1` on `production`, then open the modular-community PR with `packaging/recipe.yaml` and `packaging/tests/` as `recipes/dodo/`. The recipe builds and passes its tests on macOS arm64 and Linux aarch64 (`packaging/build_local.sh`); Linux x86-64 is checked only by the channel's CI.
 - [ ] Enable GitHub Pages for docs at `dodo-mojo.github.io/dodo`.
 - [ ] PyPI `dodo-mojo`: only if we ship a pip-installable CLI.
 - [ ] Review, after the offload pool lands: is it worth folding `serve_cancellable`'s `Cancel` support and the streaming loop into the unified loop, so the remaining separate loops can be deleted? Weigh the code removed against the risk and the performance-pass numbers.
@@ -62,7 +61,6 @@ Build order, each step tested end to end before the next:
 - [x] CLI core: argument parsing, `--json` output, exit codes, TTY check
 - [x] Docs archive: Mojo 1.2.0 split into topic files with an index, the Mojo 1.x cheat sheet, dodo's docs per release, the save-a-new-release tool, license check and credit
 - [x] `dodo docs pull`: project versions, `--mojo`/`--dodo` and `mojo@1.2 dodo@0.1`, short versions, every error case, never delete docs on a failed pull
-- [ ] First release that saves its docs (`tools/save_docs.py dodo --release`); until then the dodo half of `dodo docs pull` finds none, since dev still says 0.0.1
 - [x] `dodo new`: pixi.toml (dodo from modular-community, pinned), main.mojo, app.mojo, tests/, AGENTS.md, CLAUDE.md (`@AGENTS.md`), .gitignore; only writes files; `git init` unless `--no-git` or inside a repository. No TODO.md, ADRs or commit hook: those are the dodo repo's own habits, not every app's (decided 2026-11-11).
 - [x] `dodo run`, `dodo test`, `dodo routes`, `dodo doctor`
 - [x] Planted-mistake check for the CLI (`pixi run check-mistakes`): 78 mistakes
@@ -75,6 +73,7 @@ Build order, each step tested end to end before the next:
 
 ## After v1
 
+- [ ] The next release waits until after a full v1 (decided 2026-11-14). Then: `tools/save_docs.py dodo --release` (until a release saves its docs, the dodo half of `dodo docs pull` finds none), a tag on `production` (`v0.0.1` is already there), and the modular-community PR with `packaging/recipe.yaml` and `packaging/tests/` as `recipes/dodo/`. The recipe builds and passes its tests on macOS arm64 and Linux aarch64 (`packaging/build_local.sh`); Linux x86-64 is checked only by the channel's CI.
 - [ ] Best practices guide in `docs/best-practices/`, examples built in CI; the rule in CONTRIBUTING.md, the PR template and CLAUDE.md. Written once the API it describes is stable.
 
 ## Mojo ecosystem (survey in `docs/ecosystem.md`, 2026-11-04)
