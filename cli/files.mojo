@@ -13,7 +13,7 @@ def mojo_files(root: String) raises -> List[String]:
 
 struct ProjectTree(Movable):
     """The `.mojo` files under a root (sorted), and the folders walked to
-    find them with each folder's change time, read before it was listed.
+    find them with each folder's listing (see `listing_of`).
 
     Skips hidden folders (`.git`, `.pixi`, `.dodo`), `build/`, and folders
     reached through a symlink, so a link loop cannot hang the walk. A
@@ -22,17 +22,16 @@ struct ProjectTree(Movable):
 
     var files: List[String]
     var dirs: List[String]
-    var dir_times: List[Int]
+    var dir_listings: List[String]
 
     def __init__(out self, root: String) raises:
         """Raises: Error: If `root` cannot be listed."""
         self.files = List[String]()
         self.dirs = List[String]()
-        self.dir_times = List[Int]()
-        var changed = time_or_zero(root)
+        self.dir_listings = List[String]()
         var names = listdir(root)
         self.dirs.append(root)
-        self.dir_times.append(changed)
+        self.dir_listings.append(listing_of(names))
         self._collect(root, names)
         sort(self.files)
 
@@ -44,25 +43,28 @@ struct ProjectTree(Movable):
             if isdir(path):
                 if name == "build" or islink(path):
                     continue
-                var changed = time_or_zero(path)
                 var inner: List[String]
                 try:
                     inner = listdir(path)
                 except:
                     continue
                 self.dirs.append(path)
-                self.dir_times.append(changed)
+                self.dir_listings.append(listing_of(inner))
                 self._collect(path, inner)
             elif name.endswith(".mojo"):
                 self.files.append(path)
 
 
-def time_or_zero(path: String) -> Int:
-    """`mtime_ns(path)`, or 0 when `path` is gone."""
-    try:
-        return mtime_ns(path)
-    except:
-        return 0
+def listing_of(names: List[String]) -> String:
+    """A folder's names, sorted, one per line.
+
+    Comparing listings sees a file added or removed even when the
+    folder's change time stays the same, which happens when both land in
+    one tick of the file system's clock (a few ms on Linux).
+    """
+    var sorted_names = names.copy()
+    sort(sorted_names)
+    return String("\n").join(sorted_names)
 
 
 def mtime_ns(path: String) raises -> Int:
