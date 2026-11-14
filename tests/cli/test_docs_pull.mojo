@@ -344,6 +344,33 @@ def test_a_missing_file_keeps_the_old_docs() raises:
     assert_true(isfile(join(_docs_dir(project), "dodo-9.9.9", "guide.md")))
 
 
+def test_a_missing_file_stops_the_other_downloads() raises:
+    var site = _site("stops")
+    var folder = join(site, "dev", "mojo-docs", "1.3.1")
+    var links = String("- [Gone](gone.md)\n")
+    for i in range(80):
+        var name = String("page_", i, ".md")
+        links += String("- [Page](", name, ")\n")
+        _write(join(folder, name), "page")
+    _docs_folder(folder, "Mojo 1.3.1", links)
+    var server = DocsServer(site)
+    var project = _project("stops")
+    _ = _old_docs(project)
+    var ran = _pull(project, server.url, ["mojo@1.3.1", "dodo@9.9.9", "--json"])
+    assert_equal(ran.code, EXIT_UNAVAILABLE, String(ran.out, ran.err))
+    var error = _error_of(ran)
+    assert_true(
+        "1.3.1/gone.md answered 404" in error["message"].as_string(), ran.out
+    )
+    var asked = 0
+    for i in range(80):
+        asked += server.requests_for(
+            String("/dev/mojo-docs/1.3.1/page_", i, ".md")
+        )
+    assert_true(asked < 80, String("every page was still asked for"))
+    _assert_old_docs_kept(project)
+
+
 def test_a_server_error_is_retried_then_reported() raises:
     var site = _site("broken")
     _docs_folder(
