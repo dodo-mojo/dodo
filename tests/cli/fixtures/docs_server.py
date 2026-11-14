@@ -4,10 +4,12 @@
 
 Serves FOLDER on a free port of 127.0.0.1 with keep-alive, and prints
 `port N` once it listens. Every request is logged to stdout as
-`GET /path`. Two file names misbehave on purpose:
+`GET /path`. Some file names misbehave on purpose:
 
 - `hang.md` is never answered;
-- `broken.md` gets a 500.
+- `broken.md` gets a 500;
+- a name starting with `slow_` is answered after a second (a 404 if
+  there is no such file).
 """
 
 import http.server
@@ -28,6 +30,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if name == "broken.md":
             self.send_error(500, "broken on purpose")
             return
+        if name.startswith("slow_"):
+            time.sleep(1)
         super().do_GET()
 
     def log_message(self, format: str, *args: object) -> None:

@@ -386,13 +386,13 @@ MISTAKES = [
     ),
     Mistake(
         "docs pull saves an error page as a file",
-        "cli/cmd_docs.mojo",
-        "        raise Error(_bad_status(url, reply.status))\n",
+        "cli/docs_fetch.mojo",
+        "        raise Error(bad_status(url, reply.status))\n",
         "        pass\n",
     ),
     Mistake(
         "docs pull does not retry a server error",
-        "cli/cmd_docs.mojo",
+        "cli/docs_fetch.mojo",
         ".with_read_timeout(read_timeout).with_retry(RetryPolicy())",
         ".with_read_timeout(read_timeout)",
     ),
@@ -426,7 +426,7 @@ MISTAKES = [
     ),
     Mistake(
         "docs pull ignores DODO_DOCS_READ_TIMEOUT_MS",
-        "cli/cmd_docs.mojo",
+        "cli/docs_fetch.mojo",
         "        read_timeout = Int(given)\n",
         "        _ = Int(given)\n",
     ),
@@ -531,6 +531,18 @@ MISTAKES = [
         "cli/cmd_docs_search.mojo",
         "        if self.terms != other.terms:\n            return self.terms > other.terms\n",
         "",
+    ),
+    Mistake(
+        "docs pull keeps downloading after a file fails",
+        "cli/docs_fetch.mojo",
+        "            if _stopped(job[].stop_addr):\n                break\n",
+        "",
+    ),
+    Mistake(
+        "docs pull names a later failed file than the first",
+        "cli/docs_fetch.mojo",
+        "done.failed_at < fetched.failed_at",
+        "done.failed_at > fetched.failed_at",
     ),
 ]
 

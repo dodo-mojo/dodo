@@ -11,20 +11,28 @@ files, saved there once per release:
 `<source>` is `DODO_DOCS_URL` when set (tests point it at a local
 server), else raw.githubusercontent.com. A server silent for 30 s
 (`DODO_DOCS_READ_TIMEOUT_MS`) fails the pull. Each folder's `index.md`
-lists its files. They download into a hidden folder that replaces the old
-docs only once every file is in, so a failed pull keeps the docs you had.
+lists its files. They download eight at a time (`cli/docs_fetch.mojo`)
+into a hidden folder that replaces the old docs only once every file is
+in, so a failed pull keeps the docs you had.
 """
 
 from std.os import getenv
 from std.os.path import join
 from std.time import perf_counter_ns
 
-from dodo.http import HttpClient, Response, RetryPolicy
+from dodo.http import HttpClient
 from dodo.json import Value
 
 from cli.args import ParsedArgs
 from cli.capture import capture
 from cli.cmd_doctor import mojo_version_of
+from cli.docs_fetch import (
+    bad_status,
+    cannot_reach,
+    docs_client,
+    fetch_bytes,
+    fetch_files,
+)
 from cli.docs_folder import remove_tree, swap_in, write_file
 from cli.docs_index import (
     index_links,
@@ -44,8 +52,6 @@ from cli.report import (
 from cli.version import DODO_VERSION
 
 comptime DEFAULT_DOCS_URL = "https://raw.githubusercontent.com/dodo-mojo/dodo"
-comptime _CONNECT_TIMEOUT_MS = 10_000
-comptime _READ_TIMEOUT_MS = 30_000
 
 
 struct DocsWanted(Movable):
@@ -198,26 +204,6 @@ def docs_source() -> String:
     return source^
 
 
-def docs_client() raises -> HttpClient:
-    """One client for every file, so one connection serves them all.
-
-    Raises:
-        Error: If `DODO_DOCS_READ_TIMEOUT_MS` is not a whole number.
-    """
-    var client = HttpClient(
-        timeout_ms=_CONNECT_TIMEOUT_MS,
-        user_agent=String("dodo/", DODO_VERSION, " docs-pull"),
-    )
-    var read_timeout = _READ_TIMEOUT_MS
-    var given = getenv("DODO_DOCS_READ_TIMEOUT_MS")
-    if given != "":
-        read_timeout = Int(given)
-        if read_timeout <= 0:
-            raise Error("DODO_DOCS_READ_TIMEOUT_MS must be above 0")
-    var pooled = client^.with_pool()
-    return pooled^.with_read_timeout(read_timeout).with_retry(RetryPolicy())
-
-
 def pull_mojo(
     client: HttpClient,
     source: String,
@@ -322,11 +308,11 @@ def pull_folder(
             pulled.fail("not_found", String(index_url, " is not there"))
             return
         if reply.status != 200:
-            pulled.fail("network", _bad_status(index_url, reply.status))
+            pulled.fail("network", bad_status(index_url, reply.status))
             return
         swap(index_body, reply.body)
     except e:
-        pulled.fail("network", _cannot_reach(index_url, e))
+        pulled.fail("network", cannot_reach(index_url, e))
         return
     var index_text: String
     try:
@@ -347,18 +333,16 @@ def pull_folder(
     try:
         remove_tree(staging)
         write_file(join(staging, "index.md"), index_body)
-        pulled.files = 1
-        pulled.bytes = len(index_body)
+        var files = List[String]()
         for link in links:
-            if link == "index.md":
-                continue
-            var url = base_url + link
-            kind = "network"
-            var body = fetch_bytes(client, url)
-            kind = "disk"
-            write_file(join(staging, link), body)
-            pulled.files += 1
-            pulled.bytes += len(body)
+            if link != "index.md":
+                files.append(link)
+        var fetched = fetch_files(base_url, files, staging)
+        pulled.files = 1 + fetched.files
+        pulled.bytes = len(index_body) + fetched.bytes
+        if fetched.failed():
+            kind = fetched.error_kind
+            raise Error(fetched.error)
         swap_in(staging, join(docs, name))
     except e:
         _remove_quietly(staging)
@@ -366,24 +350,6 @@ def pull_folder(
         return
     pulled.folder = join(".dodo", "docs", name)
     pulled.seconds = Float64(perf_counter_ns() - started) / 1e9
-
-
-def fetch_bytes(client: HttpClient, url: String) raises -> List[UInt8]:
-    """The body of `url`.
-
-    Raises:
-        Error: If it cannot be reached or does not answer 200.
-    """
-    var reply: Response
-    try:
-        reply = client.get(url)
-    except e:
-        raise Error(_cannot_reach(url, e))
-    if reply.status != 200:
-        raise Error(_bad_status(url, reply.status))
-    var body = List[UInt8]()
-    swap(body, reply.body)
-    return body^
 
 
 def fetch_text(client: HttpClient, url: String) raises -> String:
@@ -439,14 +405,6 @@ def format_megabytes(bytes: Int) -> String:
     if tenths < 1:
         tenths = 1
     return String(tenths // 10, ".", tenths % 10, " MB")
-
-
-def _cannot_reach(url: String, error: Error) -> String:
-    return String("cannot download ", url, ": ", error)
-
-
-def _bad_status(url: String, status: Int) -> String:
-    return String(url, " answered ", status)
 
 
 def _listed(versions: List[String]) -> String:
