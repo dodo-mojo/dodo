@@ -371,6 +371,23 @@ def test_a_missing_file_stops_the_other_downloads() raises:
     _assert_old_docs_kept(project)
 
 
+def test_the_first_missing_file_is_the_one_named() raises:
+    # Files download eight at a time, so a later file can fail first:
+    # slow_gone.md answers 404 a second after gone.md does.
+    var site = _site("first")
+    _docs_folder(
+        join(site, "dev", "mojo-docs", "1.3.1"),
+        "Mojo 1.3.1",
+        "- [Slow](slow_gone.md)\n- [Gone](gone.md)\n",
+    )
+    var server = DocsServer(site)
+    var project = _project("first")
+    var ran = _pull(project, server.url, ["mojo@1.3.1", "dodo@9.9.9", "--json"])
+    assert_equal(ran.code, EXIT_UNAVAILABLE, String(ran.out, ran.err))
+    var message = _error_of(ran)["message"].as_string()
+    assert_true("1.3.1/slow_gone.md answered 404" in message, ran.out)
+
+
 def test_a_server_error_is_retried_then_reported() raises:
     var site = _site("broken")
     _docs_folder(

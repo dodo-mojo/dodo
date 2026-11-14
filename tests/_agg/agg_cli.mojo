@@ -264,6 +264,12 @@ from test_docs_pull import (
     test_a_missing_file_keeps_the_old_docs as test_docs_pull__test_a_missing_file_keeps_the_old_docs,
 )
 from test_docs_pull import (
+    test_a_missing_file_stops_the_other_downloads as test_docs_pull__test_a_missing_file_stops_the_other_downloads,
+)
+from test_docs_pull import (
+    test_the_first_missing_file_is_the_one_named as test_docs_pull__test_the_first_missing_file_is_the_one_named,
+)
+from test_docs_pull import (
     test_a_server_error_is_retried_then_reported as test_docs_pull__test_a_server_error_is_retried_then_reported,
 )
 from test_docs_pull import (
@@ -733,6 +739,8 @@ def main() raises:
     ]()
     suite.test[test_docs_pull__test_a_new_pull_replaces_the_old_docs]()
     suite.test[test_docs_pull__test_a_missing_file_keeps_the_old_docs]()
+    suite.test[test_docs_pull__test_a_missing_file_stops_the_other_downloads]()
+    suite.test[test_docs_pull__test_the_first_missing_file_is_the_one_named]()
     suite.test[test_docs_pull__test_a_server_error_is_retried_then_reported]()
     suite.test[
         test_docs_pull__test_an_index_that_leaves_its_folder_is_refused
