@@ -1,10 +1,12 @@
 """Download the files of one docs folder, several at a time.
 
-Every file is one round trip to the docs server, about 0.3 s to
+Every file is one round trip to the docs server, about 0.1 s to
 raw.githubusercontent.com even on a kept-alive connection, and one
 connection carries one request at a time. `fetch_files` splits the files
 among `FETCH_THREADS` threads, each with its own client and connection,
-so a folder of 288 files takes about 288 / 8 round trips instead of 288.
+so a folder of 288 files takes about 288 / 32 round trips instead of 288.
+Measured on the Mojo 1.2.0 docs: 2.8 s with 8 threads, 1.5 s with 16,
+1.2 s with 32.
 """
 
 from std.atomic import Atomic, Ordering
@@ -18,7 +20,7 @@ from dodo.runtime.pool import Pool
 from cli.docs_folder import write_file
 from cli.version import DODO_VERSION
 
-comptime FETCH_THREADS = 8
+comptime FETCH_THREADS = 32
 """How many files download at once."""
 comptime _CONNECT_TIMEOUT_MS = 10_000
 comptime _READ_TIMEOUT_MS = 30_000

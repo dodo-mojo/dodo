@@ -44,6 +44,9 @@ def main() -> None:
     def handler(*args: object, **kwargs: object) -> Handler:
         return Handler(*args, directory=folder, **kwargs)
 
+    # Python queues 5 connections by default; dodo opens 32 at once
+    # (FETCH_THREADS), and on macOS the rest are reset.
+    http.server.ThreadingHTTPServer.request_queue_size = 128
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.daemon_threads = True
     print(f"port {server.server_address[1]}", flush=True)

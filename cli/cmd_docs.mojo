@@ -11,7 +11,7 @@ files, saved there once per release:
 `<source>` is `DODO_DOCS_URL` when set (tests point it at a local
 server), else raw.githubusercontent.com. A server silent for 30 s
 (`DODO_DOCS_READ_TIMEOUT_MS`) fails the pull. Each folder's `index.md`
-lists its files. They download eight at a time (`cli/docs_fetch.mojo`)
+lists its files. They download 32 at a time (`cli/docs_fetch.mojo`)
 into a hidden folder that replaces the old docs only once every file is
 in, so a failed pull keeps the docs you had.
 """
