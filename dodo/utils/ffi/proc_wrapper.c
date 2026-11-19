@@ -13,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdint.h>
@@ -296,7 +297,54 @@ void dodo_proc_error_text(int code, char *buf, int size) {
 
 static volatile sig_atomic_t last_signal = 0;
 
-static void record_signal(int sig) { last_signal = sig; }
+/* The handler writes a byte here, so dodo_signals_wait wakes at once.
+ * Made once by the first dodo_signals_watch and kept open. */
+static int wake_pipe[2] = {-1, -1};
+
+static void record_signal(int sig) {
+    int saved = errno;
+    last_signal = sig;
+    if (wake_pipe[1] >= 0) {
+        char byte = 1;
+        /* A full pipe already wakes the waiter, so a failure is fine. */
+        ssize_t ignored = write(wake_pipe[1], &byte, 1);
+        (void)ignored;
+    }
+    errno = saved;
+}
+
+static int set_flags(int fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return errno;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        return errno;
+    }
+    return 0;
+}
+
+static int make_wake_pipe(void) {
+    if (wake_pipe[0] >= 0) {
+        return 0;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return errno;
+    }
+    int status = set_flags(fds[0]);
+    if (status == 0) {
+        status = set_flags(fds[1]);
+    }
+    if (status != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return status;
+    }
+    wake_pipe[0] = fds[0];
+    wake_pipe[1] = fds[1];
+    return 0;
+}
 
 static int set_handler(int sig, void (*handler)(int)) {
     struct sigaction action;
@@ -312,10 +360,23 @@ static int set_handler(int sig, void (*handler)(int)) {
     return 0;
 }
 
+static void drain_wake_pipe(void) {
+    char drain[64];
+    while (read(wake_pipe[0], drain, sizeof(drain)) > 0) {
+    }
+}
+
 /* Catch SIGINT, SIGTERM and SIGHUP from now on. Returns 0 or errno. */
 int dodo_signals_watch(void) {
+    int status = make_wake_pipe();
+    if (status != 0) {
+        return status;
+    }
+    /* Bytes from signals caught before this watch would cut the next
+     * wait short. */
+    drain_wake_pipe();
     last_signal = 0;
-    int status = set_handler(SIGINT, record_signal);
+    status = set_handler(SIGINT, record_signal);
     if (status == 0) {
         status = set_handler(SIGTERM, record_signal);
     }
@@ -330,6 +391,28 @@ int dodo_signals_take(void) {
     int sig = last_signal;
     last_signal = 0;
     return sig;
+}
+
+/* Wait up to `timeout_ms` for a signal to be caught; return at once if
+ * one already was. Does not take it: call dodo_signals_take after.
+ * Returns 0, or errno when the wait itself fails. */
+int dodo_signals_wait(int timeout_ms) {
+    if (last_signal != 0) {
+        return 0;
+    }
+    if (wake_pipe[0] < 0) {
+        return EINVAL;
+    }
+    struct pollfd watch;
+    watch.fd = wake_pipe[0];
+    watch.events = POLLIN;
+    watch.revents = 0;
+    int ready = poll(&watch, 1, timeout_ms);
+    if (ready < 0 && errno != EINTR) {
+        return errno;
+    }
+    drain_wake_pipe();
+    return 0;
 }
 
 /* Back to the default handling for the three signals. Returns 0 or errno. */

@@ -33,10 +33,9 @@ keeps its own copy of the handler, so a job can outlive the worker.
 
 from std.atomic import Atomic, Ordering
 from std.collections import List, Optional
-from std.ffi import _get_global, c_int, c_size_t, external_call
+from std.ffi import _get_global, external_call
 from std.iter import downcast
-from std.memory import Layout, OptionalPointer, Pointer, alloc, stack_allocation
-from std.sys.info import CompilationTarget
+from std.memory import Layout, OptionalPointer, Pointer, alloc
 
 from dodo.errors import log_handler_error, map_handler_error
 from dodo.runtime._sync import cond_new as _cond_new
@@ -47,25 +46,12 @@ from dodo.runtime._sync import unlock as _unlock
 from dodo.runtime._sync import wait as _wait
 from dodo.runtime._thread import ThreadHandle, _OpaquePtr, num_cpus
 from dodo.runtime.pool import Pool
+from dodo.runtime.scheduler_stats import write_wake
 
 from .cancel import CancelCell, CancelReason
 from .handler import CancelHandler, Handler
 from .request import Request
 from .response import Response
-
-
-def _wake(fd: Int):
-    """Make the worker's sleeping ``Reactor.poll`` return. The wake fd is
-    an eventfd on Linux (8 bytes) and a pipe on macOS (1 byte); ``poll``
-    drains either."""
-    var buf = stack_allocation[8, UInt8]()
-    buf[unsafe_offset=0] = UInt8(1)
-    for i in range(1, 8):
-        buf[unsafe_offset=i] = UInt8(0)
-    var n = 1
-    comptime if CompilationTarget.is_linux():
-        n = 8
-    _ = external_call["write", Int](c_int(fd), buf, c_size_t(n))
 
 
 def _getpid() -> Int:
@@ -454,7 +440,7 @@ def _port_complete(port_addr: Int, job: Int):
     var was_empty = port[].done.count() == 0
     _ = port[].done.push(job)
     if was_empty:
-        _wake(port[].wake_fd)
+        write_wake(port[].wake_fd)
     _unlock(port[].mu)
 
 

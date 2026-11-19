@@ -3,10 +3,14 @@
 from std.testing import assert_equal, assert_false, assert_true, TestSuite
 
 from dodo.http import Handler, HttpFrontend, Request, Response, ok
+from dodo.http.frontend import StreamFrontend
+from dodo.http.streaming_server import StreamConn, StreamHandler
 from dodo.http.server import ServerConfig
 from dodo.http2.server import Http2Config
 from dodo.net import SocketAddr
 from dodo.runtime import Scheduler
+from dodo.runtime._libc_time import libc_nanosleep_ms
+from dodo.runtime.scheduler_stats import WORKER_STAT_WAKE_FD, load_worker_stat
 from dodo.tcp import TcpListener, TcpStream
 
 comptime _H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -210,6 +214,61 @@ def test_four_workers_answer_every_request() raises:
             failures += 1
     sched.shutdown()
     assert_equal(failures, 0)
+
+
+@fieldwise_init
+struct _Quiet(Copyable, StreamHandler):
+    """A streaming handler that only opens; the test never connects."""
+
+    var tag: Int
+
+    def on_open(mut self, mut conn: StreamConn) raises:
+        pass
+
+
+def _advertised_count(addrs: List[Int]) -> Int:
+    """How many workers' cells hold a wake fd."""
+    var count = 0
+    for addr in addrs:
+        if load_worker_stat(addr, WORKER_STAT_WAKE_FD) > 0:
+            count += 1
+    return count
+
+
+def test_every_http1_worker_advertises_its_wake_fd() raises:
+    # So a stop wakes the worker now, not on its next 100 ms poll.
+    var sched = _start(
+        _free_port(), HttpFrontend(_Tagged("w"), _config()), num_workers=2
+    )
+    _ = libc_nanosleep_ms(200)
+    var advertised = _advertised_count(sched._stats_addrs)
+    sched.shutdown()
+    assert_equal(advertised, 2)
+
+
+def test_every_auto_protocol_worker_advertises_its_wake_fd() raises:
+    var sched = _start(
+        _free_port(),
+        HttpFrontend(_Tagged("w"), _config(), auto_protocol=True),
+        num_workers=2,
+    )
+    _ = libc_nanosleep_ms(200)
+    var advertised = _advertised_count(sched._stats_addrs)
+    sched.shutdown()
+    assert_equal(advertised, 2)
+
+
+def test_every_stream_worker_advertises_its_wake_fd() raises:
+    var sched = Scheduler[StreamFrontend[_Quiet]].start(
+        addr=SocketAddr.localhost(_free_port()),
+        frontend=StreamFrontend(_Quiet(0)),
+        num_workers=2,
+        pin_cores=False,
+    )
+    _ = libc_nanosleep_ms(200)
+    var advertised = _advertised_count(sched._stats_addrs)
+    sched.shutdown()
+    assert_equal(advertised, 2)
 
 
 def main() raises:

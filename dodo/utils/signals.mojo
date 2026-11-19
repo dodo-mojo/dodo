@@ -48,6 +48,23 @@ def take_signal() raises -> Int:
     return Int(take())
 
 
+def wait_for_signal(timeout_ms: Int) raises:
+    """Sleep until a signal is recorded or `timeout_ms` passes, whichever
+    comes first. Returns at once when one is already recorded. It does not
+    take the signal; call `take_signal` after. Needs `watch_signals`
+    first.
+
+    Raises:
+        Error: If the wait fails, such as before `watch_signals`.
+    """
+    var wait = dl_sym[def(c_int) thin abi("C") -> c_int](
+        pinned_dodo_lib["proc"]()[], "dodo_signals_wait"
+    )
+    var failure = Int(wait(c_int(timeout_ms)))
+    if failure != 0:
+        raise Error("dodo_signals_wait failed: ", error_text(failure))
+
+
 def _call(symbol: StaticString) raises:
     var install = dl_sym[def() thin abi("C") -> c_int](
         pinned_dodo_lib["proc"]()[], symbol

@@ -1387,6 +1387,8 @@ def _run_unified_loop_for_fd[
     and the dispatch is byte-for-byte what it was.
     """
     var reactor = Reactor()
+    # Lets the scheduler wake this loop the moment it sets the stop flag.
+    reactor.advertise_wake_fd(stats_addr)
     var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()

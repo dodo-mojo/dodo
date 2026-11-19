@@ -212,6 +212,8 @@ def _run_handler_loop_impl[
             none. Inflight and exit-status counters are published to it.
     """
     var reactor = Reactor()
+    # Lets the scheduler wake this loop the moment it sets the stop flag.
+    reactor.advertise_wake_fd(stats_addr)
     var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()
@@ -504,6 +506,8 @@ def run_reactor_loop_cancel[
     var listener_fd = listener._socket.fd
 
     var reactor = Reactor()
+    # Lets the scheduler wake this loop the moment it sets the stop flag.
+    reactor.advertise_wake_fd(stats_addr)
     var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))
     var conns = Dict[Int, Int]()
     var timers = Dict[Int, UInt64]()

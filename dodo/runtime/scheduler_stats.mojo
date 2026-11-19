@@ -10,7 +10,9 @@ the reactor loops keep working unchanged.
 """
 
 from std.atomic import Atomic, Ordering
-from std.memory import Pointer
+from std.ffi import c_int, c_size_t, external_call
+from std.memory import Pointer, stack_allocation
+from std.sys.info import CompilationTarget
 
 
 # ── Atomic stop-flag helpers ─────────────────────────────────────────────────
@@ -69,7 +71,10 @@ comptime WORKER_STAT_GROUP: Int = 3
 (``dodo.runtime._balance``), or 0 when balancing is off."""
 comptime WORKER_STAT_INDEX: Int = 4
 """Slot index: this worker's index inside the balancing group."""
-comptime WORKER_STAT_SLOTS: Int = 5
+comptime WORKER_STAT_WAKE_FD: Int = 5
+"""Slot index: the worker reactor's wake fd plus one, so a zeroed cell
+means "none" (see ``advertise_wake_fd``)."""
+comptime WORKER_STAT_SLOTS: Int = 6
 """Number of Int64 slots per worker cell."""
 
 comptime WORKER_STATUS_RUNNING: Int = 0
@@ -100,3 +105,89 @@ def load_worker_stat(base_addr: Int, slot: Int) -> Int:
         unsafe_from_address=base_addr + slot * 8
     ).unsafe_bitcast[Scalar[DType.int64]]()
     return Int(Atomic[Int64].load[ordering=Ordering.ACQUIRE](p))
+
+
+# ── Waking a worker on stop ──────────────────────────────────────────────────
+# A worker blocked in ``Reactor.poll`` sees the stop flag only when the
+# poll returns. Its reactor advertises its wake fd in the worker's stats
+# cell, so ``Scheduler`` can write that fd on stop and the worker sees
+# the flag at once instead of on its next poll timeout.
+#
+# The scheduler must never write an fd the worker already closed: the
+# number may belong to something else by then. The slot is a tiny lock.
+# It holds the fd plus one, 0 for none, or ``_WAKE_FD_BUSY`` while the
+# scheduler writes. The scheduler swaps fd+1 for busy, writes, and puts
+# fd+1 back. The reactor, before it closes the fd, waits out a busy slot
+# and swaps fd+1 for 0, so no write can start after that.
+
+comptime _WAKE_FD_NONE: Int64 = 0
+comptime _WAKE_FD_BUSY: Int64 = -1
+
+
+def write_wake(fd: Int):
+    """Make the reactor whose wake fd is ``fd`` return from ``poll``.
+
+    The wake fd is an eventfd on Linux (8 bytes) and a pipe on macOS
+    (1 byte); ``poll`` drains either. A full pipe already wakes the
+    reactor, so a failed write needs nothing more.
+    """
+    var buf = stack_allocation[8, UInt8]()
+    buf[unsafe_offset=0] = UInt8(1)
+    for i in range(1, 8):
+        buf[unsafe_offset=i] = UInt8(0)
+    var size = 1
+    comptime if CompilationTarget.is_linux():
+        size = 8
+    _ = external_call["write", Int](c_int(fd), buf, c_size_t(size))
+
+
+def _wake_slot(stats_addr: Int) -> Pointer[Scalar[DType.int64], MutUntrackedOrigin]:
+    return Pointer[Int, MutUntrackedOrigin](
+        unsafe_from_address=stats_addr + WORKER_STAT_WAKE_FD * 8
+    ).unsafe_bitcast[Scalar[DType.int64]]()
+
+
+def advertise_wake_fd(stats_addr: Int, fd: Int):
+    """Publish ``fd`` so ``wake_worker`` can reach this worker's reactor.
+    Does nothing when ``stats_addr`` is 0."""
+    if stats_addr == 0:
+        return
+    Atomic[Int64].store[ordering=Ordering.RELEASE](
+        _wake_slot(stats_addr), Int64(fd + 1)
+    )
+
+
+def withdraw_wake_fd(stats_addr: Int):
+    """Take the advertised fd back. Once this returns, no ``wake_worker``
+    writes to it, so the reactor may close it. Waits while a wake is
+    being written, which is one ``write`` call."""
+    if stats_addr == 0:
+        return
+    var slot = _wake_slot(stats_addr)
+    while True:
+        var current = Atomic[Int64].load[ordering=Ordering.ACQUIRE](slot)
+        if current == _WAKE_FD_NONE:
+            return
+        if current == _WAKE_FD_BUSY:
+            _ = external_call["sched_yield", c_int]()
+            continue
+        var expected = current
+        if Atomic[Int64].compare_exchange(slot, expected, _WAKE_FD_NONE):
+            return
+
+
+def wake_worker(stats_addr: Int):
+    """Wake the worker whose stats cell is ``stats_addr``, if its reactor
+    still advertises a wake fd. Safe from any thread."""
+    if stats_addr == 0:
+        return
+    var slot = _wake_slot(stats_addr)
+    var current = Atomic[Int64].load[ordering=Ordering.ACQUIRE](slot)
+    if current <= _WAKE_FD_NONE:
+        return
+    var expected = current
+    if not Atomic[Int64].compare_exchange(slot, expected, _WAKE_FD_BUSY):
+        # The reactor withdrew it meanwhile: it is closing anyway.
+        return
+    write_wake(Int(current) - 1)
+    Atomic[Int64].store[ordering=Ordering.RELEASE](slot, current)
