@@ -52,10 +52,18 @@ comptime WORKER_STAT_INDEX = Int(4)
 
 Slot index: this worker's index inside the balancing group.
 
+### `WORKER_STAT_WAKE_FD`
+
+```mojo
+comptime WORKER_STAT_WAKE_FD = Int(5)
+```
+
+Slot index: the worker reactor's wake fd plus one, so a zeroed cell means "none" (see ``advertise_wake_fd``).
+
 ### `WORKER_STAT_SLOTS`
 
 ```mojo
-comptime WORKER_STAT_SLOTS = Int(5)
+comptime WORKER_STAT_SLOTS = Int(6)
 ```
 
 Number of Int64 slots per worker cell.
@@ -117,3 +125,39 @@ def load_worker_stat(base_addr: Int, slot: Int) -> Int
 ```
 
 Acquire-load ``slot`` of the worker stats cell (0 when disabled).
+
+### `write_wake`
+
+```mojo
+def write_wake(fd: Int)
+```
+
+Make the reactor whose wake fd is ``fd`` return from ``poll``.
+
+The wake fd is an eventfd on Linux (8 bytes) and a pipe on macOS
+(1 byte); ``poll`` drains either. A full pipe already wakes the
+reactor, so a failed write needs nothing more.
+
+### `advertise_wake_fd`
+
+```mojo
+def advertise_wake_fd(stats_addr: Int, fd: Int)
+```
+
+Publish ``fd`` so ``wake_worker`` can reach this worker's reactor. Does nothing when ``stats_addr`` is 0.
+
+### `withdraw_wake_fd`
+
+```mojo
+def withdraw_wake_fd(stats_addr: Int)
+```
+
+Take the advertised fd back. Once this returns, no ``wake_worker`` writes to it, so the reactor may close it. Waits while a wake is being written, which is one ``write`` call.
+
+### `wake_worker`
+
+```mojo
+def wake_worker(stats_addr: Int)
+```
+
+Wake the worker whose stats cell is ``stats_addr``, if its reactor still advertises a wake fd. Safe from any thread.

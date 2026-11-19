@@ -202,6 +202,18 @@ self-pipe. Errors are swallowed because the caller has no
 meaningful recovery — a dropped wakeup just means the reactor will
 wait out the current timeout.
 
+#### `Reactor.advertise_wake_fd`
+
+```mojo
+def advertise_wake_fd(mut self, stats_addr: Int)
+```
+
+Publish this reactor's wake fd in a worker stats cell, so the scheduler can wake it on stop (``wake_worker``). The fd is withdrawn when the reactor is destroyed. Does nothing when ``stats_addr`` is 0.
+
+Args:
+
+- `stats_addr`: The worker's stats cell, or 0 for none.
+
 #### `Reactor.wake_fd`
 
 ```mojo
