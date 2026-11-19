@@ -12,9 +12,18 @@
 - [ ] **Trademark search** for "dodo" in software (class 9/42) in your country, before 1.0.
 - [ ] **Docker Desktop WSL integration** (optional): turn it on for Ubuntu-24.04 so `pixi run tests-db` can start the test databases from WSL. Until then, start them from Windows (`docker compose -f tests/live/db/compose.yaml up -d --wait`) and run with `DODO_DB_NO_COMPOSE=1`.
 
+## High priority (do these first, decided 2026-11-19)
+
+Gaps between today and a production-grade REST API:
+
+- [ ] Performance pass, since no benchmark has run yet: set up a bare-metal Linux benchmark box (cloud VM is fine); profile the HTTP/1.1 hot path (allocations, copies, syscalls per request); rewrite or remove what's slow; benchmark against other Mojo frameworks and the fastest Rust/Go servers.
+- [ ] A graceful stop takes about 100 ms even when idle: workers see the stop flag only on their 100 ms poll timeout, and `serve_until_signal` checks for signals every 50 ms. Waking each reactor's wakeup fd on stop would end it at once, which speeds up every `dodo dev` restart and every test that stops a server.
+- [ ] Fuzzers for the database parsers: PostgreSQL messages, MySQL packets and rows, RESP replies, BSON and OP_MSG, ClickHouse RowBinary.
+- [ ] Database tests in CI: `pixi run ci` (`tools/ci.sh`) runs `pixi run tests-db` when Docker is up, so the driver suites run before every merge.
+- [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler that calls another service no longer blocks a worker; it starts several calls and parks until they answer.
+
 ## Claude (after the items above are unblocked)
 
-- [ ] Performance pass: set up a bare-metal Linux benchmark box (cloud VM is fine); profile the HTTP/1.1 hot path (allocations, copies, syscalls per request); rewrite or remove what's slow; benchmark against other Mojo frameworks and the fastest Rust/Go servers.
 - [ ] Clean imported code as we touch it: remove Flare's changelog-style and personal comments, restyle to our standards.
 - [ ] Phase 0 spikes (see `docs/design.md` §9).
 - [ ] Enable GitHub Pages for docs at `dodo-mojo.github.io/dodo`.
@@ -24,13 +33,10 @@
 - [ ] `RequestView` (zero-copy request) has no server loop since `serve_view` was removed. The performance pass decides whether the unified loop parses into it or it is deleted.
 - [ ] Keep-alive idle timeout defaults to 500 ms; `docs/design.md` says 5 s. Settle it in the performance pass (short is cheaper under load, long saves reconnects).
 - [ ] Model workers (ADR-0005): supervised child processes for models and kernels, shared-memory handoff, per-worker CPU/RAM/GPU limits as ratios or amounts of the box (container or machine), restarts, `/healthz` and `/readyz`.
-- [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler starts several calls and parks until they answer.
 - [x] Database drivers (ADR-0009): PostgreSQL/CockroachDB, MySQL/MariaDB, SQLite, Redis/Valkey, MongoDB and ClickHouse in `dodo.db`, one shared pool, unit tests in `tests/db/`, Docker suites in `tests/live/db/` (`pixi run tests-db`).
 - [x] `blocking=True` on App routes (ADR-0004, ADR-0009), so a typed handler that queries a database runs on the offload pool. Usage guide: `docs/databases.md`.
 - [x] Database migrations (ADR-0010): `db.migrate(Migrations.from_dir("migrations"))` on `Postgres`, `MySql` and `Sqlite`; checksums, a `dodo_migrations` table, safe when several processes start at once. A `dodo migrate` CLI can wrap it later.
 - [ ] PostgreSQL `LISTEN/NOTIFY` and `COPY` (ADR-0011): `PgListener` with `listen`, `wait` and reconnecting by itself, `db.notify`, `copy_in`/`copy_out` and their streaming forms, text and CSV formats.
-- [ ] CI job for `pixi run tests-db`: the compose services on the Ubuntu runner, `DODO_DB_NO_COMPOSE=1` if they come up as job services.
-- [ ] Fuzzers for the database parsers: PostgreSQL messages, MySQL packets and rows, RESP replies, BSON and OP_MSG, ClickHouse RowBinary.
 - [ ] Database follow-ups when someone needs them: prepared-statement caches (PostgreSQL, MySQL, SQLite), ClickHouse bulk insert in RowBinary, MongoDB replica sets and `mongodb+srv://`, Redis pub/sub on a dedicated connection, typed dates.
 - [x] App API (ADR-0008): `App`, compile-time `{name}` paths, typed-argument handlers, struct or `Response` returns, one shared app state, problem+json errors.
 - [x] Shrink the `dodo` root to what an app needs (ADR-0008 point 8).
@@ -67,7 +73,9 @@ Build order, each step tested end to end before the next:
 - [x] `dodo dev`: change detection, restart, socket kept open across restarts
 - [x] `dodo mcp` with six tools (`routes_list`, `request_send`, `test_run`, `logs_tail`, `docs_search`, `doctor`), both the 2026-07-28 and the older protocol; `dodo logs`, `dodo request` and `dodo docs search` as commands too; `dodo dev` keeps its state and the app's output in `.dodo/dev/`; `dodo new` writes `.mcp.json`. Checked with Claude Code 2.1.306 as the client. `profile_run`, `bench_run` and `add_route` come with their commands.
 - [x] Packaging: the recipe builds `$PREFIX/bin/dodo` and its tests run `--version`, `help` and `doctor`, so a project from `dodo new` has `pixi run dodo`
-- [ ] Profile every command (startup, docs pull, dev restart time) and fix the slow parts, with before/after numbers
+- [x] Profile every command (2026-11-19, macOS arm64). Startup, help, `new`, `test` and `routes` on cached builds, `docs search`, `doctor` and every `mcp` tool take 5 to 37 ms. `docs pull` went from 2.8 s to 0.9 s (32 threads). A `dev` restart is 3.3 s, of which `mojo build` is 3.1 s.
+- [ ] `dodo dev` notices a save up to 200 ms late (it polls; one look costs 3 ms on 682 files). File events (FSEvents on macOS, inotify on Linux) would make it instant and free when idle.
+- [ ] macOS scans every new binary on its first run, 170 to 420 ms, so each `dodo dev` restart pays it. `dodo doctor` could say how to skip it (the terminal as a developer tool in System Settings).
 - [x] Retire `tools/docs_pull.py`; update CLAUDE.md, design.md and README
 - [ ] Planted mistakes for the library too (HTTP parser, router, scheduler, drivers), added as each area is next touched
 
