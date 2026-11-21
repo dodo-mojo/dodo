@@ -63,7 +63,7 @@ Every command takes `--json` (one JSON object on stdout) and `--help`. dodo neve
 
 - It pulls two sets of docs: Mojo's for the `mojo --version` on `PATH`, and dodo's for the version of this `dodo`. Name others with `mojo@1.2 dodo@0.1` or `--mojo`/`--dodo`. A short version means the newest saved one it names.
 - Both come from dodo's `dev` branch on GitHub: `mojo-docs/<version>/` and `dodo-docs/<version>/`, each with an `index.md` that lists its files. They land in `.dodo/docs/mojo-<version>/` and `.dodo/docs/dodo-<version>/` of the project root.
-- Files download eight at a time into a hidden folder that takes the old docs' place only once all are in, so a pull that fails or is stopped keeps the docs you had. A failed half fails the command (exit 69) but keeps the half that worked.
+- Files download 32 at a time into a hidden folder that takes the old docs' place only once all are in, so a pull that fails or is stopped keeps the docs you had. A failed half fails the command (exit 69) but keeps the half that worked.
 - An index that links outside its folder is refused. A server error is tried three times. A server silent for 30 s fails the pull.
 - `DODO_DOCS_URL` points the pull at another server (the tests use a local one); `DODO_DOCS_READ_TIMEOUT_MS` changes the 30 s.
 - Saving: `tools/save_docs.py mojo VERSION` saves a Mojo release, and `tools/save_docs.py dodo --release` saves dodo's at each release.

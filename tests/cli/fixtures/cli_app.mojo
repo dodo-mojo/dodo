@@ -1,5 +1,5 @@
 """The app the CLI tests build. `CLI_APP_MODE` picks what it does, so one
-build covers every case:
+build covers every case.
 
 - unset: serve `/` and a blocking `/slow` on `CLI_APP_PORT` (default 18731)
 - `hang`: never reach serve()

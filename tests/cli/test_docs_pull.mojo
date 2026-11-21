@@ -9,6 +9,7 @@ from std.time import perf_counter_ns, sleep
 from dodo.json import Value
 from dodo.utils.process import Child, ExitStatus, run, spawn
 
+from cli.docs_fetch import FETCH_THREADS
 from cli.docs_folder import write_file
 from cli.docs_index import index_links
 from cli.report import EXIT_INTERRUPTED, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE
@@ -349,8 +350,9 @@ def test_a_missing_file_stops_the_other_downloads() raises:
     var folder = join(site, "dev", "mojo-docs", "1.3.1")
     # Each page takes a second, so a thread that sees the stop asks for
     # at most the one page it was on when gone.md failed.
+    var pages = 5 * FETCH_THREADS
     var links = String("- [Gone](gone.md)\n")
-    for i in range(80):
+    for i in range(pages):
         var name = String("slow_page_", i, ".md")
         links += String("- [Page](", name, ")\n")
         _write(join(folder, name), "page")
@@ -365,16 +367,19 @@ def test_a_missing_file_stops_the_other_downloads() raises:
         "1.3.1/gone.md answered 404" in error["message"].as_string(), ran.out
     )
     var asked = 0
-    for i in range(80):
+    for i in range(pages):
         asked += server.requests_for(
             String("/dev/mojo-docs/1.3.1/slow_page_", i, ".md")
         )
-    assert_true(asked <= 16, String(asked, " pages were still asked for"))
+    assert_true(
+        asked <= 2 * FETCH_THREADS,
+        String(asked, " pages were still asked for"),
+    )
     _assert_old_docs_kept(project)
 
 
 def test_the_first_missing_file_is_the_one_named() raises:
-    # Files download eight at a time, so a later file can fail first:
+    # Files download several at a time, so a later file can fail first:
     # slow_gone.md answers 404 a second after gone.md does.
     var site = _site("first")
     _docs_folder(
