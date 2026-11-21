@@ -93,9 +93,7 @@ def test_wait_without_a_signal_lasts_its_timeout() raises:
 
 def test_wait_wakes_for_a_signal_sent_meanwhile() raises:
     watch_signals()
-    var sender = spawn(
-        ["sh", "-c", String("sleep 0.2; kill -TERM ", getpid())]
-    )
+    var sender = spawn(["sh", "-c", String("sleep 0.2; kill -TERM ", getpid())])
     var started = perf_counter_ns()
     wait_for_signal(10_000)
     var took = _ms_since(started)

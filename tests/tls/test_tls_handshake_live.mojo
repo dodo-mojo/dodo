@@ -170,10 +170,7 @@ def test_acceptor_mtls_with_bad_ca_path_raises() raises:
 
 def main() raises:
     print("=" * 60)
-    print(
-        "test_tls_handshake_live.mojo — TlsInfo, ALPN, cert reload,"
-        " mTLS"
-    )
+    print("test_tls_handshake_live.mojo — TlsInfo, ALPN, cert reload, mTLS")
     print("=" * 60)
     print()
     TestSuite.discover_tests[__functions_in_module()]().run()

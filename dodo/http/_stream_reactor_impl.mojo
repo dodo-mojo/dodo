@@ -149,9 +149,7 @@ struct _StreamOffload(Movable):
                 )
             var job = offload_submit_call(self.port, call^, fd)
             if job == 0:
-                conn._offload_slots.append(
-                    _OffloadSlot(unavailable_response())
-                )
+                conn._offload_slots.append(_OffloadSlot(unavailable_response()))
                 continue
             conn._offload_slots.append(_OffloadSlot(job))
             if self.timeout_ms > 0:

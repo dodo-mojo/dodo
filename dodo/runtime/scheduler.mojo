@@ -511,9 +511,7 @@ struct Scheduler[F: Frontend](Movable):
         # N addresses x M workers, and mixing a shared primary with
         # per-worker extras would give the two halves different accept
         # semantics on the same server.
-        var prebind_per_worker = (
-            use_reuseport_workers or len(extra_addrs) > 0
-        )
+        var prebind_per_worker = use_reuseport_workers or len(extra_addrs) > 0
         # A handed-over listener without SO_REUSEPORT, such as the one
         # `dodo dev` passes down, cannot get siblings on its port, so
         # every worker shares it. Its owner keeps it open across

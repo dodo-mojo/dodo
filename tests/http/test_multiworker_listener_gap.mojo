@@ -20,7 +20,9 @@ from dodo.tcp import TcpStream
 from dodo.utils import SIGKILL, exit, fork, kill, waitpid
 
 
-comptime EARLY_REQUEST = "GET /early HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+comptime EARLY_REQUEST = (
+    "GET /early HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+)
 comptime READ_TIMEOUT_MS = 5000
 
 

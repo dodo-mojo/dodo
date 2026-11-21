@@ -141,7 +141,9 @@ def write_wake(fd: Int):
     _ = external_call["write", Int](c_int(fd), buf, c_size_t(size))
 
 
-def _wake_slot(stats_addr: Int) -> Pointer[Scalar[DType.int64], MutUntrackedOrigin]:
+def _wake_slot(
+    stats_addr: Int,
+) -> Pointer[Scalar[DType.int64], MutUntrackedOrigin]:
     return Pointer[Int, MutUntrackedOrigin](
         unsafe_from_address=stats_addr + WORKER_STAT_WAKE_FD * 8
     ).unsafe_bitcast[Scalar[DType.int64]]()
