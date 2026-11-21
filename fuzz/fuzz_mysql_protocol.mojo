@@ -4,9 +4,10 @@ Two targets:
 
 - one packet as the server's first words: the handshake, an OK, an ERR,
   a prepare OK
-- a result set as a stream of packets (a 3-byte length, a sequence byte,
-  the payload): the column count, one definition per column, then rows,
-  text or binary as the first input byte says
+- a command's whole reply as the connection reads it, through
+  `MySqlConnection._read_results` on a replayed stream: OK, ERR, or result
+  sets (a column count, the definitions, the rows, an EOF). The first
+  input byte picks text or binary rows and the EOF style
 
 Every row is then read back cell by cell. A hostile server must get a
 `DbError`, never a crash.
@@ -16,23 +17,16 @@ Run:
 """
 
 from mozz import fuzz, FuzzConfig
-from dodo.db._bytes import ByteReader
-from dodo.db.error import DbError
+from dodo.db._stream import DbStream
+from dodo.db.mysql.connection import MySqlConnection
 from dodo.db.mysql.protocol import (
-    ColumnInfo,
-    parse_binary_row,
-    parse_column,
+    CLIENT_DEPRECATE_EOF,
     parse_error,
     parse_handshake,
     parse_ok,
     parse_prepare_ok,
-    parse_text_row,
-    read_lenenc,
 )
 from dodo.db.rows import Rows
-
-comptime MAX_COLUMNS = 64
-"""More columns than this would only slow the fuzzer down."""
 
 
 def target_packet(data: List[UInt8]) raises:
@@ -54,39 +48,11 @@ def target_result_set(data: List[UInt8]) raises:
     if len(data) == 0:
         return
     var binary = (data[0] & 1) == 1
-    var packets = _split(Span(data)[1:])
-    if len(packets) == 0:
-        return
-    var r = ByteReader(Span(packets[0]), "mysql")
-    var count = read_lenenc(r)
-    if count < 0 or count > MAX_COLUMNS or count >= len(packets):
-        raise DbError.protocol("mysql", "bad column count")
-    var rows = Rows()
-    var columns = List[ColumnInfo]()
-    for i in range(count):
-        columns.append(parse_column(Span(packets[1 + i]), rows))
-    for i in range(1 + count, len(packets)):
-        if binary:
-            parse_binary_row(Span(packets[i]), columns, rows)
-        else:
-            parse_text_row(Span(packets[i]), columns, rows)
-    _read_all(rows)
-
-
-def _split(data: Span[UInt8, _]) raises -> List[List[UInt8]]:
-    """Cut a stream into packet payloads."""
-    var packets = List[List[UInt8]]()
-    var at = 0
-    while at + 4 <= len(data):
-        var length = (
-            Int(data[at]) | Int(data[at + 1]) << 8 | Int(data[at + 2]) << 16
-        )
-        var start = at + 4
-        if start + length > len(data):
-            raise DbError.protocol("mysql", "packet runs past the input")
-        packets.append(List[UInt8](data[start : start + length]))
-        at = start + length
-    return packets^
+    var stream = DbStream(replay=Span(data)[1:], database="mysql")
+    var conn = MySqlConnection(stream^)
+    if (data[0] & 2) == 2:
+        conn._capabilities = CLIENT_DEPRECATE_EOF
+    _read_all(conn._read_results(binary))
 
 
 def _read_all(rows: Rows) raises:
@@ -135,18 +101,24 @@ def _column(name: String, type_code: Int, flags: Int) -> List[UInt8]:
     return out^
 
 
-def _result_set(binary: Bool) -> List[UInt8]:
+def _result_set(binary: Bool, deprecate_eof: Bool) -> List[UInt8]:
     var out = List[UInt8]()
+    var mode = 0
     if binary:
-        out.append(1)
-    else:
-        out.append(0)
+        mode += 1
+    if deprecate_eof:
+        mode += 2
+    out.append(UInt8(mode))
     var count = List[UInt8]()
     count.append(3)
-    _packet(out, count, 1)
-    _packet(out, _column("id", 0x08, 0x20), 2)  # BIGINT UNSIGNED
-    _packet(out, _column("name", 0xFD, 0), 3)  # VARCHAR
-    _packet(out, _column("at", 0x0C, 0), 4)  # DATETIME
+    _packet(out, count, 0)
+    _packet(out, _column("id", 0x08, 0x20), 1)  # BIGINT UNSIGNED
+    _packet(out, _column("name", 0xFD, 0), 2)  # VARCHAR
+    _packet(out, _column("at", 0x0C, 0), 3)  # DATETIME
+    var seq = 4
+    if not deprecate_eof:
+        _packet(out, _from([0xFE, 0, 0, 2, 0]), seq)
+        seq += 1
     var row = List[UInt8]()
     if binary:
         row.append(0)
@@ -160,7 +132,20 @@ def _result_set(binary: Bool) -> List[UInt8]:
         _lenenc_text(row, "7")
         _lenenc_text(row, "ada")
         row.append(0xFB)  # NULL
-    _packet(out, row, 5)
+    _packet(out, row, seq)
+    seq += 1
+    if deprecate_eof:
+        _packet(out, _from([0xFE, 0, 0, 2, 0, 0, 0]), seq)
+    else:
+        _packet(out, _from([0xFE, 0, 0, 2, 0]), seq)
+    return out^
+
+
+def _alone(payload: List[UInt8]) -> List[UInt8]:
+    """One packet as a whole reply, after the mode byte."""
+    var out = List[UInt8]()
+    out.append(0)
+    _packet(out, payload, 0)
     return out^
 
 
@@ -215,8 +200,11 @@ def main() raises:
     )
 
     var result_seeds = List[List[UInt8]]()
-    result_seeds.append(_result_set(False))
-    result_seeds.append(_result_set(True))
+    for binary in [False, True]:
+        for deprecate_eof in [False, True]:
+            result_seeds.append(_result_set(binary, deprecate_eof))
+    result_seeds.append(_alone(_from([0, 1, 5, 2, 0, 0, 0])))  # OK
+    result_seeds.append(_alone(_err()))
 
     print("\n[mozz] fuzzing MySQL result sets\n")
     fuzz(
