@@ -24,6 +24,7 @@ layer is monomorphised into the handler chain.
 
 from std.collections import Optional
 
+from .calls import Calls
 from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
@@ -172,56 +173,84 @@ struct Cors[Inner: Handler & Copyable](Copyable, Handler):
             )
 
     def serve(self, req: Request) raises -> Response:
+        var early = self._preflight(req)
+        if early:
+            return early.take()
+        return self._decorate(req, self.inner.serve(req).lower())
+
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        var early = self._preflight(req)
+        if early:
+            return early^
+        return self._decorate_answer(req, self.inner.start(req, calls))
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self._decorate_answer(req, self.inner.finish(req, calls))
+
+    def _decorate_answer(
+        self, req: Request, var answer: Optional[Response]
+    ) raises -> Optional[Response]:
+        """Add the CORS headers once a step returns a response."""
+        if not answer:
+            return None
+        return self._decorate(req, answer.take())
+
+    def _decorate(self, req: Request, var resp: Response) raises -> Response:
+        """Add the CORS headers to the inner handler's response."""
         var origin = req.headers.get("origin")
+        if origin.byte_length() == 0:
+            # Same-origin or non-CORS request; pass through, only adding
+            # ``Vary: Origin`` so caches keep it apart from CORS responses.
+            _ensure_vary_origin(resp)
+            return resp^
+        if not _origin_allowed(origin, self.config):
+            _ensure_vary_origin(resp)
+            return resp^
+        self._attach_origin(resp, origin)
+        return resp^
+
+    def _preflight(self, req: Request) raises -> Optional[Response]:
+        """The answer to a preflight request, which never reaches the
+        inner handler; ``None`` for every other request."""
+        var origin = req.headers.get("origin")
+        if origin.byte_length() == 0:
+            return None
         var is_preflight = (
             req.method == "OPTIONS"
             and req.headers.get("access-control-request-method").byte_length()
             > 0
         )
-
-        if origin.byte_length() == 0:
-            # Same-origin or non-CORS request; pass through, only adding
-            # ``Vary: Origin`` so caches keep it apart from CORS responses.
-            var plain = self.inner.serve(req).lower()
-            _ensure_vary_origin(plain)
-            return plain^
+        if not is_preflight:
+            return None
 
         if not _origin_allowed(origin, self.config):
-            if is_preflight:
-                # Spec recommends 403, in practice 204 with no CORS
-                # headers is also accepted; we go with 403 so curl
-                # users see the rejection.
-                var resp = Response(status=403)
-                _ensure_vary_origin(resp)
-                return resp^
-            var rejected = self.inner.serve(req).lower()
-            _ensure_vary_origin(rejected)
-            return rejected^
-
-        if is_preflight:
-            var resp = Response(status=204)
-            self._attach_origin(resp, origin)
-            resp.headers.set(
-                "Access-Control-Allow-Methods",
-                _join(self.config.allowed_methods, ", "),
-            )
-            var headers_value: String
-            if len(self.config.allowed_headers) == 0:
-                headers_value = req.headers.get(
-                    "access-control-request-headers"
-                )
-            else:
-                headers_value = _join(self.config.allowed_headers, ", ")
-            if headers_value.byte_length() > 0:
-                resp.headers.set("Access-Control-Allow-Headers", headers_value)
-            resp.headers.set(
-                "Access-Control-Max-Age", String(self.config.max_age_seconds)
-            )
+            # Spec recommends 403, in practice 204 with no CORS
+            # headers is also accepted; we go with 403 so curl
+            # users see the rejection.
+            var resp = Response(status=403)
+            _ensure_vary_origin(resp)
             return resp^
 
-        # Simple / actual request.
-        var resp = self.inner.serve(req).lower()
+        var resp = Response(status=204)
         self._attach_origin(resp, origin)
+        resp.headers.set(
+            "Access-Control-Allow-Methods",
+            _join(self.config.allowed_methods, ", "),
+        )
+        var headers_value: String
+        if len(self.config.allowed_headers) == 0:
+            headers_value = req.headers.get(
+                "access-control-request-headers"
+            )
+        else:
+            headers_value = _join(self.config.allowed_headers, ", ")
+        if headers_value.byte_length() > 0:
+            resp.headers.set("Access-Control-Allow-Headers", headers_value)
+        resp.headers.set(
+            "Access-Control-Max-Age", String(self.config.max_age_seconds)
+        )
         return resp^
 
     def may_block(self) -> Bool:
@@ -232,3 +261,9 @@ struct Cors[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)

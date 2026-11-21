@@ -97,7 +97,9 @@ def test_unknown_flag() raises:
 def test_routes_lists_the_app() raises:
     var ran = dodo_run(["routes", _APP])
     assert_equal(ran.code, EXIT_OK, ran.err)
-    assert_equal(ran.out, "GET  /\nGET  /slow  (blocking)\n")
+    assert_equal(
+        ran.out, "GET  /\nGET  /slow  (blocking)\nGET  /dash  (calls)\n"
+    )
 
 
 def test_routes_json() raises:
@@ -108,11 +110,14 @@ def test_routes_json() raises:
     assert_true(result["ok"].as_bool())
     assert_equal(result["command"].as_string(), "routes")
     var routes = result["routes"].copy()
-    assert_equal(len(routes), 2)
+    assert_equal(len(routes), 3)
     assert_equal(routes[0]["path"].as_string(), "/")
     assert_false(routes[0]["blocking"].as_bool())
+    assert_false(routes[0]["calls"].as_bool())
     assert_equal(routes[1]["path"].as_string(), "/slow")
     assert_true(routes[1]["blocking"].as_bool())
+    assert_equal(routes[2]["path"].as_string(), "/dash")
+    assert_true(routes[2]["calls"].as_bool())
     assert_true(
         result["binary"].as_string().endswith("tests__cli__fixtures__cli_app")
     )

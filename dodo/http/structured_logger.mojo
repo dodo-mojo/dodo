@@ -57,8 +57,10 @@ this is well under 1µs/req — invisible against the inner
 handler's latency budget.
 """
 
+from std.collections import Optional
 from std.time import perf_counter_ns
 
+from .calls import Calls
 from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
@@ -199,21 +201,31 @@ struct StructuredLogger[Inner: Handler & Copyable](Copyable, Handler):
         self._epoch_offset_ns = 0
 
     def serve(self, req: Request) raises -> Response:
-        var start = perf_counter_ns()
+        var started = perf_counter_ns()
         var resp: Response
         try:
             resp = self.inner.serve(req).lower()
         except e:
-            var latency_ms = Int((perf_counter_ns() - start) // 1_000_000)
-            var line = self._build_error_line(
-                req, String(e), latency_ms, Int(start)
-            )
-            print(line)
-            raise Error(String(e))
-        var latency_ms = Int((perf_counter_ns() - start) // 1_000_000)
-        var line = self._build_success_line(req, resp, latency_ms, Int(start))
-        print(line)
+            raise self._log_raise(req, started, e)
+        self._log_response(req, started, resp)
         return resp^
+
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        var started = perf_counter_ns()
+        calls.note(_STARTED, String(started))
+        try:
+            return self._log_answer(req, started, self.inner.start(req, calls))
+        except e:
+            raise self._log_raise(req, started, e)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        var started = Int(calls.note(_STARTED))
+        try:
+            return self._log_answer(req, started, self.inner.finish(req, calls))
+        except e:
+            raise self._log_raise(req, started, e)
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -223,6 +235,31 @@ struct StructuredLogger[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+    def _log_answer(
+        self, req: Request, started: Int, var answer: Optional[Response]
+    ) -> Optional[Response]:
+        """Log the response once a step returns one."""
+        if answer:
+            self._log_response(req, started, answer.value())
+        return answer^
+
+    def _log_response(self, req: Request, started: Int, resp: Response):
+        var latency_ms = (perf_counter_ns() - started) // 1_000_000
+        print(self._build_success_line(req, resp, latency_ms, started))
+
+    def _log_raise(self, req: Request, started: Int, e: Error) -> Error:
+        """Log the error the inner handler raised and return it to raise
+        again."""
+        var latency_ms = (perf_counter_ns() - started) // 1_000_000
+        print(self._build_error_line(req, String(e), latency_ms, started))
+        return Error(String(e))
 
     def _build_success_line(
         self,
@@ -285,3 +322,7 @@ struct StructuredLogger[Inner: Handler & Copyable](Copyable, Handler):
         """Render Request.peer as ``host:port``, or ``""`` when
         the parser couldn't fill it in (e.g. UDS connection)."""
         return String(req.peer)
+
+
+comptime _STARTED = "dodo.structured_logger.started"
+"""The note under which ``StructuredLogger.start`` keeps the start time."""

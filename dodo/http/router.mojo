@@ -61,6 +61,7 @@ from std.collections import Dict, Optional
 from std.memory import ArcPointer
 
 from ..runtime import Pool
+from .calls import Calls
 from .handler import Handler, FnHandler, RouteInfo, prefix_routes
 from .headers import HeaderMap
 from .proto.ascii import ascii_unchecked_string
@@ -183,6 +184,8 @@ struct _Route(Copyable):
     var handler_idx: Int
     var blocking: Bool
     """Whether the handler runs on the offload pool, for the route list."""
+    var calls: Bool
+    """Whether the handler makes outgoing calls, for the route list."""
 
     def __init__(
         out self,
@@ -191,12 +194,14 @@ struct _Route(Copyable):
         handler_kind: Int,
         handler_idx: Int,
         blocking: Bool = False,
+        calls: Bool = False,
     ):
         self.method = method
         self.segs = segs^
         self.handler_kind = handler_kind
         self.handler_idx = handler_idx
         self.blocking = blocking
+        self.calls = calls
 
 
 struct _Mount(Copyable):
@@ -269,6 +274,27 @@ def _struct_blocking_thunk[
     return Pool[H].get_ptr(addr)[].blocking(req)
 
 
+def _struct_calling_thunk[
+    H: Handler & Copyable
+](addr: Int, req: Request) raises -> Bool:
+    """Thunk that asks the boxed ``H`` whether ``req`` is served in steps.
+    """
+    return Pool[H].get_ptr(addr)[].calling(req)
+
+
+def _struct_step_thunk[
+    H: Handler & Copyable
+](addr: Int, req: Request, mut calls: Calls, first: Bool) raises -> Optional[
+    Response
+]:
+    """Thunk that runs the boxed ``H``'s ``start`` (``first``) or
+    ``finish``."""
+    ref handler = Pool[H].get_ptr(addr)[]
+    if first:
+        return handler.start(req, calls)
+    return handler.finish(req, calls)
+
+
 def _struct_routes_thunk[
     H: Handler & Copyable
 ](addr: Int) raises -> List[RouteInfo]:
@@ -320,6 +346,12 @@ def _struct_destroy_thunk[H: Handler & Copyable](addr: Int) -> None:
 # which is exactly the desired multi-worker semantics.
 
 
+comptime _StepThunk = def(Int, Request, mut Calls, Bool) raises thin -> Optional[
+    Response
+]
+"""Runs a boxed handler's ``start`` (``True``) or ``finish`` (``False``)."""
+
+
 struct _StructHandlerRegistry(Movable):
     """Shared registry of boxed Handler-struct addresses + thunks.
 
@@ -342,12 +374,27 @@ struct _StructHandlerRegistry(Movable):
     var blocking_thunks: List[def(Int, Request) raises thin -> Bool]
     """Monomorphised ``blocking`` thunks; ``blocking_thunks[i]`` is
     the thunk for ``addrs[i]``."""
+    var calling_thunks: List[def(Int, Request) raises thin -> Bool]
+    """Monomorphised ``calling`` thunks, one per address."""
+    var step_thunks: List[_StepThunk]
+    """Monomorphised ``start`` / ``finish`` thunks, one per address."""
 
     def __init__(out self):
         self.addrs = List[Int]()
         self.serve_thunks = List[def(Int, Request) raises thin -> Response]()
         self.destroy_thunks = List[def(Int) thin -> None]()
         self.blocking_thunks = List[def(Int, Request) raises thin -> Bool]()
+        self.calling_thunks = List[def(Int, Request) raises thin -> Bool]()
+        self.step_thunks = List[_StepThunk]()
+
+    def add[H: Handler & Copyable](mut self, addr: Int):
+        """Record the boxed ``H`` at ``addr`` with its thunks."""
+        self.addrs.append(addr)
+        self.serve_thunks.append(_struct_serve_thunk[H])
+        self.destroy_thunks.append(_struct_destroy_thunk[H])
+        self.blocking_thunks.append(_struct_blocking_thunk[H])
+        self.calling_thunks.append(_struct_calling_thunk[H])
+        self.step_thunks.append(_struct_step_thunk[H])
 
     def __deinit__(deinit self):
         """Run every destroy thunk and free the boxed handlers.
@@ -414,6 +461,9 @@ struct Router(Copyable, Defaultable, Handler):
     var _may_block: Bool
     """Some route or mount may run on the offload pool (an ``Offload``
     is registered somewhere below this router)."""
+    var _may_call: Bool
+    """Some route or mount may make outgoing calls (an ``OnLoop`` is
+    registered somewhere below this router)."""
 
     def __init__(out self):
         """Create an empty router (no routes)."""
@@ -425,6 +475,7 @@ struct Router(Copyable, Defaultable, Handler):
         )
         self._fallback = Optional[FnHandler]()
         self._may_block = False
+        self._may_call = False
 
     # ── Registration per method (def-function overloads) ────────────────────
 
@@ -642,12 +693,12 @@ struct Router(Copyable, Defaultable, Handler):
         var blocking = handler.may_block()
         if blocking:
             self._may_block = True
+        var calls = handler.may_call()
+        if calls:
+            self._may_call = True
         var addr = Pool[H].alloc_move(handler^)
         ref reg = self._struct_registry[]
-        reg.addrs.append(addr)
-        reg.serve_thunks.append(_struct_serve_thunk[H])
-        reg.destroy_thunks.append(_struct_destroy_thunk[H])
-        reg.blocking_thunks.append(_struct_blocking_thunk[H])
+        reg.add[H](addr)
         self._routes.append(
             _Route(
                 method,
@@ -655,6 +706,7 @@ struct Router(Copyable, Defaultable, Handler):
                 _ROUTE_KIND_STRUCT,
                 len(reg.addrs) - 1,
                 blocking,
+                calls,
             )
         )
 
@@ -694,12 +746,11 @@ struct Router(Copyable, Defaultable, Handler):
         var wrapper = _MountedRouter[H](sub^, len(psegs))
         if wrapper.may_block():
             self._may_block = True
+        if wrapper.may_call():
+            self._may_call = True
         var addr = Pool[_MountedRouter[H]].alloc_move(wrapper^)
         ref reg = self._struct_registry[]
-        reg.addrs.append(addr)
-        reg.serve_thunks.append(_struct_serve_thunk[_MountedRouter[H]])
-        reg.destroy_thunks.append(_struct_destroy_thunk[_MountedRouter[H]])
-        reg.blocking_thunks.append(_struct_blocking_thunk[_MountedRouter[H]])
+        reg.add[_MountedRouter[H]](addr)
         self._mounts.append(
             _Mount(
                 psegs^,
@@ -734,6 +785,7 @@ struct Router(Copyable, Defaultable, Handler):
                     self._routes[i].method,
                     _segs_to_route_path(self._routes[i].segs),
                     self._routes[i].blocking,
+                    self._routes[i].calls,
                     "route",
                 )
             )
@@ -745,7 +797,7 @@ struct Router(Copyable, Defaultable, Handler):
             for route in prefix_routes(mounted^, prefix):
                 out.append(route.copy())
         if self._fallback:
-            out.append(RouteInfo("*", "/{*path}", False, "fallback"))
+            out.append(RouteInfo("*", "/{*path}", False, False, "fallback"))
         return out^
 
     def route_path_params(self, i: Int) -> List[String]:
@@ -857,6 +909,96 @@ struct Router(Copyable, Defaultable, Handler):
                 return reg.blocking_thunks[sh_idx](reg.addrs[sh_idx], req)
         return False
 
+    def may_call(self) -> Bool:
+        """Whether some route or mount below this router makes calls."""
+        return self._may_call
+
+    def calling(self, req: Request) raises -> Bool:
+        """Whether the route ``req`` matches is served in steps.
+
+        Follows the same matching order as :meth:`serve`, like
+        :meth:`blocking`.
+        """
+        if not self._may_call:
+            return False
+        var segs_in = _split_path(_path_only(req.url))
+        for i in range(len(self._routes)):
+            if self._routes[i].method != req.method:
+                continue
+            if not _match(segs_in, self._routes[i].segs).matched:
+                continue
+            if self._routes[i].handler_kind == _ROUTE_KIND_FN:
+                return False
+            var sh_idx = self._routes[i].handler_idx
+            ref reg = self._struct_registry[]
+            return reg.calling_thunks[sh_idx](reg.addrs[sh_idx], req)
+        for i in range(len(self._mounts)):
+            if _prefix_match(segs_in, self._mounts[i].segs):
+                var sh_idx = self._mounts[i].handler_idx
+                ref reg = self._struct_registry[]
+                return reg.calling_thunks[sh_idx](reg.addrs[sh_idx], req)
+        return False
+
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        """Run the ``start`` of the handler ``req`` matches."""
+        return self._step(req, calls, True)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        """Run the ``finish`` of the handler ``req`` matches."""
+        return self._step(req, calls, False)
+
+    def _step(
+        self, req: Request, mut calls: Calls, first: Bool
+    ) raises -> Optional[Response]:
+        """Find the handler ``req`` matches, the way :meth:`serve` does,
+        and run its ``start`` (``first``) or ``finish``.
+
+        A request that ends anywhere else (a function route, 404, 405, the
+        fallback) makes no calls, so its ``start`` is plain :meth:`serve`.
+        """
+        var segs_in = _split_path(_path_only(req.url))
+        for i in range(len(self._routes)):
+            if self._routes[i].method != req.method:
+                continue
+            var m_result = _match(segs_in, self._routes[i].segs)
+            if not m_result.matched:
+                continue
+            if self._routes[i].handler_kind == _ROUTE_KIND_FN:
+                return self._serve_step(req, first)
+            var sh_idx = self._routes[i].handler_idx
+            ref reg = self._struct_registry[]
+            var thunk = reg.step_thunks[sh_idx]
+            if len(m_result.params) == 0 and not req.has_params():
+                return thunk(reg.addrs[sh_idx], req, calls, first)
+            var child = _child_request(req, req.url)
+            if len(m_result.params) > 0:
+                try:
+                    _set_decoded_params(child, m_result.params)
+                except:
+                    return _bad_percent_escape()
+            return thunk(reg.addrs[sh_idx], child, calls, first)
+        for i in range(len(self._mounts)):
+            if _prefix_match(segs_in, self._mounts[i].segs):
+                var sh_idx = self._mounts[i].handler_idx
+                ref reg = self._struct_registry[]
+                var thunk = reg.step_thunks[sh_idx]
+                if not req.has_params():
+                    return thunk(reg.addrs[sh_idx], req, calls, first)
+                var child = _child_request(req, req.url)
+                return thunk(reg.addrs[sh_idx], child, calls, first)
+        return self._serve_step(req, first)
+
+    def _serve_step(
+        self, req: Request, first: Bool
+    ) raises -> Optional[Response]:
+        """The step of a request whose handler makes no calls: ``start``
+        serves it, and ``finish`` never comes."""
+        if not first:
+            raise Error("finish: no route makes calls for this request")
+        return self.serve(req)
+
 
 # ── Mounted sub-router wrapper ───────────────────────────────────────────────
 
@@ -906,6 +1048,22 @@ struct _MountedRouter[H: Handler & Copyable](Copyable, Handler):
         if not self.sub.may_block():
             return False
         return self.sub.blocking(self._child(req))
+
+    def may_call(self) -> Bool:
+        return self.sub.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        if not self.sub.may_call():
+            return False
+        return self.sub.calling(self._child(req))
+
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        return self.sub.start(self._child(req), calls)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self.sub.finish(self._child(req), calls)
 
 
 # ── Internals ────────────────────────────────────────────────────────────────

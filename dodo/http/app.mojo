@@ -42,6 +42,7 @@ from ..runtime._thread import num_cpus
 from ..tcp import TcpListener
 from ._route_path import SEG_LITERAL, parse_route_path, percent_decode
 from ._server.responses import ok_json_of
+from .calls import Calls
 from .handler import Handler, RouteInfo
 from .request import Method, Request
 from .response import Response
@@ -786,6 +787,20 @@ struct App[S: AppState = NoState](Copyable, Handler):
     def blocking(self, req: Request) raises -> Bool:
         return self._router.blocking(req)
 
+    def may_call(self) -> Bool:
+        return self._router.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self._router.calling(req)
+
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        return self._router.start(req, calls)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self._router.finish(req, calls)
+
     def serve(
         self,
         *,
@@ -797,6 +812,16 @@ struct App[S: AppState = NoState](Copyable, Handler):
         in-flight requests finish (`ServerConfig.shutdown_timeout_ms`) and
         return. `num_workers=0` uses every core."""
         _serve_on(self.copy(), port, host, num_workers)
+
+    def route[
+        path: String, H: Handler & Copyable
+    ](mut self, method: String, var handler: H) raises:
+        """Serve `method path` with a handler struct, such as
+        `OnLoop(Dash())` or `Offload(Chat())`. It gets the request as is:
+        path parameters are in `req.param`, and the state is not passed.
+        """
+        _check_path[path]()
+        self._router._add_struct(method, path, handler^)
 
     def route[
         path: String, R: _ArgType
@@ -940,6 +965,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         )
 
     def get[
+        path: String, H: Handler & Copyable
+    ](mut self, var handler: H) raises:
+        """Serve `GET path` with a handler struct; see `route`."""
+        self.route[path](Method.GET, handler^)
+
+    def get[
         path: String, R: _ArgType
     ](
         mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
@@ -1003,6 +1034,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         self.route[path](Method.GET, handler, blocking)
 
     def post[
+        path: String, H: Handler & Copyable
+    ](mut self, var handler: H) raises:
+        """Serve `POST path` with a handler struct; see `route`."""
+        self.route[path](Method.POST, handler^)
+
+    def post[
         path: String, R: _ArgType
     ](
         mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
@@ -1066,6 +1103,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         self.route[path](Method.POST, handler, blocking)
 
     def put[
+        path: String, H: Handler & Copyable
+    ](mut self, var handler: H) raises:
+        """Serve `PUT path` with a handler struct; see `route`."""
+        self.route[path](Method.PUT, handler^)
+
+    def put[
         path: String, R: _ArgType
     ](
         mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
@@ -1129,6 +1172,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         self.route[path](Method.PUT, handler, blocking)
 
     def patch[
+        path: String, H: Handler & Copyable
+    ](mut self, var handler: H) raises:
+        """Serve `PATCH path` with a handler struct; see `route`."""
+        self.route[path](Method.PATCH, handler^)
+
+    def patch[
         path: String, R: _ArgType
     ](
         mut self, handler: def(Request) raises thin -> R, blocking: Bool = False
@@ -1190,6 +1239,12 @@ struct App[S: AppState = NoState](Copyable, Handler):
         blocking: Bool = False,
     ) raises:
         self.route[path](Method.PATCH, handler, blocking)
+
+    def delete[
+        path: String, H: Handler & Copyable
+    ](mut self, var handler: H) raises:
+        """Serve `DELETE path` with a handler struct; see `route`."""
+        self.route[path](Method.DELETE, handler^)
 
     def delete[
         path: String, R: _ArgType
@@ -1283,7 +1338,7 @@ def _serve_on[
 
 
 def routes_json(routes: List[RouteInfo]) raises -> String:
-    """`{"dodo_routes": [{"method", "path", "blocking", "kind"}, ...]}` on one
+    """`{"dodo_routes": [{"method", "path", "blocking", "calls", "kind"}, ...]}` on one
     line, so `dodo routes` can find it among whatever else `main` prints."""
     var list = Value.array()
     for route in routes:
@@ -1291,6 +1346,7 @@ def routes_json(routes: List[RouteInfo]) raises -> String:
         entry["method"] = Value(route.method)
         entry["path"] = Value(route.path)
         entry["blocking"] = Value(route.blocking)
+        entry["calls"] = Value(route.calls)
         entry["kind"] = Value(route.kind)
         list.append(entry^)
     var out = Value.object()

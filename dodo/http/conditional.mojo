@@ -66,6 +66,7 @@ var app = Conditional[Router](Router())  # wraps any Handler-shaped Inner
 
 from std.collections import Optional
 
+from .calls import Calls
 from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
@@ -430,20 +431,50 @@ struct Conditional[Inner: Handler & Copyable](Copyable, Handler):
         return out^
 
     def serve(self, req: Request) raises -> Response:
-        var is_safe = req.method == "GET" or req.method == "HEAD"
-        if not is_safe:
-            if self.lookup and _has_preconditions(req):
-                var v = self.lookup.value()(req)
-                if (
-                    _evaluate_preconditions(req, v.etag, v.last_modified)
-                    != _PRE_PASS
-                ):
-                    var failed = Response(status=412)
-                    failed.reason = String("Precondition Failed")
-                    return failed^
-            return self.inner.serve(req).lower()
+        var early = self._check_write(req)
+        if early:
+            return early.take()
+        return self._check_read(req, self.inner.serve(req).lower())
 
-        var resp = self.inner.serve(req).lower()
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        var early = self._check_write(req)
+        if early:
+            return early^
+        return self._check_answer(req, self.inner.start(req, calls))
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self._check_answer(req, self.inner.finish(req, calls))
+
+    def _check_answer(
+        self, req: Request, var answer: Optional[Response]
+    ) raises -> Optional[Response]:
+        """Evaluate the read preconditions once a step returns a response.
+        """
+        if not answer:
+            return None
+        return self._check_read(req, answer.take())
+
+    def _check_write(self, req: Request) raises -> Optional[Response]:
+        """``412`` for an unsafe request whose preconditions fail against
+        the resource's current validators, before the handler runs."""
+        if _is_safe(req):
+            return None
+        if not self.lookup or not _has_preconditions(req):
+            return None
+        var v = self.lookup.value()(req)
+        if _evaluate_preconditions(req, v.etag, v.last_modified) == _PRE_PASS:
+            return None
+        var failed = Response(status=412)
+        failed.reason = String("Precondition Failed")
+        return failed^
+
+    def _check_read(self, req: Request, var resp: Response) raises -> Response:
+        """Evaluate a safe request's preconditions against the response's
+        validators; unsafe requests pass through."""
+        if not _is_safe(req):
+            return resp^
         # Only a successful representation has validators worth
         # comparing; a 404 must stay a 404, not become a 304.
         if resp.status < 200 or resp.status >= 300:
@@ -471,6 +502,16 @@ struct Conditional[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+
+def _is_safe(req: Request) -> Bool:
+    return req.method == "GET" or req.method == "HEAD"
 
 
 def _make_304(var resp: Response) -> Response:

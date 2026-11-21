@@ -112,6 +112,7 @@ Bad Request** with the error message in the body; the handler's
 from std.collections import Optional
 from ..json import loads, Value, Null
 
+from .calls import Calls
 from .handler import Handler
 from .headers import HeaderMap
 from .cookie import CookieJar
@@ -868,26 +869,61 @@ struct Extracted[H: Copyable & Defaultable & Handler](Copyable, Handler):
 
     def serve(self, req: Request) raises -> Response:
         var h = self.prototype.copy()
-        comptime n = reflect[Self.H].field_count()
-        var expose = req.expose_errors
-        comptime for idx in range(n):
-            try:
-                ref field = reflect[Self.H].field_ref[idx](h)
-                comptime assert conforms_to(
-                    type_of(field), Extractor
-                ), "dodo: every Handler field must implement Extractor"
-                field.apply(req)
-            except e:
-                return _extractor_error_response(
-                    e, expose, req.headers.get("x-request-id")
-                )
+        var refused = _extract_into(h, req)
+        if refused:
+            return refused.take()
         return h.serve(req).lower()
+
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        var h = self.prototype.copy()
+        var refused = _extract_into(h, req)
+        if refused:
+            return refused^
+        return h.start(req, calls)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        # The fields come from ``req`` alone, so extracting them again
+        # gives ``finish`` the same values ``start`` saw.
+        var h = self.prototype.copy()
+        var refused = _extract_into(h, req)
+        if refused:
+            return refused^
+        return h.finish(req, calls)
 
     def may_block(self) -> Bool:
         return self.prototype.may_block()
 
     def blocking(self, req: Request) raises -> Bool:
         return self.prototype.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.prototype.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.prototype.calling(req)
+
+
+def _extract_into[
+    H: Handler & Copyable & Defaultable
+](mut h: H, req: Request) -> Optional[Response]:
+    """Fill every field of ``h`` from ``req``. Returns the ``400`` for a
+    field that does not parse, or ``None`` when all of them do."""
+    comptime n = reflect[H].field_count()
+    var expose = req.expose_errors
+    comptime for idx in range(n):
+        try:
+            ref field = reflect[H].field_ref[idx](h)
+            comptime assert conforms_to(
+                type_of(field), Extractor
+            ), "dodo: every Handler field must implement Extractor"
+            field.apply(req)
+        except e:
+            return _extractor_error_response(
+                e, expose, req.headers.get("x-request-id")
+            )
+    return None
 
 
 @always_inline

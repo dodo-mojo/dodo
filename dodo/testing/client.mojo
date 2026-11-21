@@ -29,6 +29,7 @@ from std.collections.span import Span
 
 from dodo.http.handler import Handler
 from dodo.http.headers import HeaderMap
+from dodo.http.on_loop import serve_steps_blocking
 from dodo.http.proto.ascii import ascii_lower
 from dodo.http.request import Request
 from dodo.http.response import Response
@@ -72,7 +73,7 @@ struct TestClient[H: Handler](Deinitable, Movable):
             expose_errors=True,
         )
         req.headers = headers^
-        return self.handler.serve(req).lower()
+        return serve_steps_blocking(self.handler, req)
 
     def get(
         self, path: String, var headers: HeaderMap = HeaderMap()
@@ -199,7 +200,7 @@ struct H2cTestClient[H: Handler](Deinitable, Movable):
             for di in range(len(done)):
                 var rid = done[di]
                 var req = server.take_request(rid)
-                var resp = self.handler.serve(req).lower()
+                var resp = serve_steps_blocking(self.handler, req)
                 server.emit_response(rid, resp^)
             client.feed(Span[UInt8, _](server.drain()))
             if client.response_ready(sid):

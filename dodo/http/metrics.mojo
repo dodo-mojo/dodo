@@ -71,10 +71,12 @@ The ``MetricsRegistry.render()`` snapshot allocates one output
 req/s, the cost rounds to zero (<5 µs amortised per request).
 """
 
+from std.collections import Optional
 from std.time import perf_counter_ns
 
 from dodo.runtime.pool import Pool
 
+from .calls import Calls
 from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
@@ -514,25 +516,63 @@ struct Metrics[Inner: Handler & Copyable](Copyable, Handler):
         self.registry_addr = _alloc_registry_or_zero()
 
     def serve(self, req: Request) raises -> Response:
-        var reg = Pool[MetricsRegistry].get_ptr(self.registry_addr)
-        var start = perf_counter_ns()
-        reg[].enter()
+        var started = self._enter()
         var resp: Response
         try:
             resp = self.inner.serve(req).lower()
         except e:
-            var latency_micros = (perf_counter_ns() - start) // 1_000
-            reg[].record_error(UInt64(Int(latency_micros)))
-            reg[].exit()
-            raise Error(String(e))
-        var latency_micros = (perf_counter_ns() - start) // 1_000
+            raise self._exit_raised(started, e)
+        self._exit(req, started, resp.status)
+        return resp^
+
+    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+        var started = self._enter()
+        calls.note(_STARTED, String(started))
+        try:
+            return self._exit_answer(req, started, self.inner.start(req, calls))
+        except e:
+            raise self._exit_raised(started, e)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        var started = Int(calls.note(_STARTED))
+        try:
+            return self._exit_answer(req, started, self.inner.finish(req, calls))
+        except e:
+            raise self._exit_raised(started, e)
+
+    def _enter(self) -> Int:
+        """Count the request in flight; returns its start time."""
+        Pool[MetricsRegistry].get_ptr(self.registry_addr)[].enter()
+        return perf_counter_ns()
+
+    def _exit(self, req: Request, started: Int, status: Int):
+        """Record the response and count the request out of flight."""
+        var reg = Pool[MetricsRegistry].get_ptr(self.registry_addr)
+        var latency_micros = (perf_counter_ns() - started) // 1_000
         reg[].record(
             _method_index(req.method),
-            _status_index(Int(resp.status)),
-            UInt64(Int(latency_micros)),
+            _status_index(status),
+            UInt64(latency_micros),
         )
         reg[].exit()
-        return resp^
+
+    def _exit_answer(
+        self, req: Request, started: Int, var answer: Optional[Response]
+    ) -> Optional[Response]:
+        """Record the response once a step returns one."""
+        if answer:
+            self._exit(req, started, answer.value().status)
+        return answer^
+
+    def _exit_raised(self, started: Int, e: Error) -> Error:
+        """Record the error and return it to raise again."""
+        var reg = Pool[MetricsRegistry].get_ptr(self.registry_addr)
+        var latency_micros = (perf_counter_ns() - started) // 1_000
+        reg[].record_error(UInt64(latency_micros))
+        reg[].exit()
+        return Error(String(e))
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -543,9 +583,19 @@ struct Metrics[Inner: Handler & Copyable](Copyable, Handler):
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
 
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
     def render(self) -> String:
         """Convenience accessor that snapshots the underlying
         registry as Prometheus text exposition. Equivalent to
         ``Pool[MetricsRegistry].get_ptr(self.registry_addr)[].render()``
         but keeps callers pointer-free."""
         return Pool[MetricsRegistry].get_ptr(self.registry_addr)[].render()
+
+
+comptime _STARTED = "dodo.metrics.started"
+"""The note under which ``Metrics.start`` keeps the start time."""
