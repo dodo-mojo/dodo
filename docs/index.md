@@ -6,6 +6,7 @@ Every relative link below is a file of these docs. `tools/save_docs.py dodo` wri
 
 ## Guides
 
+- [Outgoing calls](calls.md): A handler that calls other services (another API, a model server) is written in steps, so the worker can run its calls on the event loop and serve other requests while they are out (ADR-0006).
 - [The `dodo` command line](cli.md): One binary, written in Mojo, in `cli/`.
 - [Databases](databases.md): `dodo.db` talks to PostgreSQL, CockroachDB, MySQL, MariaDB, SQLite, Redis, Valkey, MongoDB and ClickHouse.
 - [dodo: design](design.md): Status: draft v0.1, 2026-10-26.
@@ -85,6 +86,7 @@ Every relative link below is a file of these docs. `tools/save_docs.py dodo` wri
 - [`dodo.http.auth`](api/http/auth.md): HTTP authentication helpers.
 - [`dodo.http.auth_extract`](api/http/auth_extract.md): Server-side authentication extractors + CSRF helper.
 - [`dodo.http.body`](api/http/body.md): Streaming response body primitives.
+- [`dodo.http.calls`](api/http/calls.md): ``Calls``: the outgoing HTTP calls a handler makes while it serves a request (ADR-0006).
 - [`dodo.http.cancel`](api/http/cancel.md): Cancel token plumbed from the reactor into request handlers.
 - [`dodo.http.client`](api/http/client.md): HTTP client: HTTP/1.1 and HTTP/2, over TCP or TLS.
 - [`dodo.http.client_pool`](api/http/client_pool.md): HTTP/1.1 client connection pool.
@@ -109,6 +111,7 @@ Every relative link below is a file of these docs. `tools/save_docs.py dodo` wri
 - [`dodo.http.multipart`](api/http/multipart.md): ``multipart/form-data`` parsing (RFC 7578).
 - [`dodo.http.multipart_builder`](api/http/multipart_builder.md): Client-side ``multipart/form-data`` request-body builder (RFC 7578).
 - [`dodo.http.offload`](api/http/offload.md): ``Offload``: run a blocking handler on the offload pool (ADR-0004).
+- [`dodo.http.on_loop`](api/http/on_loop.md): ``OnLoop``: serve a handler in steps, so its outgoing calls run on the worker's event loop (ADR-0006).
 - [`dodo.http.proxy_protocol`](api/http/proxy_protocol.md): PROXY protocol v1 + v2 parser (HAProxy spec).
 - [`dodo.http.redirect_policy`](api/http/redirect_policy.md): HTTP redirect policy: configurable cross-origin + auth gating.
 - [`dodo.http.reliability`](api/http/reliability.md): Reliability middleware: ``Retry`` / ``PostHocDeadline`` / ``RateLimit`` / ``CircuitBreaker`` policies.

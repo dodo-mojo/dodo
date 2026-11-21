@@ -60,6 +60,18 @@ def __init__(out self, var inner: Inner, prefix: String = "[dodo]")
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `Logger.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Logger.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `Logger.may_block`
 
 ```mojo
@@ -76,6 +88,18 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `Logger.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Logger.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 ### `RequestId`
@@ -112,6 +136,18 @@ def __init__(out self, var inner: Inner)
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `RequestId.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `RequestId.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `RequestId.may_block`
 
 ```mojo
@@ -128,6 +164,18 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `RequestId.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `RequestId.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 ### `Compress`
@@ -177,6 +225,30 @@ def __init__(out self, var inner: Inner, min_size_bytes: Int = Int(1024), brotli
 
 ```mojo
 def serve(self, req: Request) raises -> Response
+```
+
+#### `Compress.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Compress.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Compress.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Compress.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 #### `Compress.may_block`
@@ -231,6 +303,30 @@ def __init__(out self, var inner: Inner, body: String = "Internal Server Error")
 
 ```mojo
 def serve(self, req: Request) raises -> Response
+```
+
+#### `CatchPanic.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `CatchPanic.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `CatchPanic.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `CatchPanic.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 #### `CatchPanic.may_block`

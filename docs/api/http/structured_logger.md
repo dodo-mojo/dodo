@@ -118,6 +118,18 @@ def __init__(out self, var inner: Inner)
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `StructuredLogger.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `StructuredLogger.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `StructuredLogger.may_block`
 
 ```mojo
@@ -134,4 +146,16 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `StructuredLogger.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `StructuredLogger.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```

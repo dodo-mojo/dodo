@@ -14,7 +14,9 @@ Mojo has no stable async/await, so the design must not depend on it (design sect
 1. **A client on the worker's loop.** Outgoing HTTP/1.1 and HTTP/2 connections (cleartext and TLS) live on the same event loop as incoming ones, pooled per worker.
 2. **Park and resume.** A handler starts one or more calls, and the request parks the same way an offloaded request does (ADR-0004: the H1 connection or the H2 stream). The loop drives the calls side by side and resumes the handler with all the results when the last one answers. The handler is a struct with steps (start calls, then finish with the results), since closures cannot be suspended.
 3. **Same rules as offload.** `handler_timeout_ms` and the client's own timeouts answer `503`/`504` and cancel the outgoing calls; a client that goes away cancels them with `PEER_CLOSED`; graceful shutdown waits up to `shutdown_timeout_ms`.
-4. **Room for more.** Database drivers later use the same park-and-resume mechanism. If Mojo's async/await becomes stable, `async def` handlers sit on top of it without changing the I/O layer.
+4. **Rounds.** `start` asks for calls and returns `None`; after each round of replies `finish` runs and returns the response or asks for the next round, up to 32 rounds. A failed call is a reply with a `CallError`, never a raise (decided 2026-11-21).
+5. **Middleware in two parts.** Each middleware runs its before-part in `start` and can answer there, so no call goes out, and its after-part once on the final response. Notes on `Calls` carry state between them. A handler or middleware that does not take part is served through `serve`, which runs the steps with blocking calls (decided 2026-11-21).
+6. **Room for more.** Database drivers later use the same park-and-resume mechanism. If Mojo's async/await becomes stable, `async def` handlers sit on top of it without changing the I/O layer.
 
 ## Consequences
 

@@ -1076,6 +1076,18 @@ def __init__(out self, *, copy: Self)
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `Extracted.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Extracted.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `Extracted.may_block`
 
 ```mojo
@@ -1086,4 +1098,16 @@ def may_block(self) -> Bool
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `Extracted.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Extracted.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```

@@ -135,7 +135,37 @@ Every route, mounts included, for `dodo routes`.
 def blocking(self, req: Request) raises -> Bool
 ```
 
+#### `App.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `App.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
+```
+
+#### `App.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `App.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `App.route`
+
+```mojo
+def route[path: String, H: Handler & Copyable](mut self, method: String, var handler: H) raises
+```
+
+Serve `method path` with a handler struct, such as `OnLoop(Dash())` or `Offload(Chat())`. It gets the request as is: path parameters are in `req.param`, and the state is not passed.
 
 ```mojo
 def route[path: String, R: Deinitable & Movable](mut self, method: String, handler: def(Request) raises thin -> R, blocking: Bool = False) raises
@@ -164,6 +194,12 @@ def route[path: String, R: Deinitable & Movable, A0: Deinitable & Movable, A1: D
 #### `App.get`
 
 ```mojo
+def get[path: String, H: Handler & Copyable](mut self, var handler: H) raises
+```
+
+Serve `GET path` with a handler struct; see `route`.
+
+```mojo
 def get[path: String, R: Deinitable & Movable](mut self, handler: def(Request) raises thin -> R, blocking: Bool = False) raises
 ```
 
@@ -188,6 +224,12 @@ def get[path: String, R: Deinitable & Movable, A0: Deinitable & Movable, A1: Dei
 ```
 
 #### `App.post`
+
+```mojo
+def post[path: String, H: Handler & Copyable](mut self, var handler: H) raises
+```
+
+Serve `POST path` with a handler struct; see `route`.
 
 ```mojo
 def post[path: String, R: Deinitable & Movable](mut self, handler: def(Request) raises thin -> R, blocking: Bool = False) raises
@@ -216,6 +258,12 @@ def post[path: String, R: Deinitable & Movable, A0: Deinitable & Movable, A1: De
 #### `App.put`
 
 ```mojo
+def put[path: String, H: Handler & Copyable](mut self, var handler: H) raises
+```
+
+Serve `PUT path` with a handler struct; see `route`.
+
+```mojo
 def put[path: String, R: Deinitable & Movable](mut self, handler: def(Request) raises thin -> R, blocking: Bool = False) raises
 ```
 
@@ -242,6 +290,12 @@ def put[path: String, R: Deinitable & Movable, A0: Deinitable & Movable, A1: Dei
 #### `App.patch`
 
 ```mojo
+def patch[path: String, H: Handler & Copyable](mut self, var handler: H) raises
+```
+
+Serve `PATCH path` with a handler struct; see `route`.
+
+```mojo
 def patch[path: String, R: Deinitable & Movable](mut self, handler: def(Request) raises thin -> R, blocking: Bool = False) raises
 ```
 
@@ -266,6 +320,12 @@ def patch[path: String, R: Deinitable & Movable, A0: Deinitable & Movable, A1: D
 ```
 
 #### `App.delete`
+
+```mojo
+def delete[path: String, H: Handler & Copyable](mut self, var handler: H) raises
+```
+
+Serve `DELETE path` with a handler struct; see `route`.
 
 ```mojo
 def delete[path: String, R: Deinitable & Movable](mut self, handler: def(Request) raises thin -> R, blocking: Bool = False) raises
@@ -341,7 +401,7 @@ Inherits from: `AnyType`, `Deinitable`, `Movable`
 def routes_json(routes: List[RouteInfo]) raises -> String
 ```
 
-`{"dodo_routes": [{"method", "path", "blocking", "kind"}, ...]}` on one line, so `dodo routes` can find it among whatever else `main` prints.
+`{"dodo_routes": [{"method", "path", "blocking", "calls", "kind"}, ...]}` on one line, so `dodo routes` can find it among whatever else `main` prints.
 
 ### `serve`
 

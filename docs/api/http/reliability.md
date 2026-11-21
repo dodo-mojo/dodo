@@ -143,6 +143,18 @@ def __init__(out self, var inner: Inner, var policy: RetryPolicy = RetryPolicy()
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `Retry.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Retry.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `Retry.may_block`
 
 ```mojo
@@ -159,6 +171,18 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `Retry.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Retry.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 ### `PostHocDeadline`
@@ -215,6 +239,18 @@ def __init__(out self, var inner: Inner, budget_ms: Int = Int(30000))
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `PostHocDeadline.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `PostHocDeadline.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `PostHocDeadline.may_block`
 
 ```mojo
@@ -231,6 +267,18 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `PostHocDeadline.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `PostHocDeadline.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 ### `RateLimit`
@@ -278,6 +326,18 @@ def __init__(out self, var inner: Inner, rate_per_sec: Int, burst: Int = Int(0))
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `RateLimit.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `RateLimit.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `RateLimit.may_block`
 
 ```mojo
@@ -294,6 +354,18 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `RateLimit.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `RateLimit.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 ### `CircuitBreaker`
@@ -341,6 +413,18 @@ def __init__(out self, var inner: Inner, failure_threshold: Int, cooldown_ms: In
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `CircuitBreaker.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `CircuitBreaker.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `CircuitBreaker.may_block`
 
 ```mojo
@@ -357,4 +441,16 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `CircuitBreaker.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `CircuitBreaker.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```

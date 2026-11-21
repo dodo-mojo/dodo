@@ -20,7 +20,11 @@ Gaps between today and a production-grade REST API:
 - [x] A graceful stop of an idle app took about 100 ms: workers saw the stop flag only on their 100 ms poll timeout, and `serve_until_signal` checked for signals every 50 ms. Each reactor now advertises its wake fd in its worker's stats cell and the scheduler wakes it on stop; the signal wait wakes on the signal itself. SIGTERM to exit went from 101 ms to 4 ms (2026-11-19).
 - [x] Fuzzers for the database parsers: PostgreSQL messages, MySQL packets and rows, RESP replies, BSON and OP_MSG, ClickHouse RowBinary.
 - [x] Database tests in CI: `pixi run ci` (`tools/ci.sh`) runs `pixi run tests-db` when Docker is up or `DODO_DB_NO_COMPOSE=1`, and its last line says when it skipped them.
-- [ ] Outgoing calls on the event loop (ADR-0006): an HTTP client on the worker's loop, so a handler that calls another service no longer blocks a worker; it starts several calls and parks until they answer.
+- [ ] Outgoing calls on the event loop (ADR-0006), in four PRs:
+  - [x] The API: `Calls`, `Calling`, `OnLoop`, the `may_call`/`calling`/`start`/`finish` handler methods, every middleware split into start and finish, and the blocking fallback (`docs/calls.md`).
+  - [ ] HTTP/1.1 calls on the unified loop: cleartext and TLS, non-blocking connect, async DNS, a pool per worker, timeouts and cancel; park the H1 connection or H2 stream and drive `start`/`finish`.
+  - [ ] HTTP/2 outgoing calls.
+  - [ ] The other server loops (`serve_cancellable`, the H1-only multi-worker loop, streaming) and the steps for `CancelHandler`/`WithCancel`/`WithRaises`.
 
 ## Claude (after the items above are unblocked)
 

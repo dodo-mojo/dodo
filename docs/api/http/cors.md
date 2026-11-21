@@ -93,6 +93,18 @@ def __init__(out self, var inner: Inner, config: CorsConfig)
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `Cors.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Cors.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `Cors.may_block`
 
 ```mojo
@@ -109,4 +121,16 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `Cors.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Cors.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
