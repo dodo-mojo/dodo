@@ -33,6 +33,7 @@ from std.ffi import c_int, c_uint, c_size_t, c_ssize_t, get_errno
 from std.memory import Pointer, stack_allocation
 from std.sys.info import CompilationTarget
 
+from dodo.runtime.scheduler_stats import advertise_wake_fd, withdraw_wake_fd
 from dodo.net._libc import (
     INVALID_FD,
     _close,
@@ -188,6 +189,10 @@ struct Reactor(Movable):
     round-trip on every wakeup event, which matters once Stage 2+
     cross-thread wakeup traffic ramps up."""
 
+    var _advertised_in: Int
+    """The worker stats cell this reactor advertised its wake fd in, or 0.
+    The fd is withdrawn from it before the fd is closed."""
+
     var _event_buf: List[UInt8]
     """Reused scratch buffer for the raw ``epoll_event`` / ``kevent``
     array ``poll`` fills each call. Grown once to fit ``max_events``
@@ -212,6 +217,7 @@ struct Reactor(Movable):
         # before any fd is opened so a raise below leaves a valid field to
         # destroy.
         self._event_buf = List[UInt8]()
+        self._advertised_in = 0
 
         comptime if CompilationTarget.is_linux():
             var epfd = _epoll_create1(EPOLL_CLOEXEC)
@@ -275,6 +281,8 @@ struct Reactor(Movable):
 
     def __deinit__(deinit self):
         """Close the reactor fd and the wakeup fds."""
+        # First, so no wake from another thread lands on a closed fd.
+        withdraw_wake_fd(self._advertised_in)
         if (
             self._wake_write != INVALID_FD
             and self._wake_write != self._wake_read
@@ -644,6 +652,19 @@ struct Reactor(Movable):
             var b = stack_allocation[1, UInt8]()
             b.unsafe_write(UInt8(1))
             _ = self._io.write(self._wake_write, b, c_size_t(1))
+
+    def advertise_wake_fd(mut self, stats_addr: Int):
+        """Publish this reactor's wake fd in a worker stats cell, so the
+        scheduler can wake it on stop (``wake_worker``). The fd is
+        withdrawn when the reactor is destroyed. Does nothing when
+        ``stats_addr`` is 0.
+
+        Args:
+            stats_addr: The worker's stats cell, or 0 for none.
+        """
+        withdraw_wake_fd(self._advertised_in)
+        advertise_wake_fd(stats_addr, Int(self._wake_write))
+        self._advertised_in = stats_addr
 
     def wake_fd(self) -> Int:
         """The fd another thread writes to make ``poll`` return.

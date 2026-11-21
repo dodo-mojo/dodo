@@ -454,4 +454,3 @@ struct TlsAcceptor(Movable):
         var sni = server_ssl_get_sni_host(self._ctx, ssl_addr)
         var info = TlsInfo(alpn_protocol=alpn, sni_host=sni)
         return (ssl_addr, info^)
-

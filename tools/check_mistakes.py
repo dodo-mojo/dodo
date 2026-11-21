@@ -544,6 +544,54 @@ MISTAKES = [
         "done.failed_at < fetched.failed_at",
         "done.failed_at > fetched.failed_at",
     ),
+    Mistake(
+        "a stop does not wake the workers",
+        "dodo/runtime/scheduler.mojo",
+        "            for addr in self._stats_addrs:\n                wake_worker(addr)\n",
+        "",
+    ),
+    Mistake(
+        "a reactor closes its wake fd without withdrawing it",
+        "dodo/runtime/reactor.mojo",
+        "        withdraw_wake_fd(self._advertised_in)\n        if (",
+        "        if (",
+    ),
+    Mistake(
+        "withdrawing does not wait out a wake in progress",
+        "dodo/runtime/scheduler_stats.mojo",
+        "        if current == _WAKE_FD_BUSY:\n",
+        "        if False:\n",
+    ),
+    Mistake(
+        "a wake writes to the slot value instead of the fd",
+        "dodo/runtime/scheduler_stats.mojo",
+        "    write_wake(Int(current) - 1)\n",
+        "    write_wake(Int(current))\n",
+    ),
+    Mistake(
+        "the unified loop never advertises its wake fd",
+        "dodo/http/_unified_reactor_impl.mojo",
+        "    reactor.advertise_wake_fd(stats_addr)\n",
+        "",
+    ),
+    Mistake(
+        "the HTTP/1 loop never advertises its wake fd",
+        "dodo/http/_server_reactor_epoll.mojo",
+        "    reactor.advertise_wake_fd(stats_addr)\n    var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))\n    var conns = Dict[Int, Int]()\n    var timers = Dict[Int, UInt64]()\n\n    comptime if is_shared:",
+        "    var wheel = TimerWheel(now_ms=UInt64(monotonic_now_ms()))\n    var conns = Dict[Int, Int]()\n    var timers = Dict[Int, UInt64]()\n\n    comptime if is_shared:",
+    ),
+    Mistake(
+        "the streaming loop never advertises its wake fd",
+        "dodo/http/_stream_reactor_impl.mojo",
+        "    reactor.advertise_wake_fd(stats_addr)\n",
+        "",
+    ),
+    Mistake(
+        "the streaming loop drops its stats cell",
+        "dodo/http/_stream_reactor_impl.mojo",
+        "        config,\n        stats_addr,\n    )",
+        "        config,\n    )",
+    ),
 ]
 
 
@@ -557,9 +605,9 @@ def tests_for(file: str) -> list[str]:
     if file.startswith("dodo/utils/"):
         return ["tests/utils/test_process.mojo"] + cli_tests
     if file.startswith("dodo/http/"):
-        return ["tests/http/test_offload.mojo"]
+        return ["tests/http/test_frontend.mojo", "tests/http/test_offload.mojo"]
     if file.startswith("dodo/runtime/"):
-        return ["tests/runtime/test_scheduler.mojo", end_to_end]
+        return ["tests/runtime/test_stop_wake.mojo", "tests/runtime/test_scheduler.mojo", end_to_end]
     return cli_tests
 
 

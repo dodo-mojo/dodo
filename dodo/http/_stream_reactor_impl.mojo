@@ -149,9 +149,7 @@ struct _StreamOffload(Movable):
                 )
             var job = offload_submit_call(self.port, call^, fd)
             if job == 0:
-                conn._offload_slots.append(
-                    _OffloadSlot(unavailable_response())
-                )
+                conn._offload_slots.append(_OffloadSlot(unavailable_response()))
                 continue
             conn._offload_slots.append(_OffloadSlot(job))
             if self.timeout_ms > 0:
@@ -507,9 +505,9 @@ def run_stream_reactor_loop_shared[
     wakes one worker per accept event; per-worker SO_REUSEPORT fds also
     work (the exclusive flag is a harmless no-op there).
 
-    ``stats_addr`` is accepted for :trait:`dodo.runtime.Frontend`
-    signature parity; the streaming loop does not publish per-worker
-    stats yet (documented ceiling).
+    ``stats_addr`` carries only the reactor's wake fd, so a stop wakes
+    the loop at once; the streaming loop does not publish its other
+    per-worker stats yet.
     """
     _run_stream_loop_impl[H, is_shared=True](
         listener_fd,
@@ -519,6 +517,7 @@ def run_stream_reactor_loop_shared[
         max_in_flight,
         retry_after_s,
         config,
+        stats_addr,
     )
 
 
@@ -532,6 +531,7 @@ def _run_stream_loop_impl[
     max_in_flight: Int,
     retry_after_s: Int,
     config: ServerConfig,
+    stats_addr: Int = 0,
 ) raises:
     """Shared body for the streaming reactor loop (single- and
     multi-worker). ``is_shared`` picks ``register_exclusive`` (shared
@@ -541,6 +541,8 @@ def _run_stream_loop_impl[
     other connection and keeps serving those until they are answered or
     ``shutdown_timeout_ms`` passes."""
     var reactor = Reactor()
+    # Lets the scheduler wake this loop the moment it sets the stop flag.
+    reactor.advertise_wake_fd(stats_addr)
 
     comptime if is_shared:
         reactor.register_exclusive(

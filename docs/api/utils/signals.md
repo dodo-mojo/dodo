@@ -45,3 +45,13 @@ def take_signal() raises -> Int
 ```
 
 The last signal recorded since the previous call, or 0 for none.
+
+### `wait_for_signal`
+
+```mojo
+def wait_for_signal(timeout_ms: Int) raises
+```
+
+Sleep until a signal is recorded or `timeout_ms` passes, whichever comes first. Returns at once when one is already recorded. It does not take the signal; call `take_signal` after. Needs `watch_signals` first.
+
+Raises: Error: If the wait fails, such as before `watch_signals`.

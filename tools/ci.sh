@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 STEPS=(checks package tests)
 # What `package` depends on: a change here means the package must be rebuilt.
-PACKAGE_PATHS=(packaging tools/build_native.sh 'dodo/*/ffi' pixi.toml pixi.lock)
+PACKAGE_PATHS=(packaging tools/build_native.sh 'dodo/*/ffi/*' pixi.toml pixi.lock)
 
 say() {
   printf '\n== %s\n' "$*"

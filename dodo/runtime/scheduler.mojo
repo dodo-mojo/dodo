@@ -86,6 +86,7 @@ from .reuseport import allows_reuseport, bind_reuseport, bind_shared
 # ``from dodo.runtime.scheduler import load_stop_flag`` imports keep
 # resolving after the split.
 from .scheduler_stats import (
+    wake_worker,
     load_stop_flag,
     store_stop_flag,
     store_worker_stat,
@@ -96,6 +97,7 @@ from .scheduler_stats import (
     WORKER_STAT_SLOTS,
     WORKER_STAT_GROUP,
     WORKER_STAT_INDEX,
+    WORKER_STAT_WAKE_FD,
     WORKER_STATUS_RUNNING,
     WORKER_STATUS_CLEAN,
     WORKER_STATUS_CRASHED,
@@ -509,9 +511,7 @@ struct Scheduler[F: Frontend](Movable):
         # N addresses x M workers, and mixing a shared primary with
         # per-worker extras would give the two halves different accept
         # semantics on the same server.
-        var prebind_per_worker = (
-            use_reuseport_workers or len(extra_addrs) > 0
-        )
+        var prebind_per_worker = use_reuseport_workers or len(extra_addrs) > 0
         # A handed-over listener without SO_REUSEPORT, such as the one
         # `dodo dev` passes down, cannot get siblings on its port, so
         # every worker shares it. Its owner keeps it open across
@@ -595,6 +595,7 @@ struct Scheduler[F: Frontend](Movable):
             sp[unsafe_offset=WORKER_STAT_DONE] = Int64(0)
             sp[unsafe_offset=WORKER_STAT_GROUP] = Int64(s._balance_addr)
             sp[unsafe_offset=WORKER_STAT_INDEX] = Int64(w)
+            sp[unsafe_offset=WORKER_STAT_WAKE_FD] = Int64(0)
             s._stats_addrs.append(Int(sp))
 
         # Per-worker listeners are bound serially on this thread before
@@ -741,11 +742,14 @@ struct Scheduler[F: Frontend](Movable):
         would let that ``accept`` land on whatever the number names next
         (or let a worker still starting up register a reused number).
         ``_free_resources`` closes it once, after every worker joined;
-        the stop flag, polled at least every 100 ms, is what ends the
-        loops.
+        the stop flag is what ends the loops. Each worker is woken right
+        after it is set, so it sees the flag now instead of on its next
+        poll timeout (up to 100 ms later).
         """
         if self._stopping_addr != 0:
             store_stop_flag(self._stopping_addr, True)
+            for addr in self._stats_addrs:
+                wake_worker(addr)
 
     def _join_workers(mut self):
         """Join every worker thread and release the handle array.

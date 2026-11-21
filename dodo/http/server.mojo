@@ -42,7 +42,12 @@ from ..ws.server_h2 import WsH2Handler, WsH2Hooks
 from ..errors import map_handler_error, log_handler_error
 from ..net import IpAddr, SocketAddr, NetworkError, BrokenPipe, Timeout
 from ..tcp import TcpListener, TcpStream
-from ..utils.signals import stop_watching_signals, take_signal, watch_signals
+from ..utils.signals import (
+    stop_watching_signals,
+    take_signal,
+    wait_for_signal,
+    watch_signals,
+)
 from ..tls._server_ffi import ServerCtx
 from ..tls.acceptor import TlsAcceptor, TlsServerConfig, TlsSniCert
 
@@ -865,13 +870,15 @@ struct HttpServer(Movable):
         # all workers exit (an external close() on each listener via
         # the scheduler's own shutdown path is the normal exit).
         while not self._stopping and scheduler.is_running():
-            # Coarse wait: the HttpServer loop on the main thread
-            # doesn't need to be responsive the way the worker reactor
-            # is. Sleep for a short interval, then re-check.
-            _ = libc_nanosleep_ms(50)
-            if stop_on_signal and take_signal() != 0:
-                _ = scheduler.drain(self.config.shutdown_timeout_ms)
-                break
+            # Coarse wait for close() and exited workers, re-checked
+            # every 50 ms. A signal ends the wait at once.
+            if stop_on_signal:
+                wait_for_signal(50)
+                if take_signal() != 0:
+                    _ = scheduler.drain(self.config.shutdown_timeout_ms)
+                    break
+            else:
+                _ = libc_nanosleep_ms(50)
 
         scheduler.shutdown()
         self._drop_ws_h2_hooks()

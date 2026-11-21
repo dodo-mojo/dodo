@@ -48,7 +48,7 @@ def _split_target(url: String) -> Tuple[String, String]:
     var q = url.find("?")
     if q < 0:
         return (url, String(""))
-    return (String(url[byte=:q]), String(url[byte=q + 1 :]))
+    return (String(url[byte=:q]), String(url[byte = q + 1 :]))
 
 
 def _describe(req: Request) raises -> String:

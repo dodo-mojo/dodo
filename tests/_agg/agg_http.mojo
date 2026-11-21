@@ -1262,6 +1262,15 @@ from test_frontend import (
 from test_frontend import (
     test_four_workers_answer_every_request as test_frontend__test_four_workers_answer_every_request,
 )
+from test_frontend import (
+    test_every_http1_worker_advertises_its_wake_fd as test_frontend__test_every_http1_worker_advertises_its_wake_fd,
+)
+from test_frontend import (
+    test_every_auto_protocol_worker_advertises_its_wake_fd as test_frontend__test_every_auto_protocol_worker_advertises_its_wake_fd,
+)
+from test_frontend import (
+    test_every_stream_worker_advertises_its_wake_fd as test_frontend__test_every_stream_worker_advertises_its_wake_fd,
+)
 from test_fs import test_parse_range_simple as test_fs__test_parse_range_simple
 from test_fs import (
     test_parse_range_open_ended as test_fs__test_parse_range_open_ended,
@@ -5748,6 +5757,11 @@ def main() raises:
         test_frontend__test_extra_address_is_served_without_auto_protocol
     ]()
     suite.test[test_frontend__test_four_workers_answer_every_request]()
+    suite.test[test_frontend__test_every_http1_worker_advertises_its_wake_fd]()
+    suite.test[
+        test_frontend__test_every_auto_protocol_worker_advertises_its_wake_fd
+    ]()
+    suite.test[test_frontend__test_every_stream_worker_advertises_its_wake_fd]()
     # tests/http/test_fs.mojo
     suite.test[test_fs__test_parse_range_simple]()
     suite.test[test_fs__test_parse_range_open_ended]()
