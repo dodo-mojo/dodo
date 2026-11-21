@@ -592,7 +592,56 @@ MISTAKES = [
         "        config,\n        stats_addr,\n    )",
         "        config,\n    )",
     ),
+    Mistake(
+        "reply numbers restart each round",
+        "dodo/http/calls.mojo",
+        "var number = len(self._replies) + len(self._waiting)",
+        "var number = len(self._waiting)",
+    ),
+    Mistake(
+        "a handler may ask for rounds forever",
+        "dodo/http/calls.mojo",
+        "if self._round > MAX_ROUNDS:",
+        "if False:",
+    ),
+    Mistake(
+        "a cancelled request still sends its calls",
+        "dodo/http/on_loop.mojo",
+        "        if req.cancel.cancelled():\n",
+        "        if False:\n",
+    ),
+    Mistake(
+        "Retry keeps the first attempt's replies",
+        "dodo/http/reliability.mojo",
+        "            calls.restart()\n",
+        "",
+    ),
+    Mistake(
+        "Cors leaves its headers off a response from finish",
+        "dodo/http/cors.mojo",
+        "return self._decorate_answer(req, self.inner.finish(req, calls))",
+        "return self.inner.finish(req, calls)",
+    ),
+    Mistake(
+        "a stepped param route loses its params",
+        "dodo/http/router.mojo",
+        "                    return _bad_percent_escape()\n"
+        "            return thunk(reg.addrs[sh_idx], child, calls, first)",
+        "                    return _bad_percent_escape()\n"
+        "            child.params_mut().clear()\n"
+        "            return thunk(reg.addrs[sh_idx], child, calls, first)",
+    ),
 ]
+
+
+STEP_FILES = [
+    "dodo/http/calls.mojo",
+    "dodo/http/on_loop.mojo",
+    "dodo/http/reliability.mojo",
+    "dodo/http/cors.mojo",
+    "dodo/http/router.mojo",
+]
+"""Files whose step code (ADR-0006) the step tests cover."""
 
 
 def tests_for(file: str) -> list[str]:
@@ -604,6 +653,8 @@ def tests_for(file: str) -> list[str]:
         cli_tests.append(end_to_end)
     if file.startswith("dodo/utils/"):
         return ["tests/utils/test_process.mojo"] + cli_tests
+    if file in STEP_FILES:
+        return ["tests/http/test_on_loop.mojo", "tests/http/test_calls_middleware.mojo"]
     if file.startswith("dodo/http/"):
         return ["tests/http/test_frontend.mojo", "tests/http/test_offload.mojo"]
     if file.startswith("dodo/runtime/"):

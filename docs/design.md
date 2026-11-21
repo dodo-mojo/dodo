@@ -63,7 +63,7 @@ The networking layers start as an imported fork (ADR-0003), so their package nam
   - `Offload(handler)` runs a handler on an offload thread pool and wakes the loop through its wake fd (ADR-0004).
   - GPU work is enqueued on the worker's `DeviceContext` stream, and completion is polled from the loop, so the CPU never sits waiting on the GPU.
   - In dev mode `dodo.prof` flags handlers that hold a loop longer than a threshold.
-- Outgoing calls (other APIs, model servers, later databases) run on the same loop: a handler starts several at once and parks until they answer, costing no threads (ADR-0006).
+- Outgoing calls (other APIs, model servers, later databases) run on the same loop: a handler starts several at once and parks until they answer, costing no threads (ADR-0006). The handler is a `Calling` struct in steps wrapped in `OnLoop` (`docs/calls.md`); until a loop runs the calls itself, `serve` makes them with the blocking client.
 - If Mojo gains stable async later, handlers can become `async def` without changing the I/O layer.
 - **Phase 0 spike:** confirm thread creation (`parallelize` vs. pthreads via FFI) and epoll from Mojo 1.2.
 

@@ -199,7 +199,9 @@ struct ComptimeRouter[routes: List[ComptimeRoute]](Copyable, Handler):
         comptime for i in range(len(Self.routes)):
             comptime r = Self.routes[i]
             out.append(
-                RouteInfo(String(r.method), String(r.pattern), False, "route")
+                RouteInfo(
+                    String(r.method), String(r.pattern), False, False, "route"
+                )
             )
         return out^
 

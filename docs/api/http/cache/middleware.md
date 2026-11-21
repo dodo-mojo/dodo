@@ -108,6 +108,18 @@ def __init__(out self, var inner: Inner, var store: S)
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `Cache.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Cache.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `Cache.may_block`
 
 ```mojo
@@ -124,4 +136,16 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `Cache.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Cache.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```

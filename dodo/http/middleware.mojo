@@ -25,6 +25,9 @@ request.
 from std.os import getenv
 from std.time import perf_counter_ns
 
+from std.collections import Optional
+
+from .calls import Calls
 from .encoding import (
     Encoding,
     compress_brotli,
@@ -58,31 +61,66 @@ struct Logger[Inner: Handler & Copyable](Copyable, Handler):
         self.prefix = prefix
 
     def serve(self, req: Request) raises -> Response:
-        var start = perf_counter_ns()
+        var started = perf_counter_ns()
         var resp: Response
         try:
             resp = self.inner.serve(req).lower()
         except e:
-            var latency_ms = (perf_counter_ns() - start) // 1_000_000
-            var msg = String(e)
-            print(
-                self.prefix,
-                req.method,
-                req.url,
-                "raised",
-                msg,
-                String(latency_ms) + "ms",
-            )
-            raise Error(msg)
-        var latency_ms = (perf_counter_ns() - start) // 1_000_000
+            raise self._log_raise(req, started, e)
+        self._log_status(req, started, resp.status)
+        return resp^
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        var started = perf_counter_ns()
+        calls.note(_LOGGER_STARTED, String(started))
+        try:
+            return self._log_answer(req, started, self.inner.start(req, calls))
+        except e:
+            raise self._log_raise(req, started, e)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        var started = Int(calls.note(_LOGGER_STARTED))
+        try:
+            return self._log_answer(req, started, self.inner.finish(req, calls))
+        except e:
+            raise self._log_raise(req, started, e)
+
+    def _log_answer(
+        self, req: Request, started: Int, var answer: Optional[Response]
+    ) -> Optional[Response]:
+        """Log the response once a step returns one."""
+        if answer:
+            self._log_status(req, started, answer.value().status)
+        return answer^
+
+    def _log_status(self, req: Request, started: Int, status: Int):
+        var latency_ms = (perf_counter_ns() - started) // 1_000_000
         print(
             self.prefix,
             req.method,
             req.url,
-            String(resp.status),
+            String(status),
             String(latency_ms) + "ms",
         )
-        return resp^
+
+    def _log_raise(self, req: Request, started: Int, e: Error) -> Error:
+        """Log the error the inner handler raised and return it to raise
+        again."""
+        var latency_ms = (perf_counter_ns() - started) // 1_000_000
+        var msg = String(e)
+        print(
+            self.prefix,
+            req.method,
+            req.url,
+            "raised",
+            msg,
+            String(latency_ms) + "ms",
+        )
+        return Error(msg)
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -92,6 +130,16 @@ struct Logger[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+
+comptime _LOGGER_STARTED = "dodo.logger.started"
+"""The note under which ``Logger.start`` keeps the start time."""
 
 
 # ── RequestId ──────────────────────────────────────────────────────────────
@@ -111,12 +159,22 @@ struct RequestId[Inner: Handler & Copyable](Copyable, Handler):
         self.inner = inner^
 
     def serve(self, req: Request) raises -> Response:
-        var id = req.headers.get("x-request-id")
-        if id.byte_length() == 0:
-            id = String("req-") + String(perf_counter_ns())
+        var id = _request_id(req)
         var resp = self.inner.serve(req).lower()
         resp.headers.set("X-Request-Id", id)
         return resp^
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        var id = _request_id(req)
+        calls.note(_REQUEST_ID, id)
+        return _tag(self.inner.start(req, calls), id)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return _tag(self.inner.finish(req, calls), calls.note(_REQUEST_ID))
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -126,6 +184,33 @@ struct RequestId[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+
+comptime _REQUEST_ID = "dodo.request_id"
+"""The note under which ``RequestId.start`` keeps the id."""
+
+
+def _request_id(req: Request) -> String:
+    """The inbound ``X-Request-Id``, or a new one."""
+    var id = req.headers.get("x-request-id")
+    if id.byte_length() == 0:
+        id = String("req-") + String(perf_counter_ns())
+    return id^
+
+
+def _tag(
+    var answer: Optional[Response], id: String
+) raises -> Optional[Response]:
+    """``answer`` with ``X-Request-Id: id``, once a step returns one."""
+    if answer:
+        answer.value().headers.set("X-Request-Id", id)
+    return answer^
 
 
 # ── Compress ───────────────────────────────────────────────────────────────
@@ -344,10 +429,37 @@ struct Compress[Inner: Handler & Copyable](Copyable, Handler):
         self.gzip_level = gzip_level
 
     def serve(self, req: Request) raises -> Response:
+        return self._encode(req, self.inner.serve(req).lower())
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self._encode_answer(req, self.inner.start(req, calls))
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self._encode_answer(req, self.inner.finish(req, calls))
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+    def _encode_answer(
+        self, req: Request, var answer: Optional[Response]
+    ) raises -> Optional[Response]:
+        """Encode the response once a step returns one."""
+        if not answer:
+            return None
+        return self._encode(req, answer.take())
+
+    def _encode(self, req: Request, var resp: Response) raises -> Response:
+        """``resp`` in the encoding ``req`` accepts best, when worth it."""
         var accept = req.headers.get("accept-encoding")
         var brotli_ok = _brotli_available()
         var pick = negotiate_encoding(accept, brotli_ok)
-        var resp = self.inner.serve(req).lower()
         if len(resp.body) < self.min_size_bytes:
             return resp^
         if resp.headers.contains("content-encoding"):
@@ -418,10 +530,35 @@ struct CatchPanic[Inner: Handler & Copyable](Copyable, Handler):
         try:
             return self.inner.serve(req).lower()
         except:
-            var resp = Response(status=500)
-            resp.body = List[UInt8](self.body.as_bytes())
-            resp.headers.set("Content-Type", "text/plain; charset=utf-8")
-            return resp^
+            return self._error_response()
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        try:
+            return self.inner.start(req, calls)
+        except:
+            return self._error_response()
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        try:
+            return self.inner.finish(req, calls)
+        except:
+            return self._error_response()
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+    def _error_response(self) raises -> Response:
+        var resp = Response(status=500)
+        resp.body = List[UInt8](self.body.as_bytes())
+        resp.headers.set("Content-Type", "text/plain; charset=utf-8")
+        return resp^
 
     def may_block(self) -> Bool:
         return self.inner.may_block()

@@ -199,6 +199,18 @@ def __init__(out self, var inner: Inner)
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `Metrics.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Metrics.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `Metrics.may_block`
 
 ```mojo
@@ -215,6 +227,18 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `Metrics.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Metrics.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 #### `Metrics.render`

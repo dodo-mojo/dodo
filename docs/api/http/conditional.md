@@ -174,6 +174,18 @@ Construct a ``Conditional[Inner]`` that evaluates preconditions on unsafe method
 def serve(self, req: Request) raises -> Response
 ```
 
+#### `Conditional.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+#### `Conditional.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
 #### `Conditional.may_block`
 
 ```mojo
@@ -190,6 +202,18 @@ def route_list(self) raises -> List[RouteInfo]
 
 ```mojo
 def blocking(self, req: Request) raises -> Bool
+```
+
+#### `Conditional.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+#### `Conditional.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
 ```
 
 ## Functions

@@ -1,18 +1,21 @@
 """The app the CLI tests build. `CLI_APP_MODE` picks what it does, so one
 build covers every case.
 
-- unset: serve `/` and a blocking `/slow` on `CLI_APP_PORT` (default 18731)
+- unset: serve `/`, a blocking `/slow` and `/dash`, which makes calls, on
+  `CLI_APP_PORT` (default 18731)
 - `hang`: never reach serve()
 - `crash`: raise before serve()
 - `no_serve`: exit without serving
 - `args`: print each argument on its own line, exit with the first one
 """
 
+from std.collections import Optional
 from std.os import getenv
 from std.sys import argv, exit
 from std.time import sleep
 
-from dodo import App, Request
+from dodo import App, Request, Response, ok
+from dodo.http import Calling, Calls, OnLoop
 
 
 def home(req: Request) raises -> String:
@@ -22,6 +25,19 @@ def home(req: Request) raises -> String:
 def slow(req: Request) raises -> String:
     sleep(1.0)
     return "slow done"
+
+
+@fieldwise_init
+struct Dash(Calling, Copyable):
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return ok("dash")
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return ok("dash")
 
 
 def main() raises:
@@ -44,6 +60,7 @@ def main() raises:
     var app = App()
     app.get["/"](home)
     app.get["/slow"](slow, blocking=True)
+    app.get["/dash"](OnLoop(Dash()))
     var port = Int(getenv("CLI_APP_PORT", "18731"))
     app.serve(port=UInt16(port), num_workers=2)
     print("cli_app stopped")

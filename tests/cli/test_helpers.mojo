@@ -293,11 +293,17 @@ def test_format_routes() raises:
     var routes = loads(
         '[{"method":"GET","path":"/","blocking":false,"kind":"route"},'
         '{"method":"DELETE","path":"/u/{id}","blocking":true,"kind":"route"},'
-        '{"method":"*","path":"/{*path}","blocking":false,"kind":"fallback"}]'
+        '{"method":"GET","path":"/dash","blocking":false,"calls":true,'
+        '"kind":"route"},'
+        '{"method":"*","path":"/{*path}","blocking":false,"calls":false,'
+        '"kind":"fallback"}]'
     )
     assert_equal(
         format_routes(routes),
-        "GET     /\nDELETE  /u/{id}  (blocking)\n*       /{*path}  (fallback)",
+        (
+            "GET     /\nDELETE  /u/{id}  (blocking)\nGET     /dash  (calls)\n"
+            "*       /{*path}  (fallback)"
+        ),
     )
     assert_equal(format_routes(loads("[]")), "no routes")
 

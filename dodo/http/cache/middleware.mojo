@@ -51,6 +51,7 @@ from .control import (
 )
 from .key import CacheKey, derive_cache_key
 from .store import CacheEntry, CacheStore, InMemoryCacheStore
+from ..calls import Calls
 from ..handler import Handler, RouteInfo
 from ..headers import HeaderMap
 from ..request import Request
@@ -431,32 +432,36 @@ struct Cache[
         return resp^
 
     def serve(self, req: Request) raises -> Response:
-        if _is_invalidating_method(req.method):
-            var resp = self.inner.serve(req).lower()
-            if resp.status >= 200 and resp.status < 400:
-                # RFC 9111 §4.4: invalidate the URI's cached entry
-                # on a successful unsafe response. Cache keys are
-                # method-qualified (§2 primary key), but
-                # invalidation targets the URI regardless of
-                # method, so we rebuild keys for the cacheable
-                # methods (GET / HEAD) and remove each.
-                var get_key = derive_cache_key(
-                    String("GET"),
-                    String("http"),
-                    _request_authority(req),
-                    _request_path(req),
-                )
-                var head_key = derive_cache_key(
-                    String("HEAD"),
-                    String("http"),
-                    _request_authority(req),
-                    _request_path(req),
-                )
-                self._store_ptr()[].remove(get_key)
-                self._store_ptr()[].remove(head_key)
-            return resp^
+        var hit = self._lookup(req)
+        if hit:
+            return hit.take()
+        return self._after(req, self.inner.serve(req).lower())
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        var hit = self._lookup(req)
+        if hit:
+            return hit^
+        return self._after_answer(req, self.inner.start(req, calls))
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self._after_answer(req, self.inner.finish(req, calls))
+
+    def _after_answer(
+        self, req: Request, var answer: Optional[Response]
+    ) raises -> Optional[Response]:
+        """Store or invalidate once a step returns a response."""
+        if not answer:
+            return None
+        return self._after(req, answer.take())
+
+    def _lookup(self, req: Request) raises -> Optional[Response]:
+        """A fresh stored response for ``req``, or ``None`` on a miss."""
         if not _is_cacheable_method(req.method):
-            return self.inner.serve(req).lower()
+            return None
         var base_key = self._build_key(req)
         var base_hit = self._store_ptr()[].get(base_key)
         if base_hit:
@@ -495,8 +500,37 @@ struct Cache[
                             _now_ms(),
                         ):
                             return self._build_hit_response(entry)
-        var fresh = self.inner.serve(req).lower()
-        return self._store_response(req, fresh^)
+        return None
+
+    def _after(self, req: Request, var resp: Response) raises -> Response:
+        """Store a cacheable response; drop the URI's entries after a
+        successful unsafe request."""
+        if _is_invalidating_method(req.method):
+            if resp.status >= 200 and resp.status < 400:
+                # RFC 9111 §4.4: invalidate the URI's cached entry
+                # on a successful unsafe response. Cache keys are
+                # method-qualified (§2 primary key), but
+                # invalidation targets the URI regardless of
+                # method, so we rebuild keys for the cacheable
+                # methods (GET / HEAD) and remove each.
+                var get_key = derive_cache_key(
+                    String("GET"),
+                    String("http"),
+                    _request_authority(req),
+                    _request_path(req),
+                )
+                var head_key = derive_cache_key(
+                    String("HEAD"),
+                    String("http"),
+                    _request_authority(req),
+                    _request_path(req),
+                )
+                self._store_ptr()[].remove(get_key)
+                self._store_ptr()[].remove(head_key)
+            return resp^
+        if not _is_cacheable_method(req.method):
+            return resp^
+        return self._store_response(req, resp^)
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -506,3 +540,9 @@ struct Cache[
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)

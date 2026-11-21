@@ -74,6 +74,7 @@ Fields:
 - `method` (`String`): `GET`, `POST` and so on, or `*` for a handler that takes every method.
 - `path` (`String`): The path pattern as registered, such as `/users/{id}` or `/files/{*rest}`.
 - `blocking` (`Bool`): Whether it runs on the offload pool (`blocking=True` or `Offload`).
+- `calls` (`Bool`): Whether it makes outgoing calls on the loop (`OnLoop`).
 - `kind` (`String`): `route` for a registered route, `fallback` for a router's custom fallback, `handler` for a handler that does not list its routes.
 
 Implemented traits: `AnyType`, `Copyable`, `Deinitable`, `Movable`
@@ -436,6 +437,57 @@ Whether serving ``req`` may block, so the worker runs ``serve(req)`` on the offl
 returns its inner handler's answer, and a ``Router`` asks the
 route ``req`` matches. A wrapper that does not forward this keeps
 an ``Offload`` inside it inline. A raise counts as ``False``.
+
+#### `Handler.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+Whether any request to this handler may make outgoing calls on the loop (ADR-0006).
+
+Read once when a worker starts, like :meth:`may_block`. ``OnLoop``
+returns ``True``; a wrapper returns its inner handler's answer and
+a ``Router`` returns whether any route does.
+
+#### `Handler.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
+```
+
+Whether ``req`` is served in steps, :meth:`start` then :meth:`finish`, so the worker can run its outgoing calls on the loop.
+
+``False`` by default, and then the worker calls :meth:`serve`.
+``OnLoop`` returns ``True``; a wrapper returns its inner handler's
+answer, and a ``Router`` asks the route ``req`` matches.
+
+#### `Handler.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+The first step of a request that :meth:`calling` said yes to.
+
+Returns the response, or ``None`` after asking ``calls`` for at
+least one call; then :meth:`finish` runs once the replies are
+back. A wrapper runs its before-part here and its after-part on
+the response, whichever step returns it.
+
+The default serves the request at once, for a handler that makes
+no calls.
+
+#### `Handler.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+The step after each round of calls: returns the response, or ``None`` after asking for the next round.
+
+The default raises, since a handler that makes no calls never
+returns ``None`` from :meth:`start`.
 
 #### `Handler.route_list`
 

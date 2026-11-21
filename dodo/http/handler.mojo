@@ -58,7 +58,10 @@ instead keeps ``-> Response`` and calls ``.lower()`` on the inner
 result so both branches share the erased type.
 """
 
+from std.collections import Optional
+
 from .body import Body, InlineBody
+from .calls import Calls
 from .cancel import Cancel
 from .request import Request
 from .response import Response, ResponseImpl
@@ -77,6 +80,8 @@ struct RouteInfo(Copyable, Movable):
     """The path pattern as registered, such as `/users/{id}` or `/files/{*rest}`."""
     var blocking: Bool
     """Whether it runs on the offload pool (`blocking=True` or `Offload`)."""
+    var calls: Bool
+    """Whether it makes outgoing calls on the loop (`OnLoop`)."""
     var kind: String
     """`route` for a registered route, `fallback` for a router's custom
     fallback, `handler` for a handler that does not list its routes."""
@@ -213,6 +218,53 @@ trait Handler(Deinitable, Movable):
         """
         return False
 
+    def may_call(self) -> Bool:
+        """Whether any request to this handler may make outgoing calls on
+        the loop (ADR-0006).
+
+        Read once when a worker starts, like :meth:`may_block`. ``OnLoop``
+        returns ``True``; a wrapper returns its inner handler's answer and
+        a ``Router`` returns whether any route does.
+        """
+        return False
+
+    def calling(self, req: Request) raises -> Bool:
+        """Whether ``req`` is served in steps, :meth:`start` then
+        :meth:`finish`, so the worker can run its outgoing calls on the
+        loop.
+
+        ``False`` by default, and then the worker calls :meth:`serve`.
+        ``OnLoop`` returns ``True``; a wrapper returns its inner handler's
+        answer, and a ``Router`` asks the route ``req`` matches.
+        """
+        return False
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        """The first step of a request that :meth:`calling` said yes to.
+
+        Returns the response, or ``None`` after asking ``calls`` for at
+        least one call; then :meth:`finish` runs once the replies are
+        back. A wrapper runs its before-part here and its after-part on
+        the response, whichever step returns it.
+
+        The default serves the request at once, for a handler that makes
+        no calls.
+        """
+        return self.serve(req).lower()
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        """The step after each round of calls: returns the response, or
+        ``None`` after asking for the next round.
+
+        The default raises, since a handler that makes no calls never
+        returns ``None`` from :meth:`start`.
+        """
+        raise Error("finish called on a handler that makes no calls")
+
     def route_list(self) raises -> List[RouteInfo]:
         """The routes this handler answers, for `dodo routes`.
 
@@ -220,7 +272,11 @@ trait Handler(Deinitable, Movable):
         ``App`` lists its routes, and a wrapper returns its inner
         handler's list, the same way it forwards :meth:`may_block`.
         """
-        return [RouteInfo("*", "/{*path}", self.may_block(), "handler")]
+        return [
+            RouteInfo(
+                "*", "/{*path}", self.may_block(), self.may_call(), "handler"
+            )
+        ]
 
 
 # ── HandlerExtractor: convenience trait composition ──────────────────────────

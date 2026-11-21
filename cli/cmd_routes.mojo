@@ -104,7 +104,8 @@ def parse_timeout(text: String) raises -> Float64:
 
 
 def format_routes(routes: Value) raises -> String:
-    """One route per line: method, path, and `blocking` when it is."""
+    """One route per line: method, path, and `blocking` or `calls` when it
+    is. A route list from an older app has no `calls`."""
     if len(routes) == 0:
         return "no routes"
     var width = 0
@@ -120,6 +121,8 @@ def format_routes(routes: Value) raises -> String:
         line += String("  ", route["path"].as_string())
         if route["blocking"].as_bool():
             line += "  (blocking)"
+        if "calls" in route and route["calls"].as_bool():
+            line += "  (calls)"
         var kind = route["kind"].as_string()
         if kind != "route":
             line += String("  (", kind, ")")

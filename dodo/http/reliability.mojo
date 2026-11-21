@@ -38,12 +38,14 @@ chain stays monomorphised -- no virtual dispatch.
 """
 
 from std.atomic import Atomic, Ordering
+from std.collections import Optional
 from std.memory import Pointer
 from std.memory.alloc import unsafe_alloc
 from std.time import perf_counter_ns
 from std.random import random_ui64
 
 from ..runtime._libc_time import libc_nanosleep_ms
+from .calls import Calls
 from .handler import Handler, RouteInfo
 from .request import Request
 from .response import Response
@@ -240,44 +242,77 @@ struct Retry[Inner: Handler & Copyable](Copyable, Handler):
         self.policy = policy^
 
     def serve(self, req: Request) raises -> Response:
-        # Pre-flight: if the request method is non-idempotent and
-        # the policy gates retries on idempotency, fall through to
-        # a single serve() (no retry attempt at all).
-        var allow_retry = True
-        if self.policy.retry_only_idempotent and not _is_idempotent_method(
-            req.method
-        ):
-            allow_retry = False
-        if not allow_retry or self.policy.max_attempts <= 1:
+        if not self._retries(req):
             return self.inner.serve(req).lower()
-        var attempt = 0
-        var last_err: String = String("")
-        var last_raised = False
-        while attempt < self.policy.max_attempts:
-            attempt += 1
+        var attempt = 1
+        while True:
             try:
                 var resp = self.inner.serve(req).lower()
-                if resp.status < 500 or attempt == self.policy.max_attempts:
+                if resp.status < 500 or attempt >= self.policy.max_attempts:
                     return resp^
-                # 5xx and we still have attempts: jittered sleep
-                # before the next attempt (no-op when backoff is
-                # disabled).
-                var nap = _backoff_sleep_ms(self.policy, attempt + 1)
-                if nap > 0:
-                    _ = libc_nanosleep_ms(nap)
             except e:
-                last_err = String(e)
-                last_raised = True
-                if attempt == self.policy.max_attempts:
-                    break
-                var nap = _backoff_sleep_ms(self.policy, attempt + 1)
-                if nap > 0:
-                    _ = libc_nanosleep_ms(nap)
-        if last_raised:
-            raise Error(last_err)
-        # Should be unreachable: the only way out without a
-        # response is via the raise branch above.
-        return self.inner.serve(req).lower()
+                if attempt >= self.policy.max_attempts:
+                    raise e^
+            self._nap(attempt)
+            attempt += 1
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        if not self._retries(req):
+            return self.inner.start(req, calls)
+        calls.note(_RETRY_ATTEMPT, "1")
+        return self._step(req, calls, True)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        if not self._retries(req):
+            return self.inner.finish(req, calls)
+        return self._step(req, calls, False)
+
+    def _step(
+        self, req: Request, mut calls: Calls, first: Bool
+    ) raises -> Optional[Response]:
+        """Run the inner step; on a 5xx or a raise with attempts left,
+        start the inner handler over with no replies."""
+        var attempt = Int(calls.note(_RETRY_ATTEMPT))
+        var run_start = first
+        while True:
+            try:
+                var answer: Optional[Response]
+                if run_start:
+                    answer = self.inner.start(req, calls)
+                else:
+                    answer = self.inner.finish(req, calls)
+                if not answer:
+                    return None
+                var status = answer.value().status
+                if status < 500 or attempt >= self.policy.max_attempts:
+                    return answer^
+            except e:
+                if attempt >= self.policy.max_attempts:
+                    raise e^
+            self._nap(attempt)
+            attempt += 1
+            calls.note(_RETRY_ATTEMPT, String(attempt))
+            calls.restart()
+            run_start = True
+
+    def _retries(self, req: Request) -> Bool:
+        """Whether ``req`` may be tried more than once."""
+        if self.policy.max_attempts <= 1:
+            return False
+        if self.policy.retry_only_idempotent:
+            return _is_idempotent_method(req.method)
+        return True
+
+    def _nap(self, attempt: Int):
+        """The jittered sleep before attempt ``attempt + 1`` (none when
+        backoff is off)."""
+        var nap = _backoff_sleep_ms(self.policy, attempt + 1)
+        if nap > 0:
+            _ = libc_nanosleep_ms(nap)
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -287,6 +322,16 @@ struct Retry[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+
+comptime _RETRY_ATTEMPT = "dodo.retry.attempt"
+"""The note under which ``Retry`` keeps the attempt number."""
 
 
 struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
@@ -332,12 +377,38 @@ struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
         # artifact where a sub-millisecond handler would otherwise
         # pass the elapsed > 0 check on a very fast host.
         if self.budget_ms <= 0:
-            return Response(status=504, reason=String("Gateway Timeout"))
-        var start = perf_counter_ns()
-        var resp = self.inner.serve(req).lower()
-        var elapsed_ms = (perf_counter_ns() - start) // 1_000_000
+            return _gateway_timeout()
+        var started = perf_counter_ns()
+        return self._check(started, self.inner.serve(req).lower())
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        if self.budget_ms <= 0:
+            return _gateway_timeout()
+        var started = perf_counter_ns()
+        calls.note(_DEADLINE_STARTED, String(started))
+        return self._check_answer(started, self.inner.start(req, calls))
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        var started = Int(calls.note(_DEADLINE_STARTED))
+        return self._check_answer(started, self.inner.finish(req, calls))
+
+    def _check_answer(
+        self, started: Int, var answer: Optional[Response]
+    ) raises -> Optional[Response]:
+        """Check the budget once a step returns a response."""
+        if not answer:
+            return None
+        return self._check(started, answer.take())
+
+    def _check(self, started: Int, var resp: Response) raises -> Response:
+        """``504`` in place of ``resp`` when it came too late."""
+        var elapsed_ms = (perf_counter_ns() - started) // 1_000_000
         if elapsed_ms > self.budget_ms:
-            return Response(status=504, reason=String("Gateway Timeout"))
+            return _gateway_timeout()
         return resp^
 
     def may_block(self) -> Bool:
@@ -348,6 +419,20 @@ struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+
+comptime _DEADLINE_STARTED = "dodo.deadline.started"
+"""The note under which ``PostHocDeadline.start`` keeps the start time."""
+
+
+def _gateway_timeout() -> Response:
+    return Response(status=504, reason=String("Gateway Timeout"))
 
 
 struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
@@ -386,8 +471,26 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
             _cell_set(self._cell, 1, Int64(perf_counter_ns()))
 
     def serve(self, req: Request) raises -> Response:
+        if not self._admit():
+            return _too_many_requests()
+        return self.inner.serve(req).lower()
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        if not self._admit():
+            return _too_many_requests()
+        return self.inner.start(req, calls)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self.inner.finish(req, calls)
+
+    def _admit(self) -> Bool:
+        """Take a token from the bucket; ``False`` when it is empty."""
         if self.rate_per_sec <= 0:
-            return self.inner.serve(req).lower()
+            return True
         # The bucket is shared by every worker copy, and the update is
         # a read-modify-write of two slots, so it runs under the cell's
         # lock; separate atomic loads and stores let two workers spend
@@ -426,9 +529,7 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
         _cell_set(self._cell, 0, new_tokens)
         _cell_set(self._cell, 1, last)
         _cell_unlock(self._cell, 2)
-        if not allow:
-            return Response(status=429, reason=String("Too Many Requests"))
-        return self.inner.serve(req).lower()
+        return allow
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -438,6 +539,16 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+
+def _too_many_requests() -> Response:
+    return Response(status=429, reason=String("Too Many Requests"))
 
 
 # CircuitBreaker states.
@@ -495,40 +606,80 @@ struct CircuitBreaker[Inner: Handler & Copyable](Copyable, Handler):
     def serve(self, req: Request) raises -> Response:
         if self.failure_threshold <= 0:
             return self.inner.serve(req).lower()
+        var refused = self._gate()
+        if refused:
+            return refused.take()
+        try:
+            var resp = self.inner.serve(req).lower()
+            self._record(resp.status)
+            return resp^
+        except e:
+            self._record_failure(Int64(perf_counter_ns()))
+            raise e^
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        if self.failure_threshold <= 0:
+            return self.inner.start(req, calls)
+        var refused = self._gate()
+        if refused:
+            return refused^
+        try:
+            return self._record_answer(self.inner.start(req, calls))
+        except e:
+            self._record_failure(Int64(perf_counter_ns()))
+            raise e^
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        if self.failure_threshold <= 0:
+            return self.inner.finish(req, calls)
+        try:
+            return self._record_answer(self.inner.finish(req, calls))
+        except e:
+            self._record_failure(Int64(perf_counter_ns()))
+            raise e^
+
+    def _gate(self) -> Optional[Response]:
+        """``503`` while the breaker is open or a probe is in flight;
+        ``None`` lets the request through."""
         var now = Int64(perf_counter_ns())
         var state = _cell_get(self._cell, 0)
         if state == _CB_OPEN:
             var opened = _cell_get(self._cell, 2)
             var cooldown_ns = Int64(self.cooldown_ms) * 1_000_000
             if now - opened < cooldown_ns:
-                return Response(
-                    status=503, reason=String("Service Unavailable")
-                )
+                return _service_unavailable()
             # Cooldown elapsed: let exactly one probe through (half-open).
             # Claim OPEN -> HALF_OPEN atomically; a worker that loses the
             # race sees the probe already in flight and fast-fails.
             if not _cell_cas(self._cell, 0, _CB_OPEN, _CB_HALF_OPEN):
-                return Response(
-                    status=503, reason=String("Service Unavailable")
-                )
+                return _service_unavailable()
         elif state == _CB_HALF_OPEN:
             # The probe is in flight: every other call fast-fails until it
             # closes or re-opens the breaker.
-            return Response(status=503, reason=String("Service Unavailable"))
-        try:
-            var resp = self.inner.serve(req).lower()
-            if resp.status >= 500:
-                # Stamp the opening with the time of the failure, not the
-                # request's start: ``now`` is read before the inner call, so
-                # a failure slower than ``cooldown_ms`` opened the breaker
-                # already expired.
-                self._record_failure(Int64(perf_counter_ns()))
-            else:
-                self._record_success()
-            return resp^
-        except e:
+            return _service_unavailable()
+        return None
+
+    def _record_answer(
+        self, var answer: Optional[Response]
+    ) -> Optional[Response]:
+        """Count the response once a step returns one."""
+        if answer:
+            self._record(answer.value().status)
+        return answer^
+
+    def _record(self, status: Int):
+        """Count a response as a failure (5xx) or a success."""
+        if status >= 500:
+            # Stamp the opening with the time of the failure, not the
+            # request's start, so a failure slower than ``cooldown_ms``
+            # does not open the breaker already expired.
             self._record_failure(Int64(perf_counter_ns()))
-            raise e^
+        else:
+            self._record_success()
 
     def may_block(self) -> Bool:
         return self.inner.may_block()
@@ -538,3 +689,13 @@ struct CircuitBreaker[Inner: Handler & Copyable](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner.blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner.may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner.calling(req)
+
+
+def _service_unavailable() -> Response:
+    return Response(status=503, reason=String("Service Unavailable"))

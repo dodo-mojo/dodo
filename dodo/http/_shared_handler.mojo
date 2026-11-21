@@ -8,8 +8,10 @@ copy of the wrapper points at it. The last copy dropped, the server's
 or the pool's, frees it.
 """
 
+from std.collections import Optional
 from std.memory import ArcPointer
 
+from .calls import Calls
 from .cancel import Cancel
 from .handler import CancelHandler, Handler, RouteInfo
 from .request import Request
@@ -37,6 +39,22 @@ struct SharedHandler[H: Handler](Copyable, Handler):
 
     def blocking(self, req: Request) raises -> Bool:
         return self.inner[].blocking(req)
+
+    def may_call(self) -> Bool:
+        return self.inner[].may_call()
+
+    def calling(self, req: Request) raises -> Bool:
+        return self.inner[].calling(req)
+
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self.inner[].start(req, calls)
+
+    def finish(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
+        return self.inner[].finish(req, calls)
 
 
 struct SharedCancelHandler[CH: CancelHandler](CancelHandler, Copyable):

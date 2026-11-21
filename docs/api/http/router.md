@@ -355,3 +355,38 @@ Whether the route ``req`` matches is offloaded.
 Follows the same matching order as :meth:`serve`: direct routes,
 then the first matching mount. 404, 405 and the fallback always
 run inline.
+
+#### `Router.may_call`
+
+```mojo
+def may_call(self) -> Bool
+```
+
+Whether some route or mount below this router makes calls.
+
+#### `Router.calling`
+
+```mojo
+def calling(self, req: Request) raises -> Bool
+```
+
+Whether the route ``req`` matches is served in steps.
+
+Follows the same matching order as :meth:`serve`, like
+:meth:`blocking`.
+
+#### `Router.start`
+
+```mojo
+def start(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+Run the ``start`` of the handler ``req`` matches.
+
+#### `Router.finish`
+
+```mojo
+def finish(self, req: Request, mut calls: Calls) raises -> Optional[ResponseImpl]
+```
+
+Run the ``finish`` of the handler ``req`` matches.

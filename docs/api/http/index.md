@@ -107,6 +107,7 @@ def main() raises:
 - [`dodo.http.auth`](auth.md): HTTP authentication helpers.
 - [`dodo.http.auth_extract`](auth_extract.md): Server-side authentication extractors + CSRF helper.
 - [`dodo.http.body`](body.md): Streaming response body primitives.
+- [`dodo.http.calls`](calls.md): ``Calls``: the outgoing HTTP calls a handler makes while it serves a request (ADR-0006).
 - [`dodo.http.cancel`](cancel.md): Cancel token plumbed from the reactor into request handlers.
 - [`dodo.http.client`](client.md): HTTP client: HTTP/1.1 and HTTP/2, over TCP or TLS.
 - [`dodo.http.client_pool`](client_pool.md): HTTP/1.1 client connection pool.
@@ -131,6 +132,7 @@ def main() raises:
 - [`dodo.http.multipart`](multipart.md): ``multipart/form-data`` parsing (RFC 7578).
 - [`dodo.http.multipart_builder`](multipart_builder.md): Client-side ``multipart/form-data`` request-body builder (RFC 7578).
 - [`dodo.http.offload`](offload.md): ``Offload``: run a blocking handler on the offload pool (ADR-0004).
+- [`dodo.http.on_loop`](on_loop.md): ``OnLoop``: serve a handler in steps, so its outgoing calls run on the worker's event loop (ADR-0006).
 - [`dodo.http.proxy_protocol`](proxy_protocol.md): PROXY protocol v1 + v2 parser (HAProxy spec).
 - [`dodo.http.redirect_policy`](redirect_policy.md): HTTP redirect policy: configurable cross-origin + auth gating.
 - [`dodo.http.reliability`](reliability.md): Reliability middleware: ``Retry`` / ``PostHocDeadline`` / ``RateLimit`` / ``CircuitBreaker`` policies.
