@@ -32,6 +32,17 @@ struct DbStream(Movable):
         self._end = 0
         self.database = database
 
+    def __init__(out self, *, replay: Span[UInt8, _], database: String):
+        """A stream with no socket: reads return `replay`, then report a
+        closed connection, and writes fail. Tests and fuzzers use it to feed
+        a driver's reply parser without a server."""
+        self._tcp = None
+        self._tls = None
+        self._buf = List[UInt8](replay)
+        self._start = 0
+        self._end = len(replay)
+        self.database = database
+
     @staticmethod
     def connect(
         host: String, port: Int, timeout_ms: Int, database: String
@@ -78,6 +89,8 @@ struct DbStream(Movable):
     # ── Writing ─────────────────────────────────────────────────────────────
 
     def write(mut self, data: Span[UInt8, _]) raises DbError:
+        if not self._tls and not self._tcp:
+            raise DbError.io(self.database, "write failed: no socket")
         try:
             if self._tls:
                 self._tls.value().write_all(data)
@@ -109,6 +122,8 @@ struct DbStream(Movable):
             self._end += n
 
     def _read_some(mut self, room: Int) raises DbError -> Int:
+        if not self._tls and not self._tcp:
+            return 0
         var dest = self._buf.unsafe_ptr().unsafe_offset(self._end)
         try:
             if self._tls:

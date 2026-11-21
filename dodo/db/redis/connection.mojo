@@ -217,52 +217,7 @@ struct RedisConnection(Connection):
     # ── Replies ─────────────────────────────────────────────────────────────
 
     def _read_reply(mut self) raises DbError -> RedisReply:
-        var tree = ReplyTree()
-        self._read_node(tree, 0)
-        return RedisReply(tree^)
-
-    def _read_node(mut self, mut tree: ReplyTree, depth: Int) raises DbError:
-        var line = self._stream.read_line(protocol.MAX_LINE)
-        if len(line) == 0:
-            raise DbError.protocol(DB, "empty reply line")
-        var tag = Int(line[0])
-        var empty = List[UInt8]()
-        if tag == ord("+"):
-            _ = tree.push(RedisReply.STATUS, 0, Span(line)[1:])
-        elif tag == ord("-"):
-            _ = tree.push(RedisReply.ERROR, 0, Span(line)[1:])
-        elif tag == ord(":"):
-            _ = tree.push(
-                RedisReply.INT, protocol.parse_length(Span(line)), Span(empty)
-            )
-        elif tag == ord("$"):
-            var n = protocol.parse_length(Span(line))
-            if n < 0:
-                _ = tree.push(RedisReply.NIL, 0, Span(empty))
-                return
-            if n > protocol.MAX_BULK:
-                raise DbError.protocol(
-                    DB, String("bulk string of ", n, " bytes is too long")
-                )
-            self._stream.fill(n + 2)
-            var body = self._stream.unread()
-            if Int(body[n]) != 13 or Int(body[n + 1]) != 10:
-                raise DbError.protocol(DB, "bulk string not followed by CRLF")
-            _ = tree.push(RedisReply.BULK, 0, body[0:n])
-            self._stream.skip(n + 2)
-        elif tag == ord("*"):
-            var n = protocol.parse_length(Span(line))
-            if n < 0:
-                _ = tree.push(RedisReply.NIL, 0, Span(empty))
-                return
-            if depth >= protocol.MAX_DEPTH:
-                raise DbError.protocol(DB, "reply nested too deeply")
-            var index = tree.push(RedisReply.ARRAY, n, Span(empty))
-            for _ in range(n):
-                self._read_node(tree, depth + 1)
-            tree.close(index)
-        else:
-            raise DbError.protocol(DB, String("unknown reply type byte ", tag))
+        return read_reply(self._stream)
 
     def _check_usable(self) raises DbError:
         if self._broken:
@@ -300,3 +255,59 @@ struct RedisConnection(Connection):
     def close(mut self):
         self._broken = True
         self._stream.close()
+
+
+# ── Reading a reply ─────────────────────────────────────────────────────────
+
+
+def read_reply(mut stream: DbStream) raises DbError -> RedisReply:
+    """Read one whole reply, nested arrays included, from `stream`."""
+    var tree = ReplyTree()
+    _read_node(stream, tree, 0)
+    return RedisReply(tree^)
+
+
+def _read_node(
+    mut stream: DbStream, mut tree: ReplyTree, depth: Int
+) raises DbError:
+    var line = stream.read_line(protocol.MAX_LINE)
+    if len(line) == 0:
+        raise DbError.protocol(DB, "empty reply line")
+    var tag = Int(line[0])
+    var empty = List[UInt8]()
+    if tag == ord("+"):
+        _ = tree.push(RedisReply.STATUS, 0, Span(line)[1:])
+    elif tag == ord("-"):
+        _ = tree.push(RedisReply.ERROR, 0, Span(line)[1:])
+    elif tag == ord(":"):
+        _ = tree.push(
+            RedisReply.INT, protocol.parse_length(Span(line)), Span(empty)
+        )
+    elif tag == ord("$"):
+        var n = protocol.parse_length(Span(line))
+        if n < 0:
+            _ = tree.push(RedisReply.NIL, 0, Span(empty))
+            return
+        if n > protocol.MAX_BULK:
+            raise DbError.protocol(
+                DB, String("bulk string of ", n, " bytes is too long")
+            )
+        stream.fill(n + 2)
+        var body = stream.unread()
+        if Int(body[n]) != 13 or Int(body[n + 1]) != 10:
+            raise DbError.protocol(DB, "bulk string not followed by CRLF")
+        _ = tree.push(RedisReply.BULK, 0, body[0:n])
+        stream.skip(n + 2)
+    elif tag == ord("*"):
+        var n = protocol.parse_length(Span(line))
+        if n < 0:
+            _ = tree.push(RedisReply.NIL, 0, Span(empty))
+            return
+        if depth >= protocol.MAX_DEPTH:
+            raise DbError.protocol(DB, "reply nested too deeply")
+        var index = tree.push(RedisReply.ARRAY, n, Span(empty))
+        for _ in range(n):
+            _read_node(stream, tree, depth + 1)
+        tree.close(index)
+    else:
+        raise DbError.protocol(DB, String("unknown reply type byte ", tag))
