@@ -122,3 +122,13 @@ def reset(mut self) -> Bool
 ```mojo
 def close(mut self)
 ```
+
+## Functions
+
+### `read_reply`
+
+```mojo
+def read_reply(mut stream: DbStream) raises -> RedisReply
+```
+
+Read one whole reply, nested arrays included, from `stream`.

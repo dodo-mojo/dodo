@@ -19,6 +19,14 @@ comptime DB = "clickhouse"
 comptime FORMAT = "RowBinaryWithNamesAndTypes"
 ```
 
+### `MAX_TYPE_DEPTH`
+
+```mojo
+comptime MAX_TYPE_DEPTH = 32
+```
+
+How deeply a column type may nest, `Array(Array(...))`; deeper is refused before decoding, so a hostile header can't exhaust the stack.
+
 ## Functions
 
 ### `percent_encode`
