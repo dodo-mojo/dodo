@@ -41,6 +41,9 @@ requirements:
   build:
     - ${{ compiler('c') }}
     - ${{ compiler('cxx') }}
+    # Mojo binaries call dlsym from libc, which glibc has only since 2.34.
+    - if: linux
+      then: sysroot_${{ target_platform }} >=2.34
     - mojo-compiler ${{ mojo_version }}
   host:
     - mojo-compiler ${{ mojo_version }}

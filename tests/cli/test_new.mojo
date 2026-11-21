@@ -222,6 +222,11 @@ def test_new_in_a_read_only_folder() raises:
     var dir = scratch("new_read_only")
     makedirs(join(dir, "locked"))
     assert_true(run(["chmod", "555", join(dir, "locked")]).succeeded())
+    if _can_write(join(dir, "locked")):
+        # Root writes through any mode bits, so there is nothing to test.
+        _ = run(["chmod", "755", join(dir, "locked")])
+        print("    note: the folder is still writable (root?), not checked")
+        return
     var ran = dodo_run(["new", "locked/shop", "--json"], cwd=dir)
     _ = run(["chmod", "755", join(dir, "locked")])
     assert_equal(ran.code, EXIT_UNAVAILABLE)
@@ -231,6 +236,16 @@ def test_new_in_a_read_only_folder() raises:
         ".new." in error["message"].as_string(), "names the hidden folder"
     )
     assert_equal(len(listdir(join(dir, "locked"))), 0)
+
+
+def _can_write(dir: String) raises -> Bool:
+    var probe = join(dir, "probe")
+    try:
+        makedirs(probe)
+    except:
+        return False
+    _ = run(["rmdir", probe])
+    return True
 
 
 def test_new_that_fails_half_way_leaves_nothing() raises:
