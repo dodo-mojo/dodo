@@ -525,7 +525,9 @@ struct Metrics[Inner: Handler & Copyable](Copyable, Handler):
         self._exit(req, started, resp.status)
         return resp^
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var started = self._enter()
         calls.note(_STARTED, String(started))
         try:
@@ -538,7 +540,9 @@ struct Metrics[Inner: Handler & Copyable](Copyable, Handler):
     ) raises -> Optional[Response]:
         var started = Int(calls.note(_STARTED))
         try:
-            return self._exit_answer(req, started, self.inner.finish(req, calls))
+            return self._exit_answer(
+                req, started, self.inner.finish(req, calls)
+            )
         except e:
             raise self._exit_raised(started, e)
 

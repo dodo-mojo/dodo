@@ -334,9 +334,7 @@ def test_a_cancelled_request_sends_nothing() raises:
     cell.flip(CancelReason.PEER_CLOSED)
     var urls: List[String] = [_closed_url(), "not a url"]
     var body = serve_steps_blocking(OnLoop(_Kinds(urls^, 300)), req).text()
-    assert_equal(
-        body, String(CallError.CANCELLED, ",", CallError.CANCELLED)
-    )
+    assert_equal(body, String(CallError.CANCELLED, ",", CallError.CANCELLED))
 
 
 def test_start_may_answer_without_calls() raises:

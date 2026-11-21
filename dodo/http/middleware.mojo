@@ -70,7 +70,9 @@ struct Logger[Inner: Handler & Copyable](Copyable, Handler):
         self._log_status(req, started, resp.status)
         return resp^
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var started = perf_counter_ns()
         calls.note(_LOGGER_STARTED, String(started))
         try:
@@ -162,7 +164,9 @@ struct RequestId[Inner: Handler & Copyable](Copyable, Handler):
         resp.headers.set("X-Request-Id", id)
         return resp^
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var id = _request_id(req)
         calls.note(_REQUEST_ID, id)
         return _tag(self.inner.start(req, calls), id)
@@ -200,7 +204,9 @@ def _request_id(req: Request) -> String:
     return id^
 
 
-def _tag(var answer: Optional[Response], id: String) raises -> Optional[Response]:
+def _tag(
+    var answer: Optional[Response], id: String
+) raises -> Optional[Response]:
     """``answer`` with ``X-Request-Id: id``, once a step returns one."""
     if answer:
         answer.value().headers.set("X-Request-Id", id)
@@ -425,7 +431,9 @@ struct Compress[Inner: Handler & Copyable](Copyable, Handler):
     def serve(self, req: Request) raises -> Response:
         return self._encode(req, self.inner.serve(req).lower())
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         return self._encode_answer(req, self.inner.start(req, calls))
 
     def finish(
@@ -524,7 +532,9 @@ struct CatchPanic[Inner: Handler & Copyable](Copyable, Handler):
         except:
             return self._error_response()
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         try:
             return self.inner.start(req, calls)
         except:

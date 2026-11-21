@@ -239,7 +239,9 @@ trait Handler(Deinitable, Movable):
         """
         return False
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         """The first step of a request that :meth:`calling` said yes to.
 
         Returns the response, or ``None`` after asking ``calls`` for at

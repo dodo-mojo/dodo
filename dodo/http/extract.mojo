@@ -874,7 +874,9 @@ struct Extracted[H: Copyable & Defaultable & Handler](Copyable, Handler):
             return refused.take()
         return h.serve(req).lower()
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var h = self.prototype.copy()
         var refused = _extract_into(h, req)
         if refused:

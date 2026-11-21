@@ -256,7 +256,9 @@ struct Retry[Inner: Handler & Copyable](Copyable, Handler):
             self._nap(attempt)
             attempt += 1
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         if not self._retries(req):
             return self.inner.start(req, calls)
         calls.note(_RETRY_ATTEMPT, "1")
@@ -379,7 +381,9 @@ struct PostHocDeadline[Inner: Handler & Copyable](Copyable, Handler):
         var started = perf_counter_ns()
         return self._check(started, self.inner.serve(req).lower())
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         if self.budget_ms <= 0:
             return _gateway_timeout()
         var started = perf_counter_ns()
@@ -471,7 +475,9 @@ struct RateLimit[Inner: Handler & Copyable](Copyable, Handler):
             return _too_many_requests()
         return self.inner.serve(req).lower()
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         if not self._admit():
             return _too_many_requests()
         return self.inner.start(req, calls)
@@ -611,7 +617,9 @@ struct CircuitBreaker[Inner: Handler & Copyable](Copyable, Handler):
             self._record_failure(Int64(perf_counter_ns()))
             raise e^
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         if self.failure_threshold <= 0:
             return self.inner.start(req, calls)
         var refused = self._gate()

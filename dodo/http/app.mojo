@@ -793,7 +793,9 @@ struct App[S: AppState = NoState](Copyable, Handler):
     def calling(self, req: Request) raises -> Bool:
         return self._router.calling(req)
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         return self._router.start(req, calls)
 
     def finish(

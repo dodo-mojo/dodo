@@ -46,7 +46,9 @@ struct SharedHandler[H: Handler](Copyable, Handler):
     def calling(self, req: Request) raises -> Bool:
         return self.inner[].calling(req)
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         return self.inner[].start(req, calls)
 
     def finish(

@@ -250,7 +250,9 @@ struct Calls(Movable):
         self._round += 1
         if self._round > MAX_ROUNDS:
             raise Error(
-                String("a request made more than ", MAX_ROUNDS, " rounds of calls")
+                String(
+                    "a request made more than ", MAX_ROUNDS, " rounds of calls"
+                )
             )
 
 

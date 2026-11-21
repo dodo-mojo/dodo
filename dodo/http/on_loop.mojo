@@ -41,7 +41,9 @@ trait Calling(Copyable, Deinitable, Movable):
     and returns ``None`` again. Wrap it in :class:`OnLoop` to route it.
     """
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         """The first step; see the trait."""
         ...
 
@@ -73,7 +75,9 @@ struct OnLoop[Inner: Calling](Copyable, Handler):
     def calling(self, req: Request) raises -> Bool:
         return True
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         return self.inner.start(req, calls)
 
     def finish(
@@ -85,7 +89,9 @@ struct OnLoop[Inner: Calling](Copyable, Handler):
         return [RouteInfo("*", "/{*path}", False, True, "handler")]
 
 
-def serve_steps_blocking[H: Handler](handler: H, req: Request) raises -> Response:
+def serve_steps_blocking[
+    H: Handler
+](handler: H, req: Request) raises -> Response:
     """Serve ``req`` with ``handler``'s steps, making each round's calls
     with the blocking ``HttpClient``, one after another.
 

@@ -210,7 +210,9 @@ struct StructuredLogger[Inner: Handler & Copyable](Copyable, Handler):
         self._log_response(req, started, resp)
         return resp^
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var started = perf_counter_ns()
         calls.note(_STARTED, String(started))
         try:

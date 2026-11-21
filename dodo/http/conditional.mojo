@@ -436,7 +436,9 @@ struct Conditional[Inner: Handler & Copyable](Copyable, Handler):
             return early.take()
         return self._check_read(req, self.inner.serve(req).lower())
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var early = self._check_write(req)
         if early:
             return early^
@@ -450,8 +452,7 @@ struct Conditional[Inner: Handler & Copyable](Copyable, Handler):
     def _check_answer(
         self, req: Request, var answer: Optional[Response]
     ) raises -> Optional[Response]:
-        """Evaluate the read preconditions once a step returns a response.
-        """
+        """Evaluate the read preconditions once a step returns a response."""
         if not answer:
             return None
         return self._check_read(req, answer.take())

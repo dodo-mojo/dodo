@@ -217,7 +217,9 @@ def test_retry_starts_the_steps_over() raises:
 
 
 def test_deadline_checks_the_final_response() raises:
-    assert_equal(_steps(PostHocDeadline(_answer(), 60_000), _get("/")).status, 200)
+    assert_equal(
+        _steps(PostHocDeadline(_answer(), 60_000), _get("/")).status, 200
+    )
     var calls = Calls()
     var refused = PostHocDeadline(_answer(), 0).start(_get("/"), calls)
     assert_equal(refused.value().status, 504)
@@ -302,7 +304,9 @@ def test_shared_handler_forwards_the_steps() raises:
 
 
 def test_a_full_stack_answers_like_serve() raises:
-    var h = Logger(RequestId(Compress(Cors(_answer(), CorsConfig.permissive()))))
+    var h = Logger(
+        RequestId(Compress(Cors(_answer(), CorsConfig.permissive())))
+    )
     var req = _get("/")
     req.headers.set("X-Request-Id", "id-1")
     req.headers.set("Origin", "https://app.test")

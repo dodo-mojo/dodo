@@ -437,7 +437,9 @@ struct Cache[
             return hit.take()
         return self._after(req, self.inner.serve(req).lower())
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var hit = self._lookup(req)
         if hit:
             return hit^

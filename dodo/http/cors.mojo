@@ -178,7 +178,9 @@ struct Cors[Inner: Handler & Copyable](Copyable, Handler):
             return early.take()
         return self._decorate(req, self.inner.serve(req).lower())
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         var early = self._preflight(req)
         if early:
             return early^
@@ -241,9 +243,7 @@ struct Cors[Inner: Handler & Copyable](Copyable, Handler):
         )
         var headers_value: String
         if len(self.config.allowed_headers) == 0:
-            headers_value = req.headers.get(
-                "access-control-request-headers"
-            )
+            headers_value = req.headers.get("access-control-request-headers")
         else:
             headers_value = _join(self.config.allowed_headers, ", ")
         if headers_value.byte_length() > 0:

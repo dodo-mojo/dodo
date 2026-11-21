@@ -277,8 +277,7 @@ def _struct_blocking_thunk[
 def _struct_calling_thunk[
     H: Handler & Copyable
 ](addr: Int, req: Request) raises -> Bool:
-    """Thunk that asks the boxed ``H`` whether ``req`` is served in steps.
-    """
+    """Thunk that asks the boxed ``H`` whether ``req`` is served in steps."""
     return Pool[H].get_ptr(addr)[].calling(req)
 
 
@@ -346,9 +345,9 @@ def _struct_destroy_thunk[H: Handler & Copyable](addr: Int) -> None:
 # which is exactly the desired multi-worker semantics.
 
 
-comptime _StepThunk = def(Int, Request, mut Calls, Bool) raises thin -> Optional[
-    Response
-]
+comptime _StepThunk = def(
+    Int, Request, mut Calls, Bool
+) raises thin -> Optional[Response]
 """Runs a boxed handler's ``start`` (``True``) or ``finish`` (``False``)."""
 
 
@@ -939,7 +938,9 @@ struct Router(Copyable, Defaultable, Handler):
                 return reg.calling_thunks[sh_idx](reg.addrs[sh_idx], req)
         return False
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         """Run the ``start`` of the handler ``req`` matches."""
         return self._step(req, calls, True)
 
@@ -1057,7 +1058,9 @@ struct _MountedRouter[H: Handler & Copyable](Copyable, Handler):
             return False
         return self.sub.calling(self._child(req))
 
-    def start(self, req: Request, mut calls: Calls) raises -> Optional[Response]:
+    def start(
+        self, req: Request, mut calls: Calls
+    ) raises -> Optional[Response]:
         return self.sub.start(self._child(req), calls)
 
     def finish(
