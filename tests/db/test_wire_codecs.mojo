@@ -5,12 +5,15 @@ from std.testing import assert_equal, assert_false, assert_true
 
 from dodo.db import DbError, Param, Rows
 from dodo.db._bytes import ByteReader
+from dodo.db._stream import DbStream
 from dodo.db.clickhouse import protocol as ch
 from dodo.db.mongo import Bson, BsonArray
 from dodo.db.mongo import protocol as mongo
 from dodo.db.mysql import protocol as mysql
+from dodo.db.mysql.connection import MySqlConnection
 from dodo.db.postgres import protocol as pg
 from dodo.db.redis import protocol as redis
+from dodo.db.redis.connection import read_reply
 
 
 def hex(data: List[UInt8]) -> String:
@@ -363,6 +366,112 @@ def test_clickhouse_row_binary() raises:
     assert_true(failed, "a truncated body should be refused")
 
 
+# ── Hostile servers ─────────────────────────────────────────────────────────
+
+
+def test_reader_refuses_a_length_that_wraps() raises:
+    var data = bytes_of("abcd")
+    var r = ByteReader(Span(data), "test")
+    _ = r.u8()
+    var failed = False
+    try:
+        _ = r.bytes(Int.MAX)
+    except e:
+        failed = True
+        assert_equal(e.kind, DbError.PROTOCOL)
+    assert_true(failed, "Int.MAX bytes should be refused")
+
+
+def test_stream_grows_with_what_arrives() raises:
+    """A reply that claims 512 MB and sends two bytes costs no 512 MB."""
+    var data = bytes_of("$536870000\r\nab")
+    var stream = DbStream(replay=Span(data), database="redis")
+    var failed = False
+    try:
+        _ = read_reply(stream)
+    except e:
+        failed = True
+        assert_equal(e.kind, DbError.IO)
+    assert_true(failed, "the closed stream should end the reply")
+    assert_true(len(stream._buf) < 1024 * 1024, String(len(stream._buf)))
+
+
+def test_mysql_refuses_a_huge_column_count() raises:
+    var packet = List[UInt8]()
+    for b in [9, 0, 0, 0, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F]:
+        packet.append(UInt8(b))
+    var conn = MySqlConnection(DbStream(replay=Span(packet), database="mysql"))
+    var failed = False
+    try:
+        _ = conn._read_results(False)
+    except e:
+        failed = True
+        assert_equal(e.kind, DbError.IO)
+    assert_true(failed, "2^62 columns should end at the closed stream")
+
+
+def _header(names: List[String], types: List[String]) -> List[UInt8]:
+    var body = List[UInt8]()
+    put_varuint(body, len(names))
+    for name in names:
+        put_string(body, name)
+    for type_name in types:
+        put_string(body, type_name)
+    return body^
+
+
+def test_clickhouse_refuses_hostile_bodies() raises:
+    var bodies = List[List[UInt8]]()
+    # No columns, then a byte: the rows would never end.
+    bodies.append([0, 1])
+    # A column of Nothing takes no bytes, so neither would its rows.
+    var nothing = _header(["x"], ["Nothing"])
+    nothing.append(0)
+    bodies.append(nothing^)
+    var huge_array = _header(["x"], ["Array(Nothing)"])
+    put_varuint(huge_array, 1 << 62)
+    bodies.append(huge_array^)
+    var deep = String("Array(") * 40 + "Int8" + String(")") * 40
+    var too_deep = _header(["x"], [deep])
+    put_varuint(too_deep, 0)
+    bodies.append(too_deep^)
+    for type_name in [
+        "Nullable(",
+        "Array(Int8",
+        "Decimal(9, 1000000000)",
+        "Decimal(9, -1)",
+        "DateTime64(64)",
+        "FixedString(9223372036854775807)",
+    ]:
+        var body = _header(["x"], [type_name])
+        put_le(body, 0, 8)
+        bodies.append(body^)
+    for ref body in bodies:
+        var failed = False
+        try:
+            _ = ch.decode(Span(body))
+        except:
+            failed = True
+        assert_true(failed, hex(body) + " should be refused")
+
+
+def test_bson_refuses_bad_lengths() raises:
+    var docs: List[List[UInt8]] = [
+        # binary of length -1
+        [12, 0, 0, 0, 5, 97, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0],
+        # code-with-scope of 5 bytes, the last element of the document
+        [13, 0, 0, 0, 0x0F, 97, 0, 5, 0, 0, 0, 0, 0],
+    ]
+    for ref doc in docs:
+        var failed = False
+        try:
+            _ = Bson.parse(Span(doc))
+        except e:
+            failed = True
+            assert_equal(e.kind, DbError.PROTOCOL)
+        assert_true(failed, hex(doc) + " should be refused")
+
+
 def main() raises:
     test_pg_md5_password()
     test_pg_framing()
@@ -379,4 +488,9 @@ def main() raises:
     test_clickhouse_params()
     test_clickhouse_split_script()
     test_clickhouse_row_binary()
-    print("test_wire_codecs: 15 passed")
+    test_reader_refuses_a_length_that_wraps()
+    test_stream_grows_with_what_arrives()
+    test_mysql_refuses_a_huge_column_count()
+    test_clickhouse_refuses_hostile_bodies()
+    test_bson_refuses_bad_lengths()
+    print("test_wire_codecs: 20 passed")

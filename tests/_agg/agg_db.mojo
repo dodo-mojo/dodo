@@ -130,6 +130,21 @@ from test_wire_codecs import (
 from test_wire_codecs import (
     test_clickhouse_row_binary as test_wire_codecs__test_clickhouse_row_binary,
 )
+from test_wire_codecs import (
+    test_reader_refuses_a_length_that_wraps as test_wire_codecs__test_reader_refuses_a_length_that_wraps,
+)
+from test_wire_codecs import (
+    test_stream_grows_with_what_arrives as test_wire_codecs__test_stream_grows_with_what_arrives,
+)
+from test_wire_codecs import (
+    test_mysql_refuses_a_huge_column_count as test_wire_codecs__test_mysql_refuses_a_huge_column_count,
+)
+from test_wire_codecs import (
+    test_clickhouse_refuses_hostile_bodies as test_wire_codecs__test_clickhouse_refuses_hostile_bodies,
+)
+from test_wire_codecs import (
+    test_bson_refuses_bad_lengths as test_wire_codecs__test_bson_refuses_bad_lengths,
+)
 
 
 def main() raises:
@@ -194,4 +209,9 @@ def main() raises:
     suite.test[test_wire_codecs__test_clickhouse_params]()
     suite.test[test_wire_codecs__test_clickhouse_split_script]()
     suite.test[test_wire_codecs__test_clickhouse_row_binary]()
+    suite.test[test_wire_codecs__test_reader_refuses_a_length_that_wraps]()
+    suite.test[test_wire_codecs__test_stream_grows_with_what_arrives]()
+    suite.test[test_wire_codecs__test_mysql_refuses_a_huge_column_count]()
+    suite.test[test_wire_codecs__test_clickhouse_refuses_hostile_bodies]()
+    suite.test[test_wire_codecs__test_bson_refuses_bad_lengths]()
     suite^.run()
