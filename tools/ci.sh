@@ -4,13 +4,15 @@
 #   pixi run ci              every step this branch needs, in order
 #   pixi run ci tests        only the steps named
 #
-# Steps: checks, package, tests. `package` builds and tests the conda package,
-# and runs on its own only when this branch changes packaging, the native
-# wrappers or pixi. Run it on macOS and on Linux (WSL) before merging into dev.
+# Steps: checks, package, tests, db. `package` builds and tests the conda
+# package, and runs on its own only when this branch changes packaging, the
+# native wrappers or pixi. `db` runs the database driver suites, on its own
+# whenever Docker is up or DODO_DB_NO_COMPOSE=1 says the databases are.
+# Run it on macOS and on Linux (WSL) before merging into dev.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-STEPS=(checks package tests)
+STEPS=(checks package tests db)
 # What `package` depends on: a change here means the package must be rebuilt.
 PACKAGE_PATHS=(packaging tools/build_native.sh 'dodo/*/ffi/*' pixi.toml pixi.lock)
 
@@ -44,6 +46,23 @@ step_tests() {
   pixi run tests
 }
 
+step_db() {
+  say "db"
+  pixi run tests-db
+}
+
+# Can the database suites run? Either Docker can start the databases, or
+# DODO_DB_NO_COMPOSE=1 says they are already up.
+databasesAvailable() {
+  if [ "${DODO_DB_NO_COMPOSE:-}" = "1" ]; then
+    return 0
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+  docker info >/dev/null 2>&1
+}
+
 # Does this branch change anything the package is built from?
 packageChanged() {
   git fetch -q origin dev
@@ -56,11 +75,19 @@ packageChanged() {
 
 main() {
   local wanted=("$@")
+  local skipped=""
   if [ ${#wanted[@]} -eq 0 ]; then
-    wanted=(checks tests)
+    wanted=(checks)
     if packageChanged; then
       echo "this branch changes the package, so package runs too"
-      wanted=(checks package tests)
+      wanted+=(package)
+    fi
+    wanted+=(tests)
+    if databasesAvailable; then
+      wanted+=(db)
+    else
+      echo "docker is not running, so db is skipped"
+      skipped=" (db skipped: docker is not running)"
     fi
   fi
   local step
@@ -77,7 +104,7 @@ main() {
   if [ -n "$(git status --porcelain)" ]; then
     commit="$commit plus uncommitted changes"
   fi
-  say "ci passed on $(uname -s) at $commit"
+  say "ci passed on $(uname -s) at $commit$skipped"
 }
 
 main "$@"
