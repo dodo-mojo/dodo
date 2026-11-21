@@ -37,7 +37,7 @@ Useful commands:
 
 | Command | What it does |
 |---|---|
-| `pixi run ci` | Run the checks and every test, and the package build when the branch changes it |
+| `pixi run ci` | Run the checks and every test, the database suites when Docker is up, and the package build when the branch changes it |
 | `pixi run tests` | Build and run every test |
 | `pixi run tests-gen` | Regenerate `tests/_agg/` after adding or removing a test file |
 | `pixi run mojo -I . tests/http/test_x.mojo` | Run one test file |
