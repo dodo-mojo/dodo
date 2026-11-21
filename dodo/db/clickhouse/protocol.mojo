@@ -13,6 +13,9 @@ from ..rows import Rows
 
 comptime DB = "clickhouse"
 comptime FORMAT = "RowBinaryWithNamesAndTypes"
+comptime MAX_TYPE_DEPTH = 32
+"""How deeply a column type may nest, `Array(Array(...))`; deeper is refused
+before decoding, so a hostile header can't exhaust the stack."""
 
 
 # ── Requests ────────────────────────────────────────────────────────────────
@@ -211,6 +214,16 @@ def _varuint(mut r: ByteReader) raises DbError -> Int:
             raise DbError.protocol(DB, "varint too long")
 
 
+def _count(mut r: ByteReader) raises DbError -> Int:
+    """How many items an array or map holds. Each takes at least a byte,
+    so more than the bytes left is a lie; checking stops a short reply from
+    running a loop for 2^62 rounds."""
+    var n = _varuint(r)
+    if n < 0 or n > r.remaining():
+        raise DbError.protocol(DB, String("array of ", n, " items is too long"))
+    return n
+
+
 def _string(mut r: ByteReader) raises DbError -> String:
     var n = _varuint(r)
     return String(from_utf8_lossy=r.bytes(n))
@@ -229,13 +242,35 @@ def decode(body: Span[UInt8, _]) raises DbError -> Rows:
     var types = List[String]()
     for i in range(count):
         var type_name = _string(r)
+        _check_depth(type_name)
         rows.add_column(names[i], type_name)
         types.append(type_name^)
     while not r.done():
+        var row_start = r.at
         for ref type_name in types:
             _cell(r, type_name, rows)
+        if r.at == row_start:
+            # No columns, or only `Nothing`: the rest would never be read.
+            raise DbError.protocol(DB, "a row that takes no bytes")
         rows.end_row()
     return rows^
+
+
+def _check_depth(type_name: String) raises DbError:
+    var depth = 0
+    var quoted = False
+    for b in type_name.as_bytes():
+        var c = Int(b)
+        if c == ord("'"):
+            quoted = not quoted
+        elif quoted:
+            continue
+        elif c == ord("("):
+            depth += 1
+            if depth > MAX_TYPE_DEPTH:
+                raise DbError.protocol(DB, "column type nested too deeply")
+        elif c == ord(")"):
+            depth -= 1
 
 
 def _cell(mut r: ByteReader, type_name: String, mut rows: Rows) raises DbError:
@@ -329,6 +364,8 @@ def _text(
         return _maybe_quote(_datetime(r.le(4), 0, 0), quoted)
     if type_name.startswith("DateTime64("):
         var precision = _int_arg(type_name, "DateTime64(")
+        if precision < 0 or precision > 9:
+            raise DbError.decode("bad type " + type_name)
         var ticks = r.le_signed(8)
         var scale = _pow10(precision)
         var seconds = ticks // scale
@@ -380,7 +417,7 @@ def _text(
         return _quote(name) if quoted else name^
     if type_name.startswith("Array("):
         var inner = _inner(type_name, "Array(")
-        var n = _varuint(r)
+        var n = _count(r)
         var out = String("[")
         for i in range(n):
             if i > 0:
@@ -399,7 +436,7 @@ def _text(
         var parts = _args(_inner(type_name, "Map("))
         if len(parts) != 2:
             raise DbError.decode("bad Map type " + type_name)
-        var n = _varuint(r)
+        var n = _count(r)
         var out = String("{")
         for i in range(n):
             if i > 0:
@@ -418,8 +455,13 @@ def _text(
 # ── Type strings ────────────────────────────────────────────────────────────
 
 
-def _inner(type_name: String, prefix: String) -> String:
+def _inner(type_name: String, prefix: String) raises DbError -> String:
     """`Nullable(String)` with prefix `Nullable(` gives `String`."""
+    if (
+        type_name.byte_length() <= prefix.byte_length()
+        or not type_name.endswith(")")
+    ):
+        raise DbError.decode("bad type " + type_name)
     return String(
         type_name[byte = prefix.byte_length() : type_name.byte_length() - 1]
     )
@@ -515,6 +557,8 @@ def _decimal(mut r: ByteReader, type_name: String) raises DbError -> String:
             type_name
             + " is wider than 64 bits; cast it with toString() in the SQL"
         )
+    if scale < 0 or scale > precision:
+        raise DbError.decode("bad type " + type_name)
     var raw = r.le_signed(4 if precision <= 9 else 8)
     if scale == 0:
         return String(raw)

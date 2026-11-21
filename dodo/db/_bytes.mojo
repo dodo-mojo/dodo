@@ -24,7 +24,8 @@ struct ByteReader[origin: ImmOrigin]:
         return self.at >= len(self.data)
 
     def _need(self, n: Int) raises DbError:
-        if n < 0 or self.at + n > len(self.data):
+        # `n > remaining`, not `at + n > len`: a huge `n` must not wrap.
+        if n < 0 or n > self.remaining():
             raise DbError.protocol(
                 self.database,
                 String(

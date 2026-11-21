@@ -109,17 +109,26 @@ struct DbStream(Movable):
         if self._end - self._start >= need:
             return
         self._compact()
-        if len(self._buf) < need:
-            self._buf.resize(max(need, 2 * len(self._buf)), 0)
         while self._end - self._start < need:
             var room = len(self._buf) - self._end
             if room < _MIN_READ // 4:
-                self._buf.resize(len(self._buf) + _MIN_READ, 0)
+                self._grow()
                 room = len(self._buf) - self._end
             var n = self._read_some(room)
             if n == 0:
                 raise DbError.io(self.database, "server closed the connection")
             self._end += n
+
+    def _grow(mut self):
+        """Double the buffer once the bytes read so far fill it.
+
+        It grows with what arrives, never with what a server announces, so
+        a reply that claims to be 512 MB costs nothing until it is sent.
+        """
+        var size = 2 * len(self._buf)
+        if size < _MIN_READ:
+            size = _MIN_READ
+        self._buf.resize(size, 0)
 
     def _read_some(mut self, room: Int) raises DbError -> Int:
         if not self._tls and not self._tcp:

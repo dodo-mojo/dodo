@@ -408,7 +408,8 @@ struct MySqlConnection(Connection):
             var rows = Rows()
             var r = ByteReader(Span(first), DB)
             var count = protocol.read_lenenc(r)
-            var columns = List[ColumnInfo](capacity=count)
+            # No capacity from `count`: a server could claim 2^62 columns.
+            var columns = List[ColumnInfo]()
             for _ in range(count):
                 columns.append(protocol.parse_column(self._read_packet(), rows))
             self._skip_eof()

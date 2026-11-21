@@ -476,6 +476,9 @@ def _validate(doc: Span[UInt8, _], depth: Int) raises DbError:
         if kind == DOCUMENT or kind == ARRAY:
             _validate(doc[start : start + size], depth + 1)
         elif kind == CODE_WITH_SCOPE:
+            # Total length, string length, an empty string, an empty scope.
+            if size < 14:
+                raise DbError.protocol(DB, "bad BSON code-with-scope")
             var n = _le(doc, start + 4, 4)
             if 8 + n > size:
                 raise DbError.protocol(DB, "bad BSON code-with-scope")
@@ -520,6 +523,9 @@ def _size_checked(
         return n
     if kind == BINARY:
         var n = _le_signed(doc, at, 4)
+        # n = -1 would pass `_need` (n + 1 is 0), and read as 4 GB later.
+        if n < 0:
+            raise DbError.protocol(DB, "bad BSON binary length")
         _need(doc, at + 4, n + 1, end)
         return 5 + n
     if kind == REGEX:
