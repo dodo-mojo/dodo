@@ -30,6 +30,7 @@ Serves ``Inner`` in steps, so the worker runs its outgoing calls on the event lo
 Fields:
 
 - `inner` (`Inner`): The handler that makes the calls.
+- `tls` (`TlsConfig`): How ``https://`` calls check the server: a CA file, a client certificate. One setting covers every call this handler makes.
 
 Implemented traits: `AnyType`, `Copyable`, `Deinitable`, `Handler`, `Movable`
 
@@ -40,7 +41,7 @@ Aliases:
 #### `OnLoop.__init__`
 
 ```mojo
-def __init__(out self, var inner: Inner)
+def __init__(out self, var inner: Inner, tls: TlsConfig = TlsConfig(Int(1), String(""), String(""), String(""), String(""), List(), True))
 ```
 
 #### `OnLoop.serve`

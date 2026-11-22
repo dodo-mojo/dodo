@@ -54,7 +54,7 @@ Implemented traits: `AnyType`, `Deinitable`, `Movable`
 #### `HttpServer.__init__`
 
 ```mojo
-def __init__(out self, var listener: TcpListener, var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config()))
+def __init__(out self, var listener: TcpListener, var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(64), Int(16), Int(4000), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config()))
 ```
 
 #### `HttpServer.__deinit__`
@@ -66,7 +66,7 @@ def __deinit__(deinit self)
 #### `HttpServer.bind`
 
 ```mojo
-def bind(addr: SocketAddr, var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
+def bind(addr: SocketAddr, var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(64), Int(16), Int(4000), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
 ```
 
 Bind an HTTP server on ``addr``.
@@ -81,7 +81,7 @@ Returns: An ``HttpServer`` ready to call ``serve()``.
 Raises: AddressInUse: If the port is already bound. NetworkError: For any other OS error.
 
 ```mojo
-def bind(var addrs: List[SocketAddr], var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
+def bind(var addrs: List[SocketAddr], var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(64), Int(16), Int(4000), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
 ```
 
 Bind an HTTP server on multiple addresses simultaneously.
@@ -144,7 +144,7 @@ Return the bound addresses, primary first then extras in the order they were pas
 #### `HttpServer.bind_tls`
 
 ```mojo
-def bind_tls(addr: SocketAddr, cert_file: String, key_file: String, var alpn: List[String] = List(), var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
+def bind_tls(addr: SocketAddr, cert_file: String, key_file: String, var alpn: List[String] = List(), var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(64), Int(16), Int(4000), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
 ```
 
 Bind an HTTPS (TLS-terminated HTTP/1.1) server on ``addr``.
@@ -170,7 +170,7 @@ Returns: An ``HttpServer`` ready to call :meth:`serve`.
 Raises: AddressInUse: If the port is already bound. NetworkError: For any other OS error. Error: If the cert / key fails to load.
 
 ```mojo
-def bind_tls(addr: SocketAddr, var tls: TlsServerConfig, var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
+def bind_tls(addr: SocketAddr, var tls: TlsServerConfig, var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(64), Int(16), Int(4000), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config())) raises -> Self
 ```
 
 Bind an HTTPS server from a full :class:`TlsServerConfig`.
