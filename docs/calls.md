@@ -107,8 +107,48 @@ A middleware that forwards none of them still works: its `calling` says
 no, so the server calls its `serve`, which runs the steps with blocking
 calls.
 
-## Where the calls run today
+## How a call is made
 
-`OnLoop.serve` runs the steps with the blocking `HttpClient`, one call
-after another. Every server loop uses that path until it runs calls on
-the loop itself. `TestClient` runs the steps the way a server will.
+A call behaves like one made with `HttpClient`:
+
+- It follows up to 10 redirects and drops `Authorization`, `Cookie` and
+  `Proxy-Authorization` when a redirect changes origin.
+- It asks for gzip, deflate and br and hands `finish` the unzipped body.
+- It goes through `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` (a
+  `CONNECT` tunnel), except for hosts in `NO_PROXY`.
+- A request that failed on a reused connection before any reply byte is
+  sent again once on a new connection, but only when its method is safe
+  to repeat (RFC 9112 sec 9.3.1).
+
+TLS for the calls is set on `OnLoop`. The default checks certificates
+against OpenSSL's default CA bundle:
+
+```mojo
+from dodo.tls import TlsConfig
+
+r.get("/dash", OnLoop(Dash(), tls=TlsConfig(ca_bundle="internal-ca.pem")))
+```
+
+## Where the calls run
+
+On the unified loop (`serve`, `App.run`), each worker has its own client
+for calls. The request parks (the HTTP/1.1 connection, or one HTTP/2
+stream) while its calls run, and the worker serves other requests:
+
+- Connects never block. A host name is looked up on the offload pool;
+  an address is used as it is.
+- Connections are kept per host and reused. `ServerConfig` sets the
+  limits: `call_conns_per_host` (64) open at once, `call_idle_per_host`
+  (16) kept idle, closed after `call_idle_timeout_ms` (4 s) unused.
+  Calls past the open limit wait for a connection.
+- `handler_timeout_ms` bounds the whole request, calls included: at the
+  deadline the client gets 503 and the calls are cancelled. A client
+  that leaves cancels them too.
+- A graceful stop still answers a parked request, then closes its
+  connection.
+
+The other loops (`serve_cancellable`, the HTTP/1.1-only loop,
+`serve_streaming`) still run the steps through `OnLoop.serve`, with the
+blocking `HttpClient`, one call after another. So does a server whose
+handler never calls. `TestClient` runs the steps the way a server will.
+Calls use HTTP/1.1 for now, also to servers that speak HTTP/2.

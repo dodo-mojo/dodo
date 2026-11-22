@@ -137,13 +137,14 @@ Fields:
 
 - `request` (`Request`): The request to send; ``url`` is a full URL.
 - `timeout_ms` (`Int`): How long the call may take in all.
+- `tls` (`TlsConfig`): How an ``https://`` call checks the server: the setting on ``OnLoop``, or the default (OpenSSL's default CA bundle).
 
 Implemented traits: `AnyType`, `Deinitable`, `Movable`
 
 #### `OutgoingCall.__init__`
 
 ```mojo
-def __init__(out self, var request: Request, timeout_ms: Int)
+def __init__(out self, var request: Request, timeout_ms: Int, tls: TlsConfig = TlsConfig(Int(1), String(""), String(""), String(""), String(""), List(), True))
 ```
 
 ### `Calls`
@@ -188,6 +189,14 @@ def send(mut self, var req: Request, timeout_ms: Int = Int(30000)) -> Int
 ```
 
 Ask for ``req`` with any method, headers and body. ``req.url`` is a full ``http://`` or ``https://`` URL. Returns the reply's number.
+
+#### `Calls.use_tls`
+
+```mojo
+def use_tls(mut self, tls: TlsConfig)
+```
+
+Check ``https://`` servers with ``tls`` for the calls asked for from now on. ``OnLoop`` sets this from its ``tls`` setting.
 
 #### `Calls.round`
 

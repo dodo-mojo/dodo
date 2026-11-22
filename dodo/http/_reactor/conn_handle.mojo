@@ -45,6 +45,18 @@ from dodo.http._offload_pool import (
     unavailable_response,
 )
 from dodo.http.handler import Handler, CancelHandler
+from dodo.http.calls import Calls
+from dodo.http._loop_calls.client import loop_client
+from dodo.http._loop_calls.task import (
+    CallTask,
+    StepAnswer,
+    first_step,
+    next_step,
+    task_free,
+    task_new,
+    task_ptr,
+    wants_calls,
+)
 from dodo.http.headers import HeaderMap
 from dodo.http.request import Request
 from dodo.http.response import Response
@@ -434,6 +446,13 @@ struct ConnHandle(Movable):
     """Whether the connection closes after the parked request's
     response, decided when the request was parsed."""
 
+    var call_client: Int
+    """The worker's ``LoopClient`` address, or 0 when its handler makes
+    no calls (or the loop has none). Set by the unified loop."""
+
+    var call_task: Int
+    """The ``CallTask`` this connection is parked on, else 0."""
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def __init__(
@@ -494,6 +513,8 @@ struct ConnHandle(Movable):
         self.offload_port = 0
         self.offload_job = 0
         self.offload_close = False
+        self.call_client = 0
+        self.call_task = 0
 
     def attach_tls(mut self, var transport: TlsTransport):
         """Adopt the ``SSL*`` of an already-handshaken connection.
@@ -1031,12 +1052,81 @@ struct ConnHandle(Movable):
         return self._parked_step()
 
     def offload_abandon(mut self, reason: Int):
-        """Give up on the parked job: flip its cancel cell to ``reason``
-        and forget it, so its result is dropped when it comes back."""
+        """Give up on the parked job or calls: flip the job's cancel cell
+        to ``reason``, or cancel the calls, and forget them, so their
+        result is dropped."""
+        if self.call_task != 0:
+            loop_client(self.call_client)[].cancel(self.call_task)
+            self.call_task = 0
         if self.offload_job == 0:
             return
         offload_cancel(self.offload_job, reason)
         self.offload_job = 0
+
+    # ── Outgoing calls on the loop (ADR-0006) ────────────────────────────────
+
+    def _start_calls[
+        H: Handler
+    ](
+        mut self,
+        ref handler: H,
+        var req: Request,
+        close_after: Bool,
+        config: ServerConfig,
+    ) raises -> StepResult:
+        """Run ``start``. An answer is sent at once; calls park the
+        connection until their replies are back, like an offload."""
+        var calls = Calls()
+        var answer = first_step(handler, req, calls)
+        if not answer.waiting():
+            return self._answer(answer^, close_after)
+        var task = task_new(CallTask(req^, calls^, Int(self.fd()), 0))
+        loop_client(self.call_client)[].submit(task)
+        self._consume_request()
+        self.call_task = task
+        self.offload_close = close_after
+        self.state = STATE_PARKED
+        return StepResult(
+            want_read=True,
+            want_write=len(self.write_buf) > self.write_pos,
+            idle_timeout_ms=config.handler_timeout_ms,
+        )
+
+    def _answer(
+        mut self, var answer: StepAnswer, close_after: Bool
+    ) raises -> StepResult:
+        """Queue what a step came to: its response or its error."""
+        if answer.resp:
+            return self._finalise_response(answer.resp.take(), close_after)
+        self._queue_error(answer.err_status, answer.err_reason)
+        return self._transition_to_writing()
+
+    def calls_back[
+        H: Handler
+    ](mut self, ref handler: H, task: Int) raises -> Optional[StepResult]:
+        """The replies of ``task``'s round are in: run ``finish``. More
+        calls park the connection again; an answer is queued. ``None``
+        when this connection no longer waits for ``task`` (the fd now
+        belongs to another one): the caller frees it."""
+        if self.state != STATE_PARKED or self.call_task != task:
+            return Optional[StepResult]()
+        var answer = next_step(handler, task_ptr(task)[])
+        if answer.waiting():
+            loop_client(self.call_client)[].submit(task)
+            return Optional[StepResult](self._parked_step())
+        self.call_task = 0
+        task_free(task)
+        self._keep_earlier_output()
+        var step: StepResult
+        if answer.resp:
+            step = self._finalise_response(
+                answer.resp.take(), self.offload_close
+            )
+        else:
+            self._queue_error(answer.err_status, answer.err_reason)
+            step = self._transition_to_writing()
+        self._merge_batch()
+        return Optional[StepResult](step)
 
     def offload_done(mut self, job: Int) raises -> Optional[StepResult]:
         """Queue the response of ``job``, back from the pool. ``None``
@@ -1331,6 +1421,8 @@ struct ConnHandle(Movable):
         var final_close = self._apply_keepalive_policy(config, close_after)
         if self.offload_port != 0 and _wants_offload(handler, req):
             return self._offload(req^, final_close, config)
+        if self.call_client != 0 and wants_calls(handler, req):
+            return self._start_calls(handler, req^, final_close, config)
         var expose_errors = req.expose_errors
         var request_id = req.headers.get("x-request-id")
         var resp: Response

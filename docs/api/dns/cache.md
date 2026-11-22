@@ -77,6 +77,22 @@ Cache-aware off-reactor resolve: serve a fresh entry from memory (no thread spaw
 Same caching semantics as :meth:`resolve`; only the miss path
 differs (off-thread, cancellable). Failures are not cached.
 
+#### `DnsCache.cached`
+
+```mojo
+def cached(mut self, host: String) -> Optional[List[IpAddr]]
+```
+
+The fresh entry for ``host``, without a lookup on a miss. For a caller that runs the lookup itself (the loop client runs it on the offload pool) and hands the answer to :meth:`remember`.
+
+#### `DnsCache.remember`
+
+```mojo
+def remember(mut self, host: String, var addrs: List[IpAddr])
+```
+
+Cache ``addrs`` for ``host``, found by a lookup the caller ran.
+
 #### `DnsCache.resolve_ordered`
 
 ```mojo

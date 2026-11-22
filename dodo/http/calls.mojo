@@ -36,6 +36,8 @@ A failed call does not raise: its reply says why (``CallError``), so
 
 from std.collections import Dict, Optional
 
+from dodo.tls.config import TlsConfig
+
 from .headers import HeaderMap
 from .request import Method, Request
 from .response import Response
@@ -119,10 +121,19 @@ struct OutgoingCall(Movable):
     """The request to send; ``url`` is a full URL."""
     var timeout_ms: Int
     """How long the call may take in all."""
+    var tls: TlsConfig
+    """How an ``https://`` call checks the server: the setting on
+    ``OnLoop``, or the default (OpenSSL's default CA bundle)."""
 
-    def __init__(out self, var request: Request, timeout_ms: Int):
+    def __init__(
+        out self,
+        var request: Request,
+        timeout_ms: Int,
+        tls: TlsConfig = TlsConfig(),
+    ):
         self.request = request^
         self.timeout_ms = timeout_ms
+        self.tls = tls.copy()
 
 
 struct Calls(Movable):
@@ -137,12 +148,14 @@ struct Calls(Movable):
     var _replies: List[CallReply]
     var _round: Int
     var _notes: Dict[String, String]
+    var _tls: TlsConfig
 
     def __init__(out self):
         self._waiting = List[OutgoingCall]()
         self._replies = List[CallReply]()
         self._round = 0
         self._notes = Dict[String, String]()
+        self._tls = TlsConfig()
 
     # ── Asking for calls ────────────────────────────────────────────────────
 
@@ -174,8 +187,13 @@ struct Calls(Movable):
         is a full ``http://`` or ``https://`` URL. Returns the reply's
         number."""
         var number = len(self._replies) + len(self._waiting)
-        self._waiting.append(OutgoingCall(req^, timeout_ms))
+        self._waiting.append(OutgoingCall(req^, timeout_ms, self._tls))
         return number
+
+    def use_tls(mut self, tls: TlsConfig):
+        """Check ``https://`` servers with ``tls`` for the calls asked for
+        from now on. ``OnLoop`` sets this from its ``tls`` setting."""
+        self._tls = tls.copy()
 
     # ── Reading replies ─────────────────────────────────────────────────────
 

@@ -111,7 +111,7 @@ Implemented traits: `AnyType`, `Copyable`, `Deinitable`, `Frontend`, `Movable`
 #### `StreamFrontend.__init__`
 
 ```mojo
-def __init__(out self, var handler: H, max_in_flight: Int = Int(0), retry_after_s: Int = Int(1), var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config()))
+def __init__(out self, var handler: H, max_in_flight: Int = Int(0), retry_after_s: Int = Int(1), var config: ServerConfig = ServerConfig(Int(8192), Int(8192), Int(10485760), Int(8192), True, Int(1000), Int(500), Int(5000), Int(5000), False, Int(30000), Int(30000), Int(0), Int(1024), Int(64), Int(16), Int(4000), Int(60000), Int(10000), Int(240), False, H1LeniencyConfig(allow_mixed_case_method=False, allow_ows_around_colon=False, allow_obs_fold=False, allow_oversized_request_uri=False, allow_oversized_header_list=False, accept_empty_chunk_extensions=False, allow_multiple_content_length=False, allow_te_chunked_when_cl_present=False, accept_obs_text_in_field_value=False, accept_invalid_chunk_extension_chars=False, allow_leading_whitespace_before_request_line=False), Int(0), WsUpgrade(), Http2Config()))
 ```
 
 #### `StreamFrontend.run_worker`

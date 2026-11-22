@@ -27,7 +27,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +46,16 @@ class Mistake:
     file: str
     find: str
     plant: str
+    tests: list[str] = field(default_factory=list)
+    """The test files that should catch it; empty picks them by `file`."""
+
+
+LOOP_CALL_TESTS = [
+    "tests/http/test_h1_response_reader.mojo",
+    "tests/http/test_loop_client.mojo",
+    "tests/http/test_loop_calls.mojo",
+]
+"""The tests of outgoing calls on the server's loop (ADR-0006)."""
 
 
 MISTAKES = [
@@ -631,6 +641,62 @@ MISTAKES = [
         "            child.params_mut().clear()\n"
         "            return thunk(reg.addrs[sh_idx], child, calls, first)",
     ),
+    Mistake(
+        "a reply with bytes after it leaves its connection reusable",
+        "dodo/http/_client/parse.mojo",
+        "            raw.resize(self._end, 0)\n            self._extra = True\n",
+        "            raw.resize(self._end, 0)\n",
+        LOOP_CALL_TESTS,
+    ),
+    Mistake(
+        "a stale connection replays a request that is not safe to repeat",
+        "dodo/http/_loop_calls/client.mojo",
+        "if may_replay(ep[].hop.method, write_failed, no_reply):",
+        "if True:",
+        LOOP_CALL_TESTS,
+    ),
+    Mistake(
+        "a finished call connection is never kept for the next call",
+        "dodo/http/_loop_calls/client.mojo",
+        "                pool.idle.append(c)\n                keep = True\n",
+        "                keep = False\n",
+        LOOP_CALL_TESTS,
+    ),
+    Mistake(
+        "a slow call is reported as a connect failure",
+        "dodo/http/_loop_calls/client.mojo",
+        "var connecting = ep[].waits == WAIT_LOOKUP",
+        "var connecting = True",
+        LOOP_CALL_TESTS,
+    ),
+    Mistake(
+        "cancel leaves the calls on a connection running",
+        "dodo/http/_loop_calls/client.mojo",
+        "            self._cancel_calls(task, False, reactor)\n",
+        "",
+        LOOP_CALL_TESTS,
+    ),
+    Mistake(
+        "a call ignores the TLS setting on OnLoop",
+        "dodo/http/_loop_calls/client.mojo",
+        "ctx = self._ctx_for(ep[].tls)",
+        "ctx = self._ctx_for(TlsConfig())",
+        LOOP_CALL_TESTS,
+    ),
+    Mistake(
+        "the loop drops events for its call sockets",
+        "dodo/http/_unified_reactor_impl.mojo",
+        "if call_client != 0 and loop_client(call_client)[].owns(fd):",
+        "if False:",
+        ["tests/http/test_loop_calls.mojo"],
+    ),
+    Mistake(
+        "a stop leaves a parked request's connection open after it",
+        "dodo/http/_reactor/conn_handle.mojo",
+        "        if self.state == STATE_PARKED:\n            self.offload_close = True\n",
+        "",
+        ["tests/http/test_loop_calls.mojo"],
+    ),
 ]
 
 
@@ -660,6 +726,13 @@ def tests_for(file: str) -> list[str]:
     if file.startswith("dodo/runtime/"):
         return ["tests/runtime/test_stop_wake.mojo", "tests/runtime/test_scheduler.mojo", end_to_end]
     return cli_tests
+
+
+def tests_of(mistake: Mistake) -> list[str]:
+    """The test files to run for `mistake`."""
+    if mistake.tests:
+        return mistake.tests
+    return tests_for(mistake.file)
 
 
 def backup_path(file: str) -> Path:
@@ -737,7 +810,7 @@ def failing_before_planting(picked: list[int]) -> list[str]:
     planted. A file that already fails would mark every mistake caught."""
     needed = []
     for number in picked:
-        for test in tests_for(MISTAKES[number - 1].file):
+        for test in tests_of(MISTAKES[number - 1]):
             if test not in needed:
                 needed.append(test)
     lines = []
@@ -761,7 +834,7 @@ def check(number: int, mistake: Mistake) -> str:
     started = time.monotonic()
     try:
         path.write_text(original.replace(mistake.find, mistake.plant))
-        for test in tests_for(mistake.file):
+        for test in tests_of(mistake):
             outcome, why = run_test(test)
             if outcome != "passed":
                 seconds = time.monotonic() - started

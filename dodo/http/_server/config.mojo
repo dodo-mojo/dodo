@@ -142,10 +142,11 @@ struct ServerConfig(Copyable):
             last body byte (default 30_000). 0 disables. Guards the
             slow-body-upload variant of the slow-client DoS surface.
             Mirrors nginx's ``client_body_timeout``.
-        handler_timeout_ms: Max ms an ``Offload`` handler may run
-            (default 30_000). When it runs out the client gets 503,
-            ``req.cancel`` flips to ``TIMEOUT`` and the late result is
-            dropped. 0 disables. Inline handlers run on the worker
+        handler_timeout_ms: Max ms an ``Offload`` handler may run, or a
+            request may wait on its outgoing calls (default 30_000).
+            When it runs out the client gets 503, ``req.cancel`` flips
+            to ``TIMEOUT`` (the calls are cancelled) and the late result
+            is dropped. 0 disables. Inline handlers run on the worker
             thread and can't be interrupted, so it does not bound them.
             Checked against ``request_timeout_ms`` by
             ``ServerConfig.check``.
@@ -155,6 +156,14 @@ struct ServerConfig(Copyable):
         offload_queue_depth: Offloaded requests that may wait for a pool
             thread (default 1024). When the queue is full the client gets
             503 with ``Retry-After: 1`` at once.
+        call_conns_per_host: Outgoing connections one worker keeps open
+            to one origin at most (default 64). Calls past it wait for a
+            connection to come free.
+        call_idle_per_host: Idle outgoing connections one worker keeps
+            per origin for reuse (default 16); the rest are closed.
+        call_idle_timeout_ms: How long an idle outgoing connection is
+            kept (default 4_000), below the 5 s keep-alive most servers
+            use, so a server rarely closes one as it is reused.
         request_timeout_ms: Max ms to read one whole request, head and
             body, from its first byte (default 60_000); the reactor
             answers 408 and closes when it runs out. 0 disables. It
@@ -197,6 +206,9 @@ struct ServerConfig(Copyable):
     var handler_timeout_ms: Int
     var offload_threads: Int
     var offload_queue_depth: Int
+    var call_conns_per_host: Int
+    var call_idle_per_host: Int
+    var call_idle_timeout_ms: Int
     var request_timeout_ms: Int
     var header_timeout_ms: Int
     var min_body_rate: Int
@@ -261,6 +273,9 @@ struct ServerConfig(Copyable):
         handler_timeout_ms: Int = 30_000,
         offload_threads: Int = 0,
         offload_queue_depth: Int = 1024,
+        call_conns_per_host: Int = 64,
+        call_idle_per_host: Int = 16,
+        call_idle_timeout_ms: Int = 4_000,
         request_timeout_ms: Int = 60_000,
         header_timeout_ms: Int = 10_000,
         min_body_rate: Int = 240,
@@ -284,6 +299,9 @@ struct ServerConfig(Copyable):
         self.handler_timeout_ms = handler_timeout_ms
         self.offload_threads = offload_threads
         self.offload_queue_depth = offload_queue_depth
+        self.call_conns_per_host = call_conns_per_host
+        self.call_idle_per_host = call_idle_per_host
+        self.call_idle_timeout_ms = call_idle_timeout_ms
         self.request_timeout_ms = request_timeout_ms
         self.header_timeout_ms = header_timeout_ms
         self.min_body_rate = min_body_rate
@@ -349,6 +367,15 @@ struct ServerConfig(Copyable):
         comptime assert (
             cfg.offload_queue_depth >= 1
         ), "ServerConfig.offload_queue_depth must be >= 1"
+        comptime assert (
+            cfg.call_conns_per_host >= 1
+        ), "ServerConfig.call_conns_per_host must be >= 1"
+        comptime assert (
+            cfg.call_idle_per_host >= 0
+        ), "ServerConfig.call_idle_per_host must be >= 0"
+        comptime assert (
+            cfg.call_idle_timeout_ms >= 1
+        ), "ServerConfig.call_idle_timeout_ms must be >= 1"
         comptime assert (
             cfg.request_timeout_ms >= 0
         ), "ServerConfig.request_timeout_ms must be >= 0 (0 disables)"
