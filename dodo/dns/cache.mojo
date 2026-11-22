@@ -31,7 +31,7 @@ the same pointer-backed interior-mutable handle pattern as
 of this pure cache without changing its logic.
 """
 
-from std.collections import Dict, List
+from std.collections import Dict, List, Optional
 
 from ..http.cancel import Cancel
 from ..net import IpAddr
@@ -172,6 +172,24 @@ struct DnsCache(Movable):
         self._resolves += 1
         self._store(key, fresh.copy(), now)
         return fresh^
+
+    def cached(mut self, host: String) -> Optional[List[IpAddr]]:
+        """The fresh entry for ``host``, without a lookup on a miss. For
+        a caller that runs the lookup itself (the loop client runs it on
+        the offload pool) and hands the answer to :meth:`remember`."""
+        var now = monotonic_now_ms()
+        var hit = self._by_host.get(DnsCache._key(host))
+        if not hit:
+            return Optional[List[IpAddr]]()
+        if now >= hit.value().expires_at_ms:
+            return Optional[List[IpAddr]]()
+        self._hits += 1
+        return Optional[List[IpAddr]](hit.value().addrs.copy())
+
+    def remember(mut self, host: String, var addrs: List[IpAddr]):
+        """Cache ``addrs`` for ``host``, found by a lookup the caller ran."""
+        self._resolves += 1
+        self._store(DnsCache._key(host), addrs^, monotonic_now_ms())
 
     def resolve_ordered(mut self, host: String) raises -> List[IpAddr]:
         """Like :meth:`resolve` but returns the addresses in RFC 8305

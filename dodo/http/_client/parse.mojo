@@ -811,21 +811,6 @@ def _read_http_response_framed_tls(
     return resp^
 
 
-def _fill[
-    R: Readable
-](mut stream: R, mut buf: List[UInt8], mut raw: List[UInt8]) raises -> Bool:
-    var n = stream.read(buf.unsafe_ptr(), len(buf))
-    if n == 0:
-        return False
-    if len(raw) + n > MAX_BUFFERED_RESPONSE_BYTES:
-        raise NetworkError(
-            "HTTP response larger than the buffered limit; stream it"
-        )
-    for i in range(n):
-        raw.append(buf[i])
-    return True
-
-
 def _read_http_response_framed[
     R: Readable
 ](
@@ -836,16 +821,9 @@ def _read_http_response_framed[
     Also records whether the connection is in a reusable state.
 
     Stops at the end of the framed body instead of reading until EOF,
-    so the socket can go back to a connection pool. The framing follows
-    :func:`_response_framing`, and so depends on ``method``: a response
-    to HEAD has a Content-Length and no body, and waiting for that body
-    hung the request. Informational 1xx heads are read past.
-
-    A chunked body is walked chunk by chunk (``scan_chunked_resume``).
-    Searching the raw bytes for ``\\r\\n0\\r\\n`` instead would stop early
-    when the *payload* contains that pattern, leaving body bytes in the
-    socket for the next pooled request to read as its response, and
-    would never match an empty chunked body at all.
+    so the socket can go back to a connection pool. The bytes go
+    through :class:`H1ResponseReader`, the same reader the loop client
+    feeds, so both frame a response the same way.
 
     Args:
         stream: The open stream to read from.
@@ -864,95 +842,229 @@ def _read_http_response_framed[
     can_reuse = False
     var buf = List[UInt8](capacity=_READ_BUF_SIZE)
     buf.resize(_READ_BUF_SIZE, 0)
-    var raw = List[UInt8](capacity=4096)
-
-    # Heads, skipping 1xx.
-    var start = 0
-    var hdr_end: Int
-    var status: Int
-    var headers: HeaderMap
-    var http11: Bool
+    var reader = H1ResponseReader(method)
     while True:
-        hdr_end = _find_crlf2_from(raw, start)
-        while hdr_end < 0:
-            if len(raw) - start > _MAX_RESPONSE_HEAD_BYTES:
-                raise NetworkError("HTTP response head too large")
-            var more: Bool
-            try:
-                more = _fill(stream, buf, raw)
-            except e:
-                if len(raw) == 0:
-                    raise NetworkError(NO_REPLY_ERROR + ": " + String(e))
-                raise e^
-            if not more:
-                if len(raw) == 0:
-                    raise NetworkError(NO_REPLY_ERROR + ": peer closed")
-                raise NetworkError("HTTP response: missing header terminator")
-            hdr_end = _find_crlf2_from(raw, start)
-        var head_bytes = List[UInt8](capacity=hdr_end - start)
-        for i in range(start, hdr_end):
-            head_bytes.append(raw[i])
-        var head = _parse_response_head(head_bytes)
-        status = head.status
-        if status >= 100 and status < 200 and status != 101:
-            start = hdr_end + 4
-            continue
-        headers = head.headers.copy()
-        http11 = head.http11
-        break
+        var n: Int
+        try:
+            n = stream.read(buf.unsafe_ptr(), len(buf))
+        except e:
+            if reader.got_nothing():
+                raise NetworkError(NO_REPLY_ERROR + ": " + String(e))
+            raise e^
+        if n == 0:
+            reader.end_of_stream()
+            break
+        if reader.feed(Span[UInt8, _](buf)[:n]):
+            break
+    can_reuse = reader.reusable()
+    return reader.take()
 
-    var conn_close = False
-    for v in headers.get_all("connection"):
-        for tok in v.split(","):
-            if String(tok).strip().lower() == "close":
-                conn_close = True
 
-    var framing = _response_framing(method, status, headers)
-    var body_start = hdr_end + 4
-    var end = body_start
-    if framing[0] == _FRAME_LENGTH:
-        end = body_start + framing[1]
-        if end > MAX_BUFFERED_RESPONSE_BYTES:
+comptime _READ_HEAD: Int = 0
+comptime _READ_LENGTH: Int = 1
+comptime _READ_CHUNKED: Int = 2
+comptime _READ_TO_CLOSE: Int = 3
+comptime _READ_DONE: Int = 4
+
+
+struct H1ResponseReader(Movable):
+    """Frames one HTTP/1.1 response from bytes as they arrive.
+
+    ``feed`` takes each read and says when the response is complete;
+    ``end_of_stream`` is called when the peer closes. The rules are
+    RFC 9112's, through :func:`_response_framing`: 1xx heads are read
+    past, a chunked body is walked chunk by chunk (``scan_chunked_resume``)
+    so a payload holding ``\\r\\n0\\r\\n`` cannot end it early, and a
+    response over ``MAX_BUFFERED_RESPONSE_BYTES`` is refused.
+    """
+
+    var raw: List[UInt8]
+    """Every byte of the response so far, 1xx heads included."""
+    var method: String
+    """The request method; a response to HEAD has no body."""
+    var _phase: Int
+    var _head_start: Int
+    """Where the head being looked for starts (past any 1xx)."""
+    var _end: Int
+    """One past the last byte of the message, once known."""
+    var _cursor: Int
+    var _decoded: Int
+    var _conn_close: Bool
+    var _http11: Bool
+    var _extra: Bool
+    """Bytes came after the message: the framing is in doubt."""
+
+    def __init__(out self, method: String):
+        self.raw = List[UInt8](capacity=4096)
+        self.method = method
+        self._phase = _READ_HEAD
+        self._head_start = 0
+        self._end = 0
+        self._cursor = 0
+        self._decoded = 0
+        self._conn_close = False
+        self._http11 = False
+        self._extra = False
+
+    def got_nothing(self) -> Bool:
+        """Whether no byte of the response has arrived."""
+        return len(self.raw) == 0
+
+    def done(self) -> Bool:
+        """Whether the whole response is in."""
+        return self._phase == _READ_DONE
+
+    def feed(mut self, data: Span[UInt8, _]) raises -> Bool:
+        """Add the next bytes read. True once the response is complete.
+
+        Raises:
+            NetworkError: A malformed head or body, or a response too big
+                to buffer.
+        """
+        if len(self.raw) + len(data) > MAX_BUFFERED_RESPONSE_BYTES:
             raise NetworkError(
                 "HTTP response larger than the buffered limit; stream it"
             )
-        while len(raw) < end:
-            if not _fill(stream, buf, raw):
-                raise NetworkError("Unexpected EOF in body")
-    elif framing[0] == _FRAME_CHUNKED:
-        var cursor = body_start
-        var decoded = 0
-        while True:
-            var r = scan_chunked_resume(
-                Span[UInt8, _](raw),
-                cursor,
-                decoded,
-                MAX_BUFFERED_RESPONSE_BYTES,
-            )
-            if r == CHUNKED_MALFORMED:
-                raise NetworkError("HTTP response: malformed chunked body")
-            if r != CHUNKED_INCOMPLETE:
-                end = r
-                break
-            if not _fill(stream, buf, raw):
-                raise NetworkError("Unexpected EOF in chunked body")
-    elif framing[0] == _FRAME_CLOSE:
-        # No length and not chunked: read to EOF; not reusable.
-        conn_close = True
-        while _fill(stream, buf, raw):
-            pass
-        end = len(raw)
+        self.raw.extend(data)
+        if self._phase == _READ_HEAD:
+            self._find_head()
+        if self._phase == _READ_LENGTH:
+            if len(self.raw) >= self._end:
+                self._phase = _READ_DONE
+        elif self._phase == _READ_CHUNKED:
+            self._scan_chunks()
+        return self._phase == _READ_DONE
 
-    # Bytes past the end of the message on a connection we did not
-    # pipeline on mean the peer and we disagree about framing: never
-    # hand that connection to the next request.
-    var clean = len(raw) == end
-    if len(raw) > end:
-        raw.resize(end, 0)
-    var resp = _parse_http_response(raw, method)
-    # RFC 9112 sec 9.3: only HTTP/1.1 persists by default. An HTTP/1.0
-    # response closes the connection unless it said keep-alive, and a peer
-    # that answers 1.0 is not trusted to hold the connection open, so the
-    # keep-alive form is not pooled either.
-    can_reuse = clean and not conn_close and http11
-    return resp^
+    def end_of_stream(mut self, unclean_tls: Bool = False) raises:
+        """The peer closed. That ends a body read to close; anywhere else
+        the response is cut short.
+
+        ``unclean_tls`` is a TLS close without close_notify, which makes
+        the end of a body read to close untrustworthy.
+
+        Raises:
+            NetworkError: The response is incomplete.
+        """
+        if self._phase == _READ_DONE:
+            return
+        if self._phase == _READ_TO_CLOSE:
+            if unclean_tls:
+                raise NetworkError(
+                    "TLS connection closed without close_notify; the"
+                    " response body may be truncated"
+                )
+            self._end = len(self.raw)
+            self._phase = _READ_DONE
+            return
+        if self._phase == _READ_HEAD:
+            if len(self.raw) == 0:
+                raise NetworkError(NO_REPLY_ERROR + ": peer closed")
+            raise NetworkError("HTTP response: missing header terminator")
+        if self._phase == _READ_LENGTH:
+            raise NetworkError("Unexpected EOF in body")
+        raise NetworkError("Unexpected EOF in chunked body")
+
+    def reusable(self) -> Bool:
+        """Whether the connection can carry another request: the response
+        is complete, HTTP/1.1, not marked ``close``, not read to close,
+        and nothing came after it.
+
+        RFC 9112 sec 9.3: only HTTP/1.1 persists by default, and a peer
+        that answers 1.0 is not trusted to hold the connection open.
+        Bytes past the end of the message mean the peer and we disagree
+        about framing.
+        """
+        if self._phase != _READ_DONE:
+            return False
+        if self._conn_close or not self._http11:
+            return False
+        if self._extra:
+            return False
+        return len(self.raw) == self._end
+
+    def take(mut self) raises -> Response:
+        """The complete response.
+
+        Raises:
+            NetworkError: The response is not complete, or does not parse.
+        """
+        if self._phase != _READ_DONE:
+            raise NetworkError("HTTP response: incomplete")
+        var raw = self.raw^
+        self.raw = List[UInt8]()
+        if len(raw) > self._end:
+            raw.resize(self._end, 0)
+            self._extra = True
+        # The bytes are handed over; ``reusable`` still answers the same.
+        self._end = 0
+        return _parse_http_response(raw, self.method)
+
+    def _find_head(mut self) raises:
+        """Look for the final head; once found, choose how the body ends."""
+        while True:
+            var hdr_end = _find_crlf2_from(self.raw, self._head_start)
+            if hdr_end < 0:
+                if len(self.raw) - self._head_start > _MAX_RESPONSE_HEAD_BYTES:
+                    raise NetworkError("HTTP response head too large")
+                return
+            var head_bytes = List[UInt8](capacity=hdr_end - self._head_start)
+            for i in range(self._head_start, hdr_end):
+                head_bytes.append(self.raw[i])
+            var head = _parse_response_head(head_bytes)
+            var body_start = hdr_end + 4
+            if head.status >= 100 and head.status < 200 and head.status != 101:
+                self._head_start = body_start
+                continue
+            self._http11 = head.http11
+            self._conn_close = _says_close(head.headers)
+            self._choose_framing(head.status, head.headers, body_start)
+            return
+
+    def _choose_framing(
+        mut self, status: Int, headers: HeaderMap, body_start: Int
+    ) raises:
+        var framing = _response_framing(self.method, status, headers)
+        if framing[0] == _FRAME_LENGTH:
+            self._end = body_start + framing[1]
+            if self._end > MAX_BUFFERED_RESPONSE_BYTES:
+                raise NetworkError(
+                    "HTTP response larger than the buffered limit; stream it"
+                )
+            self._phase = _READ_LENGTH
+            if len(self.raw) >= self._end:
+                self._phase = _READ_DONE
+            return
+        if framing[0] == _FRAME_CHUNKED:
+            self._cursor = body_start
+            self._phase = _READ_CHUNKED
+            self._scan_chunks()
+            return
+        if framing[0] == _FRAME_CLOSE:
+            self._conn_close = True
+            self._phase = _READ_TO_CLOSE
+            return
+        self._end = body_start
+        self._phase = _READ_DONE
+
+    def _scan_chunks(mut self) raises:
+        var r = scan_chunked_resume(
+            Span[UInt8, _](self.raw),
+            self._cursor,
+            self._decoded,
+            MAX_BUFFERED_RESPONSE_BYTES,
+        )
+        if r == CHUNKED_MALFORMED:
+            raise NetworkError("HTTP response: malformed chunked body")
+        if r == CHUNKED_INCOMPLETE:
+            return
+        self._end = r
+        self._phase = _READ_DONE
+
+
+def _says_close(headers: HeaderMap) -> Bool:
+    """Whether a ``Connection`` header names ``close``."""
+    for v in headers.get_all("connection"):
+        for tok in v.split(","):
+            if String(tok).strip().lower() == "close":
+                return True
+    return False

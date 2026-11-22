@@ -49,6 +49,17 @@ from dodo.http._offload_pool import (
     unavailable_response,
 )
 from dodo.http.handler import CancelHandler, Handler
+from dodo.http.calls import Calls
+from dodo.http._loop_calls.client import loop_client
+from dodo.http._loop_calls.task import (
+    CallTask,
+    first_step,
+    next_step,
+    task_free,
+    task_new,
+    task_ptr,
+    wants_calls,
+)
 from dodo.http.headers import HeaderMap
 from dodo.http.request import Request
 from dodo.http.response import Response
@@ -259,6 +270,14 @@ struct Http2ConnHandle(Movable):
     """Streams parked on the offload pool: stream id -> job address.
     Only the stream waits; the connection keeps reading and serving."""
 
+    var call_client: Int
+    """The worker's ``LoopClient`` address, or 0 when its handler makes
+    no calls. Set by the unified loop."""
+
+    var calls: Dict[Int, Int]
+    """Streams parked on outgoing calls: stream id -> ``CallTask``.
+    Their deadlines share ``offload_deadlines``."""
+
     var offload_deadlines: Dict[Int, Int]
     """Monotonic ms by which each parked stream must be answered
     (``handler_timeout_ms``); absent when it is 0. The connection's timer
@@ -308,6 +327,8 @@ struct Http2ConnHandle(Movable):
         self.offload_port = 0
         self.offloads = Dict[Int, Int]()
         self.offload_deadlines = Dict[Int, Int]()
+        self.call_client = 0
+        self.calls = Dict[Int, Int]()
         self.close_deadline_ms = 0
 
     def __init__(
@@ -381,6 +402,8 @@ struct Http2ConnHandle(Movable):
         self.offload_port = 0
         self.offloads = Dict[Int, Int]()
         self.offload_deadlines = Dict[Int, Int]()
+        self.call_client = 0
+        self.calls = Dict[Int, Int]()
         self.close_deadline_ms = 0
 
     def attach_tls(mut self, var transport: TlsTransport):
@@ -584,12 +607,15 @@ struct Http2ConnHandle(Movable):
             # never dispatch a WS stream (even if it END_STREAM's).
             if sid in self._ws_tunnels:
                 continue
-            if sid in self.offloads:
+            if sid in self.offloads or sid in self.calls:
                 continue
             var req = self.h2.take_request(sid)
             req.peer = self.peer
             if self.offload_port != 0 and _wants_offload(handler, req):
                 self._park_stream(sid, req^, config)
+                continue
+            if self.call_client != 0 and wants_calls(handler, req):
+                self._start_stream_calls(handler, sid, req^, config)
                 continue
             var expose_errors = req.expose_errors
             var request_id = req.headers.get("x-request-id")
@@ -1072,19 +1098,91 @@ struct Http2ConnHandle(Movable):
             )
 
     def _abandon_stream(mut self, sid: Int, reason: Int) raises:
-        """Cancel parked stream ``sid``'s job with ``reason`` and forget
-        it; its result is dropped when it comes back."""
-        if sid not in self.offloads:
-            return
-        offload_cancel(self.offloads.pop(sid), reason)
+        """Cancel parked stream ``sid``'s job with ``reason``, or its
+        calls, and forget it; its result is dropped."""
+        if sid in self.calls:
+            loop_client(self.call_client)[].cancel(self.calls.pop(sid))
+        if sid in self.offloads:
+            offload_cancel(self.offloads.pop(sid), reason)
         if sid in self.offload_deadlines:
             _ = self.offload_deadlines.pop(sid)
+
+    def _start_stream_calls[
+        H: Handler
+    ](
+        mut self,
+        ref handler: H,
+        sid: Int,
+        var req: Request,
+        config: ServerConfig,
+    ) raises:
+        """Run ``start`` for stream ``sid``. An answer is sent at once;
+        calls park only this stream until their replies are back."""
+        var calls = Calls()
+        var answer = first_step(handler, req, calls)
+        if answer.resp:
+            self._emit_buffered(sid, answer.resp.take())
+            return
+        if not answer.waiting():
+            self._emit_buffered(
+                sid,
+                Response(status=answer.err_status, reason=answer.err_reason),
+            )
+            return
+        var task = task_new(CallTask(req^, calls^, Int(self.fd()), sid))
+        loop_client(self.call_client)[].submit(task)
+        self.h2.mark_dispatched(sid)
+        self.calls[sid] = task
+        if config.handler_timeout_ms > 0:
+            self.offload_deadlines[sid] = (
+                monotonic_now_ms() + config.handler_timeout_ms
+            )
+
+    def calls_back[
+        H: Handler
+    ](
+        mut self, ref handler: H, sid: Int, task: Int, config: ServerConfig
+    ) raises -> Optional[StepResult]:
+        """The replies of ``task``'s round are in: run ``finish`` for
+        stream ``sid``. More calls park it again; an answer is queued.
+        ``None`` when the stream no longer waits for ``task``: the
+        caller frees it."""
+        if sid not in self.calls or self.calls[sid] != task:
+            return Optional[StepResult]()
+        var answer = next_step(handler, task_ptr(task)[])
+        if answer.waiting():
+            loop_client(self.call_client)[].submit(task)
+            return Optional[StepResult](self._next_step(config))
+        _ = self.calls.pop(sid)
+        if sid in self.offload_deadlines:
+            _ = self.offload_deadlines.pop(sid)
+        task_free(task)
+        if answer.resp:
+            self._send_parked(sid, answer.resp.take())
+        else:
+            self._send_parked(
+                sid,
+                Response(status=answer.err_status, reason=answer.err_reason),
+            )
+        if len(self._stream_out) > 0:
+            try:
+                self._stream_pump()
+            except:
+                self.should_close = True
+        self._take_outbox()
+        return Optional[StepResult](self._next_step(config))
+
+    def _parked_count(self) -> Int:
+        """Streams waiting on the offload pool or on calls."""
+        return len(self.offloads) + len(self.calls)
 
     def offload_abandon_all(mut self, reason: Int):
         """Cancel every parked stream's job (the connection is going
         away)."""
         var sids = List[Int]()
         for entry in self.offloads.items():
+            sids.append(entry.key)
+        for entry in self.calls.items():
             sids.append(entry.key)
         for i in range(len(sids)):
             try:
@@ -1144,7 +1242,7 @@ struct Http2ConnHandle(Movable):
         return self._next_step(config)
 
     def has_parked_streams(self) -> Bool:
-        return len(self.offloads) > 0
+        return self._parked_count() > 0
 
     def offload_timer(mut self, config: ServerConfig) raises -> StepResult:
         """The connection's timer fired while streams are parked.
@@ -1170,7 +1268,7 @@ struct Http2ConnHandle(Movable):
         """The timer to arm while reading. With streams parked the
         connection is not idle: the timer is the earliest stream deadline
         (or the close deadline), and 0 (no timer) when there is none."""
-        if len(self.offloads) == 0:
+        if self._parked_count() == 0:
             return config.idle_timeout_ms
         var earliest = self.close_deadline_ms
         for entry in self.offload_deadlines.items():
@@ -1185,7 +1283,7 @@ struct Http2ConnHandle(Movable):
         pending, else read. A connection that should close but still has
         parked streams keeps reading until they are answered or
         ``shutdown_timeout_ms`` passes."""
-        if self.should_close and len(self.offloads) > 0:
+        if self.should_close and self._parked_count() > 0:
             if self.close_deadline_ms == 0:
                 self.close_deadline_ms = (
                     monotonic_now_ms() + config.shutdown_timeout_ms
@@ -1197,7 +1295,7 @@ struct Http2ConnHandle(Movable):
                 want_write=True,
                 idle_timeout_ms=config.write_timeout_ms,
             )
-        if self.should_close and len(self.offloads) == 0:
+        if self.should_close and self._parked_count() == 0:
             return StepResult(want_read=False, want_write=False, done=True)
         self.state = STATE_READING
         return StepResult(

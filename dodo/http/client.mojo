@@ -40,11 +40,23 @@ from .response import Response, Status
 from .headers import HeaderMap
 from .url import Url
 from .auth import Auth, BasicAuth, BearerAuth
-from .error import HttpError, TooManyRedirects
-from .redirect_policy import RedirectPolicy, RedirectAction, RedirectMode
+from .error import HttpError
+from .redirect_policy import RedirectPolicy
 from .reliability import RetryPolicy, _backoff_sleep_ms
-from .encoding import DEFAULT_MAX_DECOMPRESSED_BYTES, decode_content
+from .encoding import DEFAULT_MAX_DECOMPRESSED_BYTES
 from ._client.cookie_store import CookieStore
+from ._client.exchange import (
+    ProxyEnv,
+    RedirectHop,
+    connect_request,
+    is_idempotent,
+    may_replay,
+    request_head,
+    resolve_url,
+    tunnel_status_ok,
+    unzip_body,
+)
+from ._scan import find_crlfcrlf
 from .body import ChunkSource
 from .cancel import Cancel
 from ..runtime._libc_time import libc_nanosleep_ms
@@ -58,7 +70,6 @@ from ..dns import resolve
 
 from ..http2.client import Http2ClientConnection
 from ..http2.hpack import HpackHeader
-from std.os import getenv
 from std.memory import Pointer
 from .client_pool import ClientPool
 from ._client.parse import (
@@ -113,44 +124,16 @@ def _chunk_frame_prefix(n: Int) -> String:
     return out + "\r\n"
 
 
-def _same_origin(a: String, b: String) -> Bool:
-    """Scheme, host and port all equal (RFC 6454). Unparseable means
-    not the same."""
-    try:
-        var ua = Url.parse(a)
-        var ub = Url.parse(b)
-        return (
-            ua.scheme.lower() == ub.scheme.lower()
-            and ua.host.lower() == ub.host.lower()
-            and ua.port == ub.port
-        )
-    except:
-        return False
-
-
 def _is_idempotent(method: String) -> Bool:
-    """Whether ``method`` is idempotent per RFC 9110 sec 9.2.2 (safe to
-    send more than once with the same effect). Gates every automatic
-    replay. The ``Retry`` middleware uses the same set."""
-    from dodo.http.reliability import _is_idempotent_method
-
-    return _is_idempotent_method(method.upper())
+    """Whether ``method`` is idempotent per RFC 9110 sec 9.2.2. Gates
+    every automatic replay. The ``Retry`` middleware uses the same set."""
+    return is_idempotent(method)
 
 
 def _may_replay(method: String, write_failed: Bool, err: String) -> Bool:
-    """Whether a request that failed on a reused connection may be sent
-    again on a fresh one (RFC 9112 sec 9.3.1).
-
-    A failed write is the stale-connection signature before the
-    request reached the server. A read that failed before any reply
-    byte is the other (the peer closed an idle keep-alive), but the
-    request may have been processed, so only an idempotent one is
-    re-sent. Once reply bytes have arrived, nothing is re-sent.
-    """
-    if write_failed:
-        return True
-    # ``in``, not ``startswith``: String(e) prefixes the error type.
-    return NO_REPLY_ERROR in err and _is_idempotent(method)
+    """:func:`may_replay` for a raised error. ``in``, not
+    ``startswith``: ``String(e)`` puts the error type first."""
+    return may_replay(method, write_failed, NO_REPLY_ERROR in err)
 
 
 @fieldwise_init
@@ -1148,46 +1131,16 @@ struct HttpClient(Movable):
         Returns:
             Absolute URL string.
         """
-        if self._base_url.byte_length() == 0:
-            return url
-        if url.startswith("http://") or url.startswith("https://"):
-            return url
-        return self._base_url + url
+        return resolve_url(self._base_url, url)
 
     # ── Proxy (CONNECT tunnel + env policy) ────────────────────────────────────
 
     def _resolve_proxy(self, u: Url) raises -> String:
-        """Return the proxy URL to use for ``u`` per the standard env
-        policy, or ``""`` for a direct connection.
-
-        Honors ``NO_PROXY`` (comma-separated host suffixes; ``*`` bypasses
-        all), then ``HTTPS_PROXY`` / ``HTTP_PROXY`` by scheme, falling
-        back to ``ALL_PROXY`` (lowercase variants accepted, matching
-        curl / requests).
-        """
-        var host = u.host.lower()
-        var no = getenv("NO_PROXY", getenv("no_proxy", ""))
-        if no.byte_length() > 0:
-            if no == "*":
-                return ""
-            for entry in no.split(","):
-                var e = String(entry).strip().lower()
-                if e.byte_length() == 0:
-                    continue
-                if host == e or host.endswith("." + e):
-                    return ""
-        # Explicit with_proxy() overrides env.
-        if self._proxy.byte_length() > 0:
-            return self._proxy
-        if u.is_tls():
-            var ph = getenv("HTTPS_PROXY", getenv("https_proxy", ""))
-            if ph.byte_length() > 0:
-                return ph
-        else:
-            var ph = getenv("HTTP_PROXY", getenv("http_proxy", ""))
-            if ph.byte_length() > 0:
-                return ph
-        return getenv("ALL_PROXY", getenv("all_proxy", ""))
+        """The proxy URL to use for ``u``, or ``""`` for a direct
+        connection: ``NO_PROXY``, then :meth:`with_proxy`, then the
+        scheme's proxy variable, then ``ALL_PROXY`` (see
+        :meth:`ProxyEnv.pick`)."""
+        return ProxyEnv().pick(u, self._proxy)
 
     def _connect_tunnel(
         self, proxy_url: String, host: String, port: UInt16
@@ -1199,12 +1152,8 @@ struct HttpClient(Movable):
         var pu = Url.parse(proxy_url)
         var tcp = _connect_with_fallback(pu.host, pu.port, self._timeout_ms)
         self._arm_read_timeout(tcp)
-        var target = host + ":" + String(Int(port))
-        var req = String("CONNECT ") + target + " HTTP/1.1\r\n"
-        req += "Host: " + target + "\r\n"
-        req += "Proxy-Connection: keep-alive\r\n\r\n"
-        var rb = req.as_bytes()
-        tcp.write_all(Span[UInt8, _](rb))
+        var req = connect_request(host, port)
+        tcp.write_all(Span[UInt8, _](req.as_bytes()))
         # Read the proxy response head (until CRLFCRLF) and require 2xx.
         var buf = List[UInt8](capacity=1024)
         buf.resize(1024, 0)
@@ -1216,25 +1165,8 @@ struct HttpClient(Movable):
                 raise NetworkError("proxy CONNECT: closed before reply")
             for i in range(n):
                 acc.append(buf[i])
-            var m = len(acc)
-            if m >= 4:
-                for j in range(m - 3):
-                    if (
-                        acc[j] == 13
-                        and acc[j + 1] == 10
-                        and acc[j + 2] == 13
-                        and acc[j + 3] == 10
-                    ):
-                        hdr_end = j
-                        break
-        # Status line: "HTTP/1.1 200 ...". Require the code to start '2'.
-        var line_end = 0
-        while line_end < len(acc) and acc[line_end] != 13:
-            line_end += 1
-        var sp = 0
-        while sp < line_end and acc[sp] != 32:
-            sp += 1
-        if sp + 1 >= line_end or acc[sp + 1] != UInt8(ord("2")):
+            hdr_end = find_crlfcrlf(acc, 0)
+        if not tunnel_status_ok(Span[UInt8, _](acc)):
             raise NetworkError("proxy CONNECT: non-2xx from proxy")
         return tcp^
 
@@ -1806,82 +1738,29 @@ struct HttpClient(Movable):
         Threads the effective Authorization through each hop (cleared on
         a cross-origin redirect unless the policy forwards it), attaches
         / records cookies, and decompresses the final body."""
-        var current_url = req.url
-        var hops = 0
-        var method = req.method
-        var body = req.body.copy()
-        var auth_header = self._auth_header
-        var headers = req.headers.copy()
-        if self._auto_decompress and not headers.contains("Accept-Encoding"):
-            headers.set("Accept-Encoding", "gzip, deflate, br")
-
+        var hop = RedirectHop(
+            req, self._auth_header, self._auto_decompress, self._base_url
+        )
         while True:
             # Attach session cookies for this hop (jar wins over a stale
             # caller-supplied Cookie since it carries the live session).
-            var cookie_hdr = self._cookies.request_header(
-                self._resolve_url(current_url)
-            )
+            var here = self._resolve_url(hop.url)
+            var cookie_hdr = self._cookies.request_header(here)
             if cookie_hdr.byte_length() > 0:
-                headers.set("Cookie", cookie_hdr)
+                hop.headers.set("Cookie", cookie_hdr)
 
             var resp = self._do_request(
-                method, current_url, headers, body, auth_header
+                hop.method, hop.url, hop.headers, hop.body, hop.auth_header
             )
 
             # Capture Set-Cookie(s) into the jar (no-op if disabled).
             if self._cookies.enabled():
                 var set_cookies = resp.headers.get_all("Set-Cookie")
                 for i in range(len(set_cookies)):
-                    self._cookies.record_set_cookie(
-                        set_cookies[i], self._resolve_url(current_url)
-                    )
+                    self._cookies.record_set_cookie(set_cookies[i], here)
 
-            if not resp.is_redirect():
+            if not hop.follow(resp, self._redirect_policy):
                 return self._maybe_decompress(resp^)
-
-            var location = resp.headers.get("Location")
-            var decision = self._redirect_policy.decide(
-                current_url, method, resp.status, location, hops
-            )
-
-            if decision.action == RedirectAction.FOLLOW:
-                # Credentials the *caller* attached were meant for the
-                # origin they asked for. Authorization is handled by the
-                # policy below; Cookie and Proxy-Authorization used to
-                # ride along to any origin a 3xx pointed at. Jar cookies
-                # are re-selected per hop by URL, so they stay scoped.
-                if not _same_origin(
-                    self._resolve_url(current_url),
-                    self._resolve_url(decision.next_url),
-                ):
-                    _ = headers.remove("Cookie")
-                    _ = headers.remove("Proxy-Authorization")
-                current_url = decision.next_url
-                method = decision.next_method
-                if decision.next_body_dropped:
-                    body = List[UInt8]()
-                    _ = headers.remove("Content-Type")
-                if not decision.forward_authorization:
-                    auth_header = String("")
-                    _ = headers.remove("Authorization")
-                hops += 1
-                continue
-
-            if decision.action == RedirectAction.REJECT:
-                raise Error(
-                    String("RedirectPolicy: cross-origin redirect to '")
-                    + location
-                    + String("' refused (same_origin_only)")
-                )
-
-            # STOP: empty Location or DENY -> surface the 3xx unchanged;
-            # otherwise the hop cap was hit -> raise (legacy behaviour).
-            if (
-                location.byte_length() == 0
-                or self._redirect_policy.mode == RedirectMode.DENY
-            ):
-                return self._maybe_decompress(resp^)
-            raise TooManyRedirects(current_url, hops)
 
     def _maybe_decompress(self, var resp: Response) raises -> Response:
         """Decode a compressed response body in place when
@@ -1889,24 +1768,7 @@ struct HttpClient(Movable):
         unsupported encodings are left untouched."""
         if not self._auto_decompress:
             return resp^
-        var enc = resp.headers.get("Content-Encoding")
-        if enc.byte_length() == 0:
-            return resp^
-        var el = String(enc.strip()).lower()
-        if el == "identity" or el == "":
-            return resp^
-        if el.find(",") >= 0:
-            return resp^  # stacked encodings unsupported: leave raw
-        try:
-            var decoded = decode_content(
-                Span[UInt8, _](resp.body), el, self._max_decompressed_bytes
-            )
-            resp.body = decoded^
-            _ = resp.headers.remove("Content-Encoding")
-            resp.headers.set("Content-Length", String(len(resp.body)))
-        except:
-            pass  # unsupported / corrupt payload: leave the raw bytes
-        return resp^
+        return unzip_body(resp^, self._max_decompressed_bytes)
 
     def _do_request(
         self,
@@ -1954,43 +1816,15 @@ struct HttpClient(Movable):
             and not self._h2c_upgrade
         )
 
-        # ── Build wire request ─────────────────────────────────────────────
-        var wire = method + " " + u.request_target() + " HTTP/1.1\r\n"
-        # Host header (RFC 7230 §5.4 — required)
-        var host_header = u.host
-        if (u.scheme == "http" and u.port != 80) or (
-            u.scheme == "https" and u.port != 443
-        ):
-            host_header = host_header + ":" + String(Int(u.port))
-        wire += "Host: " + host_header + "\r\n"
-        wire += "User-Agent: " + self._user_agent + "\r\n"
-        if pool_enabled or tls_pool_enabled:
-            wire += "Connection: keep-alive\r\n"
-        else:
-            wire += "Connection: close\r\n"
-        wire += "Accept: */*\r\n"
-
-        # Authorization header from the effective (redirect-gated) auth
-        if auth_header.byte_length() > 0:
-            wire += "Authorization: " + auth_header + "\r\n"
-
-        # Forward caller-supplied headers (skip Host — already set)
-        for i in range(extra_headers.len()):
-            var k = extra_headers._keys[i]
-            if k.lower() != "host":
-                # Only skip caller's Authorization when the effective auth
-                # is set, matching the h2/h2c paths (_build_h2_request_headers).
-                if (
-                    k.lower() == "authorization"
-                    and auth_header.byte_length() > 0
-                ):
-                    continue
-                wire += k + ": " + extra_headers._values[i] + "\r\n"
-
-        if len(body) > 0:
-            wire += "Content-Length: " + String(len(body)) + "\r\n"
-
-        wire += "\r\n"  # end of headers
+        var wire = request_head(
+            method,
+            u,
+            extra_headers,
+            len(body),
+            auth_header,
+            self._user_agent,
+            pool_enabled or tls_pool_enabled,
+        )
 
         # ── Connect and send ───────────────────────────────────────────────
         if u.is_tls():

@@ -19,6 +19,8 @@ the same; only the cost differs.
 
 from std.collections import Optional
 
+from dodo.tls.config import TlsConfig
+
 from .calls import (
     CallError,
     CallReply,
@@ -60,9 +62,13 @@ struct OnLoop[Inner: Calling](Copyable, Handler):
 
     var inner: Self.Inner
     """The handler that makes the calls."""
+    var tls: TlsConfig
+    """How ``https://`` calls check the server: a CA file, a client
+    certificate. One setting covers every call this handler makes."""
 
-    def __init__(out self, var inner: Self.Inner):
+    def __init__(out self, var inner: Self.Inner, tls: TlsConfig = TlsConfig()):
         self.inner = inner^
+        self.tls = tls.copy()
 
     def serve(self, req: Request) raises -> Response:
         """Run every step here, with blocking calls. A server loop that
@@ -78,11 +84,13 @@ struct OnLoop[Inner: Calling](Copyable, Handler):
     def start(
         self, req: Request, mut calls: Calls
     ) raises -> Optional[Response]:
+        calls.use_tls(self.tls)
         return self.inner.start(req, calls)
 
     def finish(
         self, req: Request, mut calls: Calls
     ) raises -> Optional[Response]:
+        calls.use_tls(self.tls)
         return self.inner.finish(req, calls)
 
     def route_list(self) raises -> List[RouteInfo]:
@@ -134,9 +142,9 @@ def _call_blocking(call: OutgoingCall) -> CallReply:
     client has no deadline for the whole call.
     """
     try:
-        var client = HttpClient(timeout_ms=call.timeout_ms).with_read_timeout(
-            call.timeout_ms
-        )
+        var client = HttpClient(
+            call.tls, timeout_ms=call.timeout_ms
+        ).with_read_timeout(call.timeout_ms)
         return CallReply(client.send(call.request))
     except e:
         var message = String(e)
